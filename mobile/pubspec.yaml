@@ -1,0 +1,28 @@
+name: live_translator
+description: Real-time automatic surrounding-language translator.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  provider: ^6.1.2
+  shared_preferences: ^2.3.2
+  permission_handler: ^11.3.1
+  web_socket_channel: ^3.0.1
+  http: ^1.2.2
+  uuid: ^4.4.2
+  intl: ^0.19.0
+  flutter_tts: ^4.0.2
+  google_fonts: ^6.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
