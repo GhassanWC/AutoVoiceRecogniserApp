@@ -9,15 +9,12 @@ workflows:
       app_store_connect: Codemagic
 
     environment:
+      groups:
+        - code-signing
+
       flutter: stable
       xcode: latest
       cocoapods: default
-
-      ios_signing:
-        provisioning_profiles:
-          - live_translator_appstore
-        certificates:
-          - live_translator_distribution
 
     scripts:
       - name: Get Flutter packages
@@ -28,7 +25,22 @@ workflows:
         script: |
           find . -name "Podfile" -execdir pod install \;
 
-      - name: Set up iOS signing
+      - name: Initialize signing keychain
+        script: |
+          keychain initialize
+
+      - name: Fetch Apple signing files
+        script: |
+          app-store-connect fetch-signing-files \
+            "com.ghassanalhattali.livetranslator" \
+            --type IOS_APP_STORE \
+            --create
+
+      - name: Add signing certificate
+        script: |
+          keychain add-certificates
+
+      - name: Configure Xcode signing
         script: |
           xcode-project use-profiles \
             --custom-export-options='{"testFlightInternalTestingOnly": true}'
