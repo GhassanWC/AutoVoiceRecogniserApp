@@ -14,10 +14,8 @@ workflows:
       cocoapods: default
 
       ios_signing:
-        provisioning_profiles:
-          - live_translator_appstore
-        certificates:
-          - live_translator_distribution
+        distribution_type: app_store
+        bundle_identifier: com.ghassanalhattali.livetranslator
 
     scripts:
       - name: Get Flutter packages
