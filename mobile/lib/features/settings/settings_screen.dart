@@ -118,6 +118,13 @@ class SettingsScreen extends StatelessWidget {
             subtitle: Text(settings.serverUrl.isEmpty ? 'Default' : settings.serverUrl),
             onTap: () => _editServerUrl(context, controller),
           ),
+          SwitchListTile(
+            secondary: const Icon(Icons.troubleshoot_outlined),
+            title: const Text('Diagnostics Logging'),
+            subtitle: const Text('Log VAD levels and translation pipeline details to the console'),
+            value: settings.developerDiagnostics,
+            onChanged: (value) => controller.update((s) => s.copyWith(developerDiagnostics: value)),
+          ),
           const SizedBox(height: 24),
         ],
       ),

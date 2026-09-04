@@ -28,13 +28,13 @@ Copy `.env.example` → `.env`. Everything has a safe development default.
 | `PORT` | number | default 8080 |
 | `JWT_SECRET` | string | **must** be changed in production (refuses to start otherwise) |
 | `DATABASE_URL` | postgres URL | unset → in-memory storage |
-| `SPEECH_PROVIDER` | `mock` `openai` `deepgram` | auto language detection in all |
-| `SPEECH_API_KEY` | string | key for the chosen speech provider |
-| `SPEECH_MODEL` | string | optional; defaults `whisper-1` / `nova-2` |
-| `TRANSLATION_PROVIDER` | `mock` `openai` `google` | |
-| `TRANSLATION_API_KEY` | string | |
+| `SPEECH_PROVIDER` | `mock` `openai` `deepgram` | **production: `deepgram`** — enables the live streaming pipeline (nova-3, `language=multi`, `diarize_model=latest`: multilingual code-switching + real speaker diarization on one socket per session; code-switching covers en/es/fr/de/hi/ru/pt/ja/it/nl — see `NOVA3_MULTI_LANGUAGES`). `openai`/`mock` use per-segment batch recognition |
+| `SPEECH_API_KEY` | string | key for the chosen speech provider (Deepgram key for `deepgram`) |
+| `SPEECH_MODEL` | string | optional; defaults `whisper-1` / `nova-3` |
+| `TRANSLATION_PROVIDER` | `mock` `openai` `google` | **production: `openai`** |
+| `TRANSLATION_API_KEY` | string | OpenAI key for `openai` |
 | `TRANSLATION_MODEL` | string | optional; default `gpt-4o-mini` |
-| `DIARIZATION_PROVIDER` | `heuristic` `none` | |
+| `DIARIZATION_PROVIDER` | `heuristic` `none` | batch-fallback path only; the streaming pipeline uses Deepgram's diarization |
 | `MAX_SESSION_MINUTES` | number | hard cap per listening session (120) |
 | `FREE_MONTHLY_MINUTES` | number | processed-speech quota per user; `0` = unlimited |
 | `MAX_SEGMENT_SECONDS` | number | reject overlong segments (30) |

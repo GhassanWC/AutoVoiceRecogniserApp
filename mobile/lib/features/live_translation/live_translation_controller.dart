@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer' as developer;
 
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
@@ -175,6 +176,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
         }
       },
       onLevel: _handleLevel,
+      onDiagnostics: _handleVadDiagnostics,
     );
 
     // 4. Native microphone capture (starts the Android foreground service).
@@ -315,6 +317,21 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   void _addMessage(TranslationMessage message) {
     messages.add(message);
     _sessionMessages.add(message);
+    if (settings.settings.developerDiagnostics) {
+      developer.log(
+        '[PIPELINE] provider=${message.diagnostics?['sttProvider']} '
+        'transcript="${message.originalText}" '
+        'language=${message.sourceLanguage} '
+        '(detected=${message.diagnostics?['detectedLanguage']}, '
+        'confidence=${message.languageConfidence.toStringAsFixed(2)}) '
+        'sttConfidence=${message.transcriptionConfidence.toStringAsFixed(2)} '
+        'speaker=${message.speakerId} '
+        'translated="${message.translatedText}" '
+        'audioMs=${message.diagnostics?['audioMs']} '
+        'translateLatencyMs=${message.diagnostics?['translateLatencyMs']}',
+        name: 'pipeline',
+      );
+    }
     notifyListeners();
     if (settings.settings.autoSpeak) {
       tts.speak(message.translatedText, message.targetLanguage);
@@ -334,6 +351,23 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       }
     }
     notifyListeners();
+  }
+
+  DateTime _lastVadLog = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// Developer mode: VAD internals in the console. Segment events always log;
+  /// per-chunk level lines are throttled to one per second.
+  void _handleVadDiagnostics(VadDiagnostics d) {
+    if (!settings.settings.developerDiagnostics) return;
+    if (d.event != null) {
+      developer.log('[VAD] $d', name: 'vad');
+      return;
+    }
+    final now = DateTime.now();
+    if (now.difference(_lastVadLog).inMilliseconds >= 1000) {
+      _lastVadLog = now;
+      developer.log('[VAD] $d', name: 'vad');
+    }
   }
 
   void _handleLevel(double level, bool isSpeech) {

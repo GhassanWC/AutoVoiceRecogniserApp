@@ -31,6 +31,7 @@ class AppSettings {
     this.onboardingComplete = false,
     this.serverUrl = '',
     this.mockMode = false,
+    this.developerDiagnostics = false,
   });
 
   final String targetLanguage;
@@ -51,6 +52,9 @@ class AppSettings {
   /// Demo mode: generates a fake conversation, no microphone, no network.
   final bool mockMode;
 
+  /// Developer mode: log VAD and translation-pipeline diagnostics.
+  final bool developerDiagnostics;
+
   AppSettings copyWith({
     String? targetLanguage,
     bool? showOriginalText,
@@ -63,6 +67,7 @@ class AppSettings {
     bool? onboardingComplete,
     String? serverUrl,
     bool? mockMode,
+    bool? developerDiagnostics,
   }) {
     return AppSettings(
       targetLanguage: targetLanguage ?? this.targetLanguage,
@@ -76,6 +81,7 @@ class AppSettings {
       onboardingComplete: onboardingComplete ?? this.onboardingComplete,
       serverUrl: serverUrl ?? this.serverUrl,
       mockMode: mockMode ?? this.mockMode,
+      developerDiagnostics: developerDiagnostics ?? this.developerDiagnostics,
     );
   }
 
@@ -91,6 +97,7 @@ class AppSettings {
         'onboardingComplete': onboardingComplete,
         'serverUrl': serverUrl,
         'mockMode': mockMode,
+        'developerDiagnostics': developerDiagnostics,
       };
 
   factory AppSettings.fromJson(Map<String, dynamic> json) => AppSettings(
@@ -105,5 +112,6 @@ class AppSettings {
         onboardingComplete: json['onboardingComplete'] as bool? ?? false,
         serverUrl: json['serverUrl'] as String? ?? '',
         mockMode: json['mockMode'] as bool? ?? false,
+        developerDiagnostics: json['developerDiagnostics'] as bool? ?? false,
       );
 }

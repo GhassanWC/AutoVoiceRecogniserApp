@@ -6,9 +6,7 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
-import android.media.audiofx.NoiseSuppressor
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
@@ -145,20 +143,15 @@ object AudioCaptureManager : EventChannel.StreamHandler {
         effects.clear()
     }
 
+    /**
+     * Environmental listening, not a phone call: NoiseSuppressor and
+     * AcousticEchoCanceler are tuned for near-field voice chat and strip out
+     * exactly the distant/background speech (TV, people across the room) this
+     * app must hear — keep them OFF. Only AutomaticGainControl is attached,
+     * because it lifts quiet distant speech into a usable range.
+     */
     private fun attachEffects(sessionId: Int) {
         try {
-            if (NoiseSuppressor.isAvailable()) {
-                NoiseSuppressor.create(sessionId)?.let {
-                    it.enabled = true
-                    effects.add(it)
-                }
-            }
-            if (AcousticEchoCanceler.isAvailable()) {
-                AcousticEchoCanceler.create(sessionId)?.let {
-                    it.enabled = true
-                    effects.add(it)
-                }
-            }
             if (AutomaticGainControl.isAvailable()) {
                 AutomaticGainControl.create(sessionId)?.let {
                     it.enabled = true

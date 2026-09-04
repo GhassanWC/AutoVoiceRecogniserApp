@@ -9,6 +9,8 @@ class TranslationMessage {
     required this.translatedText,
     required this.targetLanguage,
     required this.timestamp,
+    this.transcriptionConfidence = 0,
+    this.diagnostics,
   });
 
   final String id;
@@ -18,10 +20,17 @@ class TranslationMessage {
   final String? speakerLabel;
   final String sourceLanguage;
   final double languageConfidence;
+
+  /// 0..1 provider confidence in the transcript itself (0 when unknown).
+  final double transcriptionConfidence;
   final String originalText;
   final String translatedText;
   final String targetLanguage;
   final DateTime timestamp;
+
+  /// Server-side per-utterance detail (STT provider, latency, …). Only logged
+  /// in developer mode; deliberately not persisted to history.
+  final Map<String, dynamic>? diagnostics;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -29,6 +38,7 @@ class TranslationMessage {
         'speakerLabel': speakerLabel,
         'sourceLanguage': sourceLanguage,
         'languageConfidence': languageConfidence,
+        'transcriptionConfidence': transcriptionConfidence,
         'originalText': originalText,
         'translatedText': translatedText,
         'targetLanguage': targetLanguage,
@@ -41,6 +51,7 @@ class TranslationMessage {
         speakerLabel: json['speakerLabel'] as String?,
         sourceLanguage: json['sourceLanguage'] as String? ?? 'und',
         languageConfidence: (json['languageConfidence'] as num?)?.toDouble() ?? 0,
+        transcriptionConfidence: (json['transcriptionConfidence'] as num?)?.toDouble() ?? 0,
         originalText: json['originalText'] as String? ?? '',
         translatedText: json['translatedText'] as String? ?? '',
         targetLanguage: json['targetLanguage'] as String? ?? 'en',

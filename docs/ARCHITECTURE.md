@@ -3,26 +3,62 @@
 ## The pipeline
 
 ```text
-Microphone (native: Android AudioRecord / iOS AVAudioEngine)
-    ↓  16 kHz mono PCM16, ~100 ms chunks, platform NS/AEC/AGC where available
-Voice Activity Detection (on-device, Dart)          ← silence never leaves the phone
-    ↓  speech segments ≈ 0.35–10 s, with 350 ms pre-roll, 800 ms silence hangover
+Environmental microphone (native: Android AudioRecord / iOS AVAudioEngine,
+                          iOS: .measurement mode, voice-processing DSP off)
+    ↓  16 kHz mono PCM16, ~100 ms chunks
+Adaptive Voice Activity Detection (on-device, Dart)  ← silence never leaves the phone
+    ↓  speech segments, adaptive noise-floor threshold,
+    ↓  1.5 s pre-roll, 900 ms silence hangover, 15 s cap
 WebSocket  wss://…/live-translation                  ← binary frames + JSON control
     ↓
 Backend LiveSession (one per connection)
-    ↓  PCM → WAV
-Speech recognition provider (auto language detection per segment)
-    ↓  { text, language, confidence }
-Speaker assignment (heuristic diarization, per session)
-    ↓
-Translation provider (meaning-focused, small rolling context window)
+    ↓  audio forwarded as it arrives
+Deepgram live stream (one per session: nova-3, language=multi, diarize_model=latest)
+    ↓  { text, per-word language, per-word speaker, confidences }
+    ↓  speaker ids from the provider, preserved verbatim
+OpenAI translation (after a reliable transcript exists; rolling context window)
     ↓
 translation event → mobile chat UI (+ optional local history, optional TTS)
 ```
 
-Latency budget: the segment closes ~0.8 s after the speaker stops (silence
+The Deepgram stream lives for the whole session, so switching languages
+mid-conversation needs no reconnect or reconfiguration, and diarized speaker
+ids stay stable across the conversation. Client segment ends send a
+`Finalize` to flush results immediately; `KeepAlive` frames cover the silent
+stretches (silence still never leaves the phone).
+
+**Provider limitation, kept explicit:** nova-3 `language=multi` currently
+code-switches between English, Spanish, French, German, Hindi, Russian,
+Portuguese, Japanese, Italian and Dutch only (`NOVA3_MULTI_LANGUAGES` in
+`deepgram_stream.ts`). A word tagged outside that set yields
+`sourceLanguage: "und"` rather than an unverifiable language claim; the
+transcript and translation still go through. Expand the list only when
+Deepgram's documentation does.
+
+Providers without a streaming mode (openai/mock) fall back to the previous
+per-segment batch pipeline (PCM → WAV → transcribe → heuristic speakers), and
+the live pipeline also falls back to it if the stream errors mid-session.
+
+Latency budget: the segment closes ~0.9 s after the speaker stops (silence
 hangover); recognition + translation of a short utterance typically add
 1–2 s with real providers, landing inside the 1–3 s product target.
+
+### Environmental capture, not a phone call
+
+The microphone path is tuned to hear the room, not just the phone's owner:
+
+- iOS: `.playAndRecord` + `.measurement` (no system voice DSP), voice-processing
+  I/O explicitly disabled, built-in mic preferred with an omnidirectional polar
+  pattern, input gain maxed (there is no AGC in measurement mode), and
+  `.allowBluetoothA2DP` only — a Bluetooth headset's narrow-band call mic never
+  replaces the environmental microphone.
+- VAD: the threshold adapts to the measured noise floor instead of assuming
+  near-field levels. Steady noise (A/C hum) raises the floor and never
+  triggers; speech above the floor — 30 cm or 4 m away, or a TV at normal
+  volume — opens a segment. While sound is above the threshold the floor only
+  rises glacially, so hours of TV can never be re-learned as "noise".
+  Developer mode (Settings → Developer → Diagnostics Logging) logs RMS, noise
+  floor, current threshold, speech flag and segment start/end per chunk.
 
 ## WebSocket protocol
 
@@ -61,25 +97,30 @@ The backend never hard-codes an AI vendor. Interfaces in `backend/src/providers/
 
 | Interface | Implementations | Selected by |
 |---|---|---|
-| `SpeechRecognitionProvider` | `mock`, `openai` (Whisper), `deepgram` (nova-2, `detect_language`) | `SPEECH_PROVIDER` |
+| `StreamingSpeechProvider` | `deepgram` (live WS: nova-3, `language=multi`, `diarize_model=latest`) | `SPEECH_PROVIDER` |
+| `SpeechRecognitionProvider` (batch fallback) | `mock`, `openai` (Whisper), `deepgram` (pre-recorded, `detect_language`) | `SPEECH_PROVIDER` |
 | `TranslationProvider` | `mock`, `openai` (LLM — handles slang & code-switching), `google` (Translation v2) | `TRANSLATION_PROVIDER` |
-| `SpeakerDiarizationProvider` | `heuristic`, `none` | `DIARIZATION_PROVIDER` |
+| `SpeakerDiarizationProvider` (batch fallback only) | `heuristic`, `none` | `DIARIZATION_PROVIDER` |
 
 The mock pair reproduces the product's example conversation end-to-end with
 zero API cost — used for development, tests and `npm run simulate`.
 
-### Speaker detection honesty
+### Speaker detection
 
-V1 diarization is a **heuristic** (language of the segment + time gaps), which
-works well precisely in the app's core scenario — multilingual groups — and
-degrades to the generic "Speaker" label rather than guessing confidently.
-Real voice-print diarization is a Phase-2 provider drop-in behind the same
-interface. A wrong speaker label never blocks a translation.
+The streaming pipeline uses **Deepgram's diarization**: per-word speaker
+indices from the provider are mapped to `speaker_1`, `speaker_2`, … in order
+of first appearance and passed through verbatim — speakers are never inferred
+from language or by alternating segments. The old language+gap heuristic
+remains only as the batch-fallback assigner. A wrong speaker label never
+blocks a translation.
 
 ### Language confidence
 
-Every result carries `languageConfidence`. Below 0.5 the app shows
-*"Language detected automatically"* instead of a possibly-wrong language name.
+Every result carries `languageConfidence` and `transcriptionConfidence`.
+Below 0.5 the app shows *"Language detected automatically"* instead of a
+possibly-wrong language name. Very short utterances ("yes", "okay", "hello")
+exist in many languages, so when they arrive with language confidence below
+0.8 the server reports `sourceLanguage: "und"` rather than guessing.
 When the detected language equals the target language, translation is skipped
 (the text is already in the user's language).
 

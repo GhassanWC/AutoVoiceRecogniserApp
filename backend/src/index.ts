@@ -7,7 +7,7 @@ import { authRouter } from './modules/auth/auth.router';
 import { attachRealtimeServer } from './modules/realtime/realtime.server';
 import { translationRouter } from './modules/sessions/sessions.router';
 import { usersRouter } from './modules/users/users.router';
-import { createSpeechProvider } from './providers/speech';
+import { createSpeechProvider, createStreamingSpeechProvider } from './providers/speech';
 import { createTranslationProvider } from './providers/translation';
 import { log } from './utils/logger';
 
@@ -28,13 +28,15 @@ app.use(errorHandler);
 const httpServer = createServer(app);
 
 const speech = createSpeechProvider();
+const streamingSpeech = createStreamingSpeechProvider();
 const translation = createTranslationProvider();
-attachRealtimeServer(httpServer, { speech, translation });
+attachRealtimeServer(httpServer, { speech, streamingSpeech, translation });
 
 httpServer.listen(env.PORT, () => {
   log.info('backend listening', {
     port: env.PORT,
     speechProvider: speech.name,
+    streamingSpeech: streamingSpeech ? streamingSpeech.name : 'none (batch per segment)',
     translationProvider: translation.name,
     diarization: env.DIARIZATION_PROVIDER,
   });

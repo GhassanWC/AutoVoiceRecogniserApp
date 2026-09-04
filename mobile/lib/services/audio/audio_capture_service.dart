@@ -4,13 +4,16 @@ import 'package:flutter/services.dart';
 
 /// Bridge to the native microphone capture implementation.
 ///
-/// Native side (see mobile/platform/):
-///  - Android: AudioRecord @16 kHz mono PCM16 with NoiseSuppressor /
-///    AcousticEchoCanceler / AutomaticGainControl when available, wrapped in a
-///    microphone foreground service with a persistent "Listening" notification
-///    that carries a Stop action.
-///  - iOS: AVAudioEngine with the `audio` background mode, resampled to
-///    16 kHz mono PCM16.
+/// Both platforms are configured for *environmental* listening (the whole
+/// room, including distant speakers and TV audio) — never for near-field
+/// voice-call capture:
+///  - Android: AudioRecord @16 kHz mono PCM16 with only AutomaticGainControl
+///    attached (no noise suppression / echo cancellation, which strip distant
+///    speech), wrapped in a microphone foreground service with a persistent
+///    "Listening" notification that carries a Stop action.
+///  - iOS: AVAudioEngine in `.measurement` mode with voice-processing I/O
+///    disabled and an omnidirectional mic preference, `audio` background
+///    mode, resampled to 16 kHz mono PCM16.
 ///
 /// Events from the EventChannel are either a Uint8List (an audio chunk) or a
 /// map like {'event': 'stopped', 'reason': 'notification'} when capture ended

@@ -65,6 +65,18 @@ export type SegmentStartMessage = z.infer<typeof segmentStartSchema>;
 
 export type SegmentState = 'hearing' | 'transcribing' | 'translating';
 
+/** Extra per-utterance detail, shown only in the client's developer mode. */
+export interface TranslationDiagnostics {
+  /** Speech provider that produced the transcript, e.g. "deepgram". */
+  sttProvider: string;
+  /** Language code exactly as the provider reported it, before gating. */
+  detectedLanguage: string;
+  /** Duration of the recognized audio, milliseconds (0 when unknown). */
+  audioMs: number;
+  /** Translation request latency, milliseconds. 0 when translation was skipped. */
+  translateLatencyMs: number;
+}
+
 export interface TranslationMessagePayload {
   type: 'translation';
   id: string;
@@ -75,10 +87,13 @@ export interface TranslationMessagePayload {
   sourceLanguage: string;
   /** 0..1; below ~0.5 the client shows "Language detected automatically". */
   languageConfidence: number;
+  /** 0..1 provider confidence in the transcript itself (0 when unknown). */
+  transcriptionConfidence: number;
   originalText: string;
   translatedText: string;
   targetLanguage: string;
   timestamp: string;
+  diagnostics?: TranslationDiagnostics;
 }
 
 export type ServerMessage =

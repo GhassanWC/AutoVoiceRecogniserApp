@@ -61,13 +61,18 @@ export class OpenAISpeechProvider implements SpeechRecognitionProvider {
       textLength: (json.text ?? '').length,
     });
 
+    const text = (json.text ?? '').trim();
+    // verbose_json does not expose numeric confidences; treat a non-empty
+    // result as reasonably confident and let the UI soften the label. Very
+    // short snippets ("yes", "okay") exist in many languages, so Whisper's
+    // language guess for them is not trustworthy — report low confidence and
+    // let the pipeline's short-utterance gate map it to "und".
+    const shortSnippet = text.split(/\s+/).filter(Boolean).length <= 2;
     return {
-      text: (json.text ?? '').trim(),
+      text,
       language: toIso(json.language ?? 'und'),
-      // verbose_json does not expose numeric confidences; treat a non-empty
-      // result as reasonably confident and let the UI soften the label.
-      languageConfidence: json.language ? 0.85 : 0,
-      transcriptionConfidence: json.text ? 0.85 : 0,
+      languageConfidence: json.language ? (shortSnippet ? 0.5 : 0.85) : 0,
+      transcriptionConfidence: text ? 0.85 : 0,
     };
   }
 }

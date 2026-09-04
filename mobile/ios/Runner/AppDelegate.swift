@@ -82,14 +82,45 @@ final class AudioCaptureManager: NSObject, FlutterStreamHandler {
     guard !isRunning else { return }
 
     let session = AVAudioSession.sharedInstance()
-    // .measurement keeps system voice processing minimal; the backend's
-    // speech provider handles the rest. playAndRecord so TTS can speak
-    // translations while listening (Earphone Mode).
+    // Environmental capture, not a phone call:
+    //  - .measurement disables Apple's voice-call DSP (echo cancellation,
+    //    noise suppression, near-field beamforming) that would strip TV audio
+    //    and speakers a few meters away out of the signal;
+    //  - .allowBluetoothA2DP (NOT .allowBluetooth/HFP) so headphones only ever
+    //    receive playback — the narrow-band Bluetooth headset mic must never
+    //    replace the phone's environmental microphone;
+    //  - .playAndRecord + .defaultToSpeaker so TTS can speak translations
+    //    while listening (Earphone Mode).
     try session.setCategory(
-      .playAndRecord, mode: .measurement, options: [.allowBluetooth, .defaultToSpeaker])
+      .playAndRecord, mode: .measurement, options: [.allowBluetoothA2DP, .defaultToSpeaker])
+
+    // Prefer the built-in mic with an omnidirectional pickup pattern so the
+    // room is heard evenly, instead of a beam pointed at the phone's owner.
+    if let builtInMic = session.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+      if let omni = builtInMic.dataSources?.first(where: {
+        $0.supportedPolarPatterns?.contains(.omnidirectional) == true
+      }) {
+        try? omni.setPreferredPolarPattern(.omnidirectional)
+        try? builtInMic.setPreferredDataSource(omni)
+      }
+      try? session.setPreferredInput(builtInMic)
+    }
+
     try session.setActive(true)
 
+    // Distant speech is quiet and there is no AGC in .measurement mode —
+    // open the analog input gain all the way where the hardware allows it.
+    if session.isInputGainSettable {
+      try? session.setInputGain(1.0)
+    }
+
     let input = engine.inputNode
+    // Belt and braces: voice-processing I/O must stay off. It is tuned for
+    // telephone conversations and removes exactly the distant/background
+    // speech this app exists to hear.
+    if input.isVoiceProcessingEnabled {
+      try? input.setVoiceProcessingEnabled(false)
+    }
     let inputFormat = input.outputFormat(forBus: 0)
     guard inputFormat.sampleRate > 0,
       let outFormat = AVAudioFormat(

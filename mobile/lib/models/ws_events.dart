@@ -59,11 +59,15 @@ sealed class ServerEvent {
             speakerLabel: json['speakerLabel'] as String?,
             sourceLanguage: json['sourceLanguage'] as String? ?? 'und',
             languageConfidence: (json['languageConfidence'] as num?)?.toDouble() ?? 0,
+            transcriptionConfidence: (json['transcriptionConfidence'] as num?)?.toDouble() ?? 0,
             originalText: json['originalText'] as String? ?? '',
             translatedText: json['translatedText'] as String? ?? '',
             targetLanguage: json['targetLanguage'] as String? ?? 'en',
             timestamp:
                 DateTime.tryParse(json['timestamp'] as String? ?? '')?.toLocal() ?? DateTime.now(),
+            diagnostics: json['diagnostics'] is Map<String, dynamic>
+                ? json['diagnostics'] as Map<String, dynamic>
+                : null,
           ),
         );
       case 'segment_dropped':

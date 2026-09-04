@@ -30,7 +30,8 @@ export class OpenAITranslationProvider implements TranslationProvider {
       source,
       'Translate meaning, not word-for-word. Keep the register (casual stays casual).',
       'Sentences may mix languages; translate all of it into the target language.',
-      'Do not translate personal names. Keep numbers, currencies and dates accurate.',
+      'Do not translate personal names or brand names unless a well-known localized form exists.',
+      'Keep numbers, place names, currencies and dates accurate.',
       'Output ONLY the translation — no quotes, no explanations, no source text.',
       contextLines
         ? `Recent conversation, for resolving references only (do not re-translate it):\n${contextLines}`

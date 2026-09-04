@@ -1,7 +1,7 @@
 import { IncomingMessage, Server } from 'http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createDiarizationProvider } from '../../providers/diarization';
-import { SpeechRecognitionProvider } from '../../providers/speech';
+import { SpeechRecognitionProvider, StreamingSpeechProvider } from '../../providers/speech';
 import { TranslationProvider } from '../../providers/translation';
 import { log } from '../../utils/logger';
 import { verifyToken } from '../auth/tokens';
@@ -22,7 +22,11 @@ function extractToken(request: IncomingMessage): string | null {
 
 export function attachRealtimeServer(
   httpServer: Server,
-  providers: { speech: SpeechRecognitionProvider; translation: TranslationProvider },
+  providers: {
+    speech: SpeechRecognitionProvider;
+    streamingSpeech?: StreamingSpeechProvider | null;
+    translation: TranslationProvider;
+  },
 ): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: '/live-translation' });
 
@@ -43,6 +47,7 @@ export function attachRealtimeServer(
     const session = new LiveSession({
       userId: claims.sub,
       speech: providers.speech,
+      streamingSpeech: providers.streamingSpeech ?? null,
       translation: providers.translation,
       diarization: createDiarizationProvider(), // stateful → one per connection
       send,
