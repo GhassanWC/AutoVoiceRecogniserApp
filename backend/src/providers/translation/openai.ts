@@ -11,8 +11,39 @@ import {
 const REQUEST_TIMEOUT_MS = 20_000;
 
 /**
- * LLM-based translation. An LLM handles slang, code-switching ("Habibi, let's
- * go mañana") and conversational context better than literal MT engines.
+ * Parse the model's structured reply. Exported for unit tests.
+ * Tolerates code fences and stray text around the JSON object; an unusable
+ * reply throws a retryable error (the next attempt usually returns valid JSON).
+ */
+export function parseTranslationResponse(content: string): {
+  sourceLanguage: string;
+  translatedText: string;
+} {
+  const match = content.match(/\{[\s\S]*\}/);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[0]) as { sourceLanguage?: unknown; translatedText?: unknown };
+      const translatedText =
+        typeof parsed.translatedText === 'string' ? parsed.translatedText.trim() : '';
+      if (translatedText) {
+        const rawLanguage =
+          typeof parsed.sourceLanguage === 'string' ? parsed.sourceLanguage.trim().toLowerCase() : '';
+        const sourceLanguage = /^[a-z]{2,3}$/.test(rawLanguage) ? rawLanguage : 'und';
+        return { sourceLanguage, translatedText };
+      }
+    } catch {
+      // fall through to the error below
+    }
+  }
+  throw new TranslationProviderError('Translation provider returned an unparseable result', true);
+}
+
+/**
+ * LLM-based translation AND authoritative language detection. The speech
+ * provider does not decide the source language — this model reads the actual
+ * text and returns {sourceLanguage, translatedText} as structured JSON. An
+ * LLM also handles slang and code-switching ("Habibi, let's go mañana")
+ * better than literal MT engines.
  */
 export class OpenAITranslationProvider implements TranslationProvider {
   readonly name = 'openai';
@@ -30,16 +61,20 @@ export class OpenAITranslationProvider implements TranslationProvider {
       .join('\n');
 
     const system = [
-      `You translate live conversation snippets into the language with ISO 639-1 code "${request.targetLanguage}".`,
+      'You are the translation engine of a live conversation translator.',
+      `Target language: ISO 639-1 code "${request.targetLanguage}".`,
       // Upstream language labels can be wrong, so they are deliberately not
       // passed here — the text itself is the only trustworthy signal.
       'Detect the input language yourself from the text.',
-      'Translate meaning, not word-for-word. Keep the register (casual stays casual).',
-      'Sentences may mix languages; translate all of it into the target language.',
-      'If the text is already entirely in the target language, return it unchanged, phrased naturally.',
-      'Do not translate personal names or brand names unless a well-known localized form exists.',
-      'Keep numbers, place names, currencies and dates accurate.',
-      'Output ONLY the translation — no quotes, no explanations, no source text.',
+      'Reply with ONLY a JSON object, no other text:',
+      '{"sourceLanguage": "<ISO 639-1 code of the input language, or \\"und\\" if genuinely unsure>", "translatedText": "<the translation>"}',
+      'Translation rules:',
+      '- Translate meaning naturally, not word-for-word. Keep the register (casual stays casual).',
+      '- Sentences may mix languages; translate all of it into the target language.',
+      '- If the text is already entirely in the target language, return it unchanged, phrased naturally.',
+      '- Do not translate personal names or brand names unless a well-known localized form exists.',
+      '- Keep numbers, place names, currencies and dates accurate.',
+      '- Even when sourceLanguage is "und", translatedText must still contain the translation.',
       contextLines
         ? `Recent conversation, for resolving references only (do not re-translate it):\n${contextLines}`
         : '',
@@ -59,6 +94,7 @@ export class OpenAITranslationProvider implements TranslationProvider {
         body: JSON.stringify({
           model: this.model,
           temperature: 0.2,
+          response_format: { type: 'json_object' },
           messages: [
             { role: 'system', content: system },
             { role: 'user', content: request.text },
@@ -75,15 +111,22 @@ export class OpenAITranslationProvider implements TranslationProvider {
     }
 
     if (!response.ok) {
+      // Surface OpenAI's own error type/message (never contains the key) so
+      // "why is every translation failing" is answerable from the logs.
       const body = await response.text().catch(() => '');
+      let detail = '';
+      try {
+        const parsed = JSON.parse(body) as { error?: { type?: string; code?: string; message?: string } };
+        detail = [parsed.error?.type, parsed.error?.code, parsed.error?.message]
+          .filter(Boolean)
+          .join(' / ');
+      } catch {
+        detail = body.slice(0, 200);
+      }
       const retryable = isRetryableStatus(response.status);
-      log.error('openai translation failed', {
-        status: response.status,
-        retryable,
-        bodyLength: body.length,
-      });
+      log.error('openai translation failed', { status: response.status, retryable, detail });
       throw new TranslationProviderError(
-        `Translation provider error (${response.status})`,
+        `Translation provider error (HTTP ${response.status}${detail ? `: ${detail}` : ''})`,
         retryable,
         response.status,
       );
@@ -92,16 +135,14 @@ export class OpenAITranslationProvider implements TranslationProvider {
     const json = (await response.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
     };
-    const translatedText = json.choices?.[0]?.message?.content?.trim() ?? '';
+    const content = json.choices?.[0]?.message?.content ?? '';
+    const parsed = parseTranslationResponse(content);
     log.debug('openai translation ok', {
       latencyMs: Date.now() - started,
       inputLength: request.text.length,
-      outputLength: translatedText.length,
+      outputLength: parsed.translatedText.length,
+      sourceLanguage: parsed.sourceLanguage,
     });
-
-    if (!translatedText) {
-      throw new TranslationProviderError('Translation provider returned an empty result', true);
-    }
-    return { translatedText };
+    return parsed;
   }
 }

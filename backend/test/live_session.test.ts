@@ -432,6 +432,52 @@ describe('LiveSession streaming pipeline', () => {
     });
   });
 
+  it('adopts the translator\'s language verdict in translation_complete', async () => {
+    // Speech says "und"; the translator (which read the text) says Spanish.
+    translation.translate = async () => ({
+      translatedText: 'مرحباً يا أخي',
+      sourceLanguage: 'es',
+    });
+
+    streamSegment(segmentId(1));
+    streaming.sessions[0]!.emitUtterance({
+      text: 'Hola hermano',
+      language: 'und',
+      languageConfidence: 0,
+    });
+    streaming.sessions[0]!.emitFinalized(true);
+    await settle();
+
+    expect(transcripts()[0]!.sourceLanguage).toBe('und'); // provisional
+    expect(completions()[0]).toMatchObject({
+      translatedText: 'مرحباً يا أخي',
+      sourceLanguage: 'es', // authoritative, from the translator
+    });
+  });
+
+  it('exposes the real failure reason on translation_failed', async () => {
+    await makeSession([
+      new TranslationProviderError(
+        'Translation provider error (HTTP 429: insufficient_quota / credit_balance_exhausted)',
+        false, // treat as permanent for this test to fail fast
+        429,
+      ),
+    ]);
+    streamSegment(segmentId(1));
+    streaming.sessions[0]!.emitUtterance({ text: 'Good morning.' });
+    streaming.sessions[0]!.emitFinalized(true);
+
+    const deadline = Date.now() + 3000;
+    while (!sent.some((m) => m.type === 'translation_failed') && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(sent.find((m) => m.type === 'translation_failed')).toMatchObject({
+      status: 429,
+      reason: expect.stringContaining('insufficient_quota'),
+    });
+  });
+
   it('recovers from a transient translation failure without telling the user', async () => {
     await makeSession([
       new TranslationProviderError('Translation provider error (503)', true, 503),

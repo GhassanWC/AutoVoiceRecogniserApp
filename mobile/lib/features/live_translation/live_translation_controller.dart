@@ -296,13 +296,27 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       case TranscriptFinalEvent(:final message):
         activityLabel = null;
         _addTranscript(message);
-      case TranslationCompleteEvent(:final messageId, :final translatedText):
+      case TranslationCompleteEvent(:final messageId, :final translatedText, :final sourceLanguage):
+        final languageKnown = sourceLanguage != null && sourceLanguage != 'und';
         _updateMessage(
           messageId,
-          (m) => m.copyWith(translatedText: translatedText, status: TranslationStatus.done),
+          (m) => m.copyWith(
+            translatedText: translatedText,
+            status: TranslationStatus.done,
+            // The translator read the actual text — its language verdict
+            // replaces the provisional one from the speech provider.
+            sourceLanguage: languageKnown ? sourceLanguage : null,
+            languageConfidence: languageKnown ? 0.9 : null,
+          ),
           speak: true,
         );
-      case TranslationFailedEvent(:final messageId):
+      case TranslationFailedEvent(:final messageId, :final reason, :final status):
+        if (settings.settings.developerDiagnostics) {
+          developer.log(
+            '[PIPELINE] translation FAILED id=$messageId status=$status reason=$reason',
+            name: 'pipeline',
+          );
+        }
         _updateMessage(messageId, (m) => m.copyWith(status: TranslationStatus.failed));
       case SegmentDroppedEvent():
         activityLabel = null;

@@ -43,13 +43,15 @@ class TranslationMessage {
   TranslationMessage copyWith({
     String? translatedText,
     TranslationStatus? status,
+    String? sourceLanguage,
+    double? languageConfidence,
   }) {
     return TranslationMessage(
       id: id,
       speakerId: speakerId,
       speakerLabel: speakerLabel,
-      sourceLanguage: sourceLanguage,
-      languageConfidence: languageConfidence,
+      sourceLanguage: sourceLanguage ?? this.sourceLanguage,
+      languageConfidence: languageConfidence ?? this.languageConfidence,
       transcriptionConfidence: transcriptionConfidence,
       originalText: originalText,
       translatedText: translatedText ?? this.translatedText,

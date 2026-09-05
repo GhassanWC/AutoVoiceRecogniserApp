@@ -18,6 +18,12 @@ export interface TranslationRequest {
 
 export interface TranslationResult {
   translatedText: string;
+  /**
+   * ISO 639-1 code the TRANSLATOR detected from the text itself ("und" when
+   * unsure). When present this is the authoritative source language — speech
+   * providers' language labels are only provisional metadata.
+   */
+  sourceLanguage?: string;
 }
 
 /**

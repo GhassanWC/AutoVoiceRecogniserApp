@@ -33,3 +33,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Generated audio fixtures for verify:providers
+backend/fixtures/

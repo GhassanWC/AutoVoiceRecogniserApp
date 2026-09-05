@@ -25,6 +25,8 @@ export interface TranslationJob {
 export interface TranslationJobSuccess {
   messageId: string;
   translatedText: string;
+  /** Language detected by the translator from the text; undefined if not reported. */
+  sourceLanguage?: string;
   attempts: number;
   latencyMs: number;
 }
@@ -112,6 +114,7 @@ export class TranslationQueue {
         this.onSuccess({
           messageId: job.messageId,
           translatedText: result.translatedText,
+          sourceLanguage: result.sourceLanguage,
           attempts: attempt,
           latencyMs: Date.now() - started,
         });

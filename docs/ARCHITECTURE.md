@@ -12,17 +12,21 @@ Adaptive Voice Activity Detection (on-device, Dart)  ← silence never leaves th
 WebSocket  wss://…/live-translation                  ← binary frames + JSON control
     ↓
 Backend LiveSession (one per connection)
-    ↓  audio forwarded as it arrives
-Deepgram live stream (one per session: nova-3, language=multi, diarize_model=latest)
-    ↓  { text, per-word language, per-word speaker, confidences }
+    ↓  audio forwarded as it arrives (16 kHz PCM → resampled to 24 kHz)
+OpenAI realtime transcription (one per session: gpt-4o-transcribe-diarize,
+                               far_field noise reduction, NO input language —
+                               it transcribes whatever language it hears)
+    ↓  { transcript, diarized speaker segments }
     ↓  speaker ids from the provider, preserved verbatim
 transcript_final event → mobile chat UI shows the message with "Translating…"
     ↓
 translation queue (concurrency 2, retries w/ backoff on 408/429/5xx/network)
-    ↓  OpenAI translation — ALWAYS runs on a non-empty transcript,
-    ↓  even when sourceLanguage is "und" (language is metadata only)
+    ↓  OpenAI translation — ALWAYS runs on a non-empty transcript; it is also
+    ↓  the AUTHORITATIVE language detector: returns structured JSON
+    ↓  {sourceLanguage, translatedText} from the actual text
 translation_complete / translation_failed → updates the SAME message
-                                            (+ optional local history, TTS)
+                                            (language label included; +
+                                            optional local history, TTS)
 ```
 
 Reliability rules for translation:
@@ -41,23 +45,29 @@ Reliability rules for translation:
 - Startup refuses to run a real provider without its API key — the backend
   never silently degrades to mock.
 
-The Deepgram stream lives for the whole session, so switching languages
+The realtime stream lives for the whole session, so switching languages
 mid-conversation needs no reconnect or reconfiguration, and diarized speaker
-ids stay stable across the conversation. Client segment ends send a
-`Finalize` to flush results immediately; `KeepAlive` frames cover the silent
-stretches (silence still never leaves the phone).
+ids stay stable across the conversation. Server turn detection is disabled —
+the phone's VAD owns segmentation, and each client segment end commits the
+audio buffer, which finalizes one transcription. There is **no source-language
+allowlist** on this path: Arabic, Thai, Chinese or anything else the model can
+hear is transcribed; the speech stage reports `sourceLanguage: "und"` and the
+translation stage — which reads the actual text — is the authoritative
+language detector.
 
-**Provider limitation, kept explicit:** nova-3 `language=multi` currently
-code-switches between English, Spanish, French, German, Hindi, Russian,
-Portuguese, Japanese, Italian and Dutch only (`NOVA3_MULTI_LANGUAGES` in
-`deepgram_stream.ts`). A word tagged outside that set yields
-`sourceLanguage: "und"` rather than an unverifiable language claim; the
-transcript and translation still go through. Expand the list only when
-Deepgram's documentation does.
+`mock` falls back to the per-segment batch pipeline (PCM → WAV → transcribe →
+heuristic speakers), the live pipeline falls back to it (whisper-1) if the
+stream errors mid-session, and the optional `deepgram` provider (nova-3
+`language=multi`, ten-language code-switching limit in
+`NOVA3_MULTI_LANGUAGES`) remains behind the same abstraction but is not part
+of the MVP.
 
-Providers without a streaming mode (openai/mock) fall back to the previous
-per-segment batch pipeline (PCM → WAV → transcribe → heuristic speakers), and
-the live pipeline also falls back to it if the stream errors mid-session.
+**Real provider smoke test:** `npm run verify:providers` calls the actually
+configured speech + translation APIs (TTS-generated Arabic/English fixtures →
+transcription; "Good morning." / "Hello." / "السلام عليكم" → Arabic
+translation) and prints PASS or the concrete HTTP status and provider error.
+Run it whenever the app shows failing translations — mocked unit tests do not
+prove provider health.
 
 Latency budget: the segment closes ~0.9 s after the speaker stops (silence
 hangover); recognition + translation of a short utterance typically add
@@ -117,7 +127,7 @@ The backend never hard-codes an AI vendor. Interfaces in `backend/src/providers/
 
 | Interface | Implementations | Selected by |
 |---|---|---|
-| `StreamingSpeechProvider` | `deepgram` (live WS: nova-3, `language=multi`, `diarize_model=latest`) | `SPEECH_PROVIDER` |
+| `StreamingSpeechProvider` | **`openai` (production: realtime WS, gpt-4o-transcribe-diarize, far_field)**, `deepgram` (optional: nova-3, `language=multi`, `diarize_model=latest`) | `SPEECH_PROVIDER` |
 | `SpeechRecognitionProvider` (batch fallback) | `mock`, `openai` (Whisper), `deepgram` (pre-recorded, `detect_language`) | `SPEECH_PROVIDER` |
 | `TranslationProvider` | `mock`, `openai` (LLM — handles slang & code-switching), `google` (Translation v2) | `TRANSLATION_PROVIDER` |
 | `SpeakerDiarizationProvider` (batch fallback only) | `heuristic`, `none` | `DIARIZATION_PROVIDER` |

@@ -94,9 +94,14 @@ sealed class ServerEvent {
         return TranslationCompleteEvent(
           messageId: json['messageId'] as String? ?? '',
           translatedText: json['translatedText'] as String? ?? '',
+          sourceLanguage: json['sourceLanguage'] as String?,
         );
       case 'translation_failed':
-        return TranslationFailedEvent(messageId: json['messageId'] as String? ?? '');
+        return TranslationFailedEvent(
+          messageId: json['messageId'] as String? ?? '',
+          reason: json['reason'] as String?,
+          status: json['status'] as int?,
+        );
       case 'segment_dropped':
         return SegmentDroppedEvent(
           segmentId: json['segmentId'] as String? ?? '',
@@ -164,14 +169,25 @@ class TranscriptFinalEvent extends ServerEvent {
 }
 
 class TranslationCompleteEvent extends ServerEvent {
-  const TranslationCompleteEvent({required this.messageId, required this.translatedText});
+  const TranslationCompleteEvent({
+    required this.messageId,
+    required this.translatedText,
+    this.sourceLanguage,
+  });
   final String messageId;
   final String translatedText;
+
+  /// Authoritative language, detected by the translator from the actual text.
+  final String? sourceLanguage;
 }
 
 class TranslationFailedEvent extends ServerEvent {
-  const TranslationFailedEvent({required this.messageId});
+  const TranslationFailedEvent({required this.messageId, this.reason, this.status});
   final String messageId;
+
+  /// Real provider failure detail, for developer diagnostics.
+  final String? reason;
+  final int? status;
 }
 
 class SegmentDroppedEvent extends ServerEvent {

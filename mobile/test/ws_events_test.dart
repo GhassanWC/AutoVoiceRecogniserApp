@@ -74,14 +74,19 @@ void main() {
       'messageId': 'msg_1',
       'translatedText': 'مرحباً يا أخي',
       'targetLanguage': 'ar',
+      'sourceLanguage': 'es',
     }));
     expect(complete, isA<TranslationCompleteEvent>());
     expect((complete as TranslationCompleteEvent).messageId, 'msg_1');
     expect(complete.translatedText, 'مرحباً يا أخي');
+    expect(complete.sourceLanguage, 'es'); // the translator's language verdict
 
-    final failed = ServerEvent.parse('{"type":"translation_failed","messageId":"msg_1"}');
+    final failed = ServerEvent.parse(
+        '{"type":"translation_failed","messageId":"msg_1","status":429,"reason":"insufficient_quota"}');
     expect(failed, isA<TranslationFailedEvent>());
     expect((failed as TranslationFailedEvent).messageId, 'msg_1');
+    expect(failed.status, 429);
+    expect(failed.reason, 'insufficient_quota');
   });
 
   test('parses status, error, limit and session events', () {

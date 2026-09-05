@@ -132,12 +132,20 @@ export interface TranslationCompletePayload {
   messageId: string;
   translatedText: string;
   targetLanguage: string;
+  /**
+   * Authoritative source language, detected by the TRANSLATOR from the text.
+   * Replaces the provisional label from transcript_final when present.
+   */
+  sourceLanguage?: string;
 }
 
 /** Sent only after every retry failed; the client offers a Retry action. */
 export interface TranslationFailedPayload {
   type: 'translation_failed';
   messageId: string;
+  /** Real provider failure detail for developer diagnostics (never a secret). */
+  reason?: string;
+  status?: number;
 }
 
 export type ServerMessage =

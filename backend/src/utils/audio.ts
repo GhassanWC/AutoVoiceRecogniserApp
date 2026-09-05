@@ -37,6 +37,28 @@ export function pcmDurationMs(pcmBytes: number, format: PcmFormat): number {
   return Math.round((pcmBytes / bytesPerSecond) * 1000);
 }
 
+/**
+ * Linear-interpolation resampler for PCM16LE mono. Quality is fine for speech
+ * (16 kHz mic audio → the 24 kHz OpenAI realtime input format); not meant for
+ * music. Returns the input unchanged when the rates already match.
+ */
+export function resamplePcm16(pcm: Buffer, fromRate: number, toRate: number): Buffer {
+  if (fromRate === toRate || pcm.length < 4) return pcm;
+  const inSamples = Math.floor(pcm.length / 2);
+  const outSamples = Math.max(1, Math.round((inSamples * toRate) / fromRate));
+  const out = Buffer.alloc(outSamples * 2);
+  const step = (inSamples - 1) / Math.max(1, outSamples - 1);
+  for (let i = 0; i < outSamples; i++) {
+    const position = i * step;
+    const index = Math.floor(position);
+    const fraction = position - index;
+    const a = pcm.readInt16LE(index * 2);
+    const b = index + 1 < inSamples ? pcm.readInt16LE((index + 1) * 2) : a;
+    out.writeInt16LE(Math.round(a + (b - a) * fraction), i * 2);
+  }
+  return out;
+}
+
 /** Root-mean-square level of a PCM16LE buffer, 0..1. Used for sanity checks. */
 export function pcm16Rms(pcm: Buffer): number {
   const samples = Math.floor(pcm.length / 2);

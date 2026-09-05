@@ -17,7 +17,10 @@ npm run simulate   # streams 3 fake speech segments, prints Arabic translations
 ```
 
 Other commands: `npm test` (vitest), `npm run typecheck`, `npm run build` +
-`npm start` (production), `npm run migrate` (PostgreSQL schema).
+`npm start` (production), `npm run migrate` (PostgreSQL schema),
+`npm run verify:providers` (REAL speech + translation API smoke test — run it
+whenever translations fail in the app; prints PASS or the concrete HTTP
+status/error, never the key).
 
 ## Configuration
 
@@ -28,9 +31,9 @@ Copy `.env.example` → `.env`. Everything has a safe development default.
 | `PORT` | number | default 8080 |
 | `JWT_SECRET` | string | **must** be changed in production (refuses to start otherwise) |
 | `DATABASE_URL` | postgres URL | unset → in-memory storage |
-| `SPEECH_PROVIDER` | `mock` `openai` `deepgram` | **production: `deepgram`** — enables the live streaming pipeline (nova-3, `language=multi`, `diarize_model=latest`: multilingual code-switching + real speaker diarization on one socket per session; code-switching covers en/es/fr/de/hi/ru/pt/ja/it/nl — see `NOVA3_MULTI_LANGUAGES`). `openai`/`mock` use per-segment batch recognition |
-| `SPEECH_API_KEY` | string | key for the chosen speech provider (Deepgram key for `deepgram`) |
-| `SPEECH_MODEL` | string | optional; defaults `whisper-1` / `nova-3` |
+| `SPEECH_PROVIDER` | `mock` `openai` `deepgram` | **production: `openai`** — OpenAI realtime transcription (gpt-4o-transcribe-diarize, far-field noise reduction, diarization, no source-language configuration or allowlist). `deepgram` is optional (nova-3 multi, ten-language limit); `mock` uses per-segment batch recognition |
+| `SPEECH_API_KEY` | string | key for the chosen speech provider (OpenAI key for `openai`; may equal `TRANSLATION_API_KEY`) |
+| `SPEECH_MODEL` | string | optional realtime model override; default `gpt-4o-transcribe-diarize` |
 | `TRANSLATION_PROVIDER` | `mock` `openai` `google` | **production: `openai`** |
 | `TRANSLATION_API_KEY` | string | OpenAI key for `openai` |
 | `TRANSLATION_MODEL` | string | optional; default `gpt-4o-mini` |

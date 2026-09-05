@@ -99,6 +99,8 @@ interface RegisteredMessage {
   speakerId: string | null;
   speakerLabel: string | null;
   languageConfidence: number;
+  /** Language the translator detected; set on completion. */
+  resolvedLanguage?: string;
 }
 
 /**
@@ -533,17 +535,22 @@ export class LiveSession {
     if (entry.status === 'done') return; // duplicate completion (e.g. double retry)
     entry.status = 'done';
     entry.translatedText = result.translatedText;
+    // The translator read the actual text, so its language verdict outranks
+    // the speech provider's provisional label.
+    const sourceLanguage = result.sourceLanguage ?? entry.request.sourceLanguage;
+    entry.resolvedLanguage = sourceLanguage;
 
     this.deps.send({
       type: 'translation_complete',
       messageId: result.messageId,
       translatedText: result.translatedText,
       targetLanguage: this.targetLanguage,
+      sourceLanguage,
     });
     this.translationCount += 1;
 
     this.context.push({
-      sourceLanguage: entry.request.sourceLanguage,
+      sourceLanguage,
       originalText: entry.originalText,
       translatedText: result.translatedText,
     });
@@ -556,7 +563,7 @@ export class LiveSession {
           sessionId: this.sessionId,
           speakerId: entry.speakerId,
           speakerLabel: entry.speakerLabel,
-          sourceLanguage: entry.request.sourceLanguage,
+          sourceLanguage: entry.resolvedLanguage ?? entry.request.sourceLanguage,
           languageConfidence: entry.languageConfidence,
           originalText: entry.originalText,
           translatedText: result.translatedText,
@@ -592,8 +599,14 @@ export class LiveSession {
       lastError: failure.lastError,
     });
     if (this.closed || !this.sessionId) return;
-    // The transcript stays on screen; the client shows a Retry action.
-    this.deps.send({ type: 'translation_failed', messageId: failure.messageId });
+    // The transcript stays on screen; the client shows a Retry action and the
+    // real failure reason reaches developer diagnostics (never a secret).
+    this.deps.send({
+      type: 'translation_failed',
+      messageId: failure.messageId,
+      reason: failure.lastError,
+      status: failure.lastStatus,
+    });
   }
 
   /** Client pressed Retry: resubmit the SAME text — no audio is re-recorded. */
@@ -609,6 +622,7 @@ export class LiveSession {
         messageId,
         translatedText: entry.translatedText ?? '',
         targetLanguage: this.targetLanguage,
+        sourceLanguage: entry.resolvedLanguage,
       });
       return;
     }
