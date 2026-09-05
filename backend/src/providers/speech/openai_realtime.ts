@@ -1,7 +1,12 @@
 import { WebSocket } from 'ws';
 import { resamplePcm16 } from '../../utils/audio';
 import { log } from '../../utils/logger';
-import { StreamingSpeechProvider, StreamingSpeechSession, StreamingUtterance } from './types';
+import {
+  StreamingSessionOptions,
+  StreamingSpeechProvider,
+  StreamingSpeechSession,
+  StreamingUtterance,
+} from './types';
 
 /**
  * OpenAI realtime transcription (production MVP speech path).
@@ -26,6 +31,21 @@ const REALTIME_URL = 'wss://api.openai.com/v1/realtime?intent=transcription';
 const REALTIME_SAMPLE_RATE = 24_000;
 /** OpenAI rejects commits of less than ~100 ms of audio; stay safely above. */
 const MIN_COMMIT_BYTES = (REALTIME_SAMPLE_RATE * 2 * 200) / 1000;
+
+/**
+ * Server-VAD tuning for live subtitles: a short end-of-speech window so a
+ * finished phrase finalizes fast (the product target is "boom — Arabic
+ * appears"), a low threshold so quiet far-field speech (TV, someone across
+ * the room) still trips detection, and enough prefix padding that the first
+ * syllable survives. Plain server_vad, NOT semantic VAD — semantic turn
+ * detection adds model latency, and fast subtitles win over smarter turns.
+ */
+const SERVER_VAD_CONFIG = {
+  type: 'server_vad',
+  threshold: 0.35,
+  prefix_padding_ms: 300,
+  silence_duration_ms: 300,
+} as const;
 
 export interface RealtimeSegment {
   itemId: string;
@@ -108,6 +128,8 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
   private segments: RealtimeSegment[] = [];
   private bytesSinceCommit = 0;
   private readonly speakerIds = new Map<string, string>();
+  /** speech_stopped wall-clock times awaiting their transcription.completed. */
+  private readonly speechEndQueue: number[] = [];
 
   private utteranceHandler: (utterance: StreamingUtterance) => void = () => undefined;
   private finalizedHandler: (hadSpeech: boolean) => void = () => undefined;
@@ -117,6 +139,7 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
     apiKey: string,
     private readonly model: string,
     private readonly inputSampleRate: number,
+    private readonly serverTurnDetection: boolean,
     baseUrl: string = REALTIME_URL,
   ) {
     this.ws = new WebSocket(baseUrl, {
@@ -152,6 +175,9 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
 
   finalize(): void {
     if (this.closed) return;
+    // With server turn detection OpenAI's VAD commits turns by itself —
+    // manual commits would double-cut utterances.
+    if (this.serverTurnDetection) return;
     if (this.bytesSinceCommit < MIN_COMMIT_BYTES) {
       // Too little audio to commit (OpenAI rejects near-empty buffers) — the
       // segment finalizes locally as "no speech" so the client UI moves on.
@@ -183,7 +209,8 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
       return;
     }
     // Configuration first, then any queued audio. No input language is set —
-    // the model transcribes the language it hears, per utterance.
+    // the model transcribes the language it hears, per utterance. far_field
+    // noise reduction: this product listens to a room, not a handset.
     this.ws.send(
       JSON.stringify({
         type: 'transcription_session.update',
@@ -191,7 +218,9 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
           input_audio_format: 'pcm16',
           input_audio_transcription: { model: this.model },
           input_audio_noise_reduction: { type: 'far_field' },
-          turn_detection: null, // the phone's VAD owns segmentation
+          // Continuous mode: OpenAI's VAD cuts utterances (fast subtitles).
+          // Segmented mode: the caller commits, turn detection stays off.
+          turn_detection: this.serverTurnDetection ? SERVER_VAD_CONFIG : null,
         },
       }),
     );
@@ -210,6 +239,11 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
     }
 
     switch (event.type) {
+      case 'input_audio_buffer.speech_stopped':
+        // The VAD just heard the speaker finish — anchor for latency stats.
+        this.speechEndQueue.push(Date.now());
+        break;
+
       case 'conversation.item.input_audio_transcription.segment':
         this.segments.push({
           itemId: event.item_id ?? '',
@@ -225,6 +259,7 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
           (s) => !event.item_id || s.itemId === event.item_id,
         );
         this.segments = this.segments.filter((s) => event.item_id && s.itemId !== event.item_id);
+        const speechEndAtMs = this.speechEndQueue.shift();
         const utterances = utterancesFromRealtime(
           itemSegments,
           event.transcript ?? '',
@@ -237,7 +272,9 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
             return id;
           },
         );
-        for (const utterance of utterances) this.utteranceHandler(utterance);
+        for (const utterance of utterances) {
+          this.utteranceHandler({ ...utterance, speechEndAtMs });
+        }
         this.finalizedHandler(utterances.length > 0);
         break;
       }
@@ -246,6 +283,7 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
         log.warn('openai realtime transcription item failed', {
           message: event.error?.message,
         });
+        this.speechEndQueue.shift();
         this.finalizedHandler(false);
         break;
 
@@ -282,7 +320,13 @@ export class OpenAIRealtimeSpeechProvider implements StreamingSpeechProvider {
     if (!apiKey) throw new Error('SPEECH_API_KEY is required for the openai speech provider');
   }
 
-  createSession(options: { sampleRate: number }): StreamingSpeechSession {
-    return new OpenAIRealtimeSession(this.apiKey, this.model, options.sampleRate, this.baseUrl);
+  createSession(options: StreamingSessionOptions): StreamingSpeechSession {
+    return new OpenAIRealtimeSession(
+      this.apiKey,
+      this.model,
+      options.sampleRate,
+      options.serverTurnDetection ?? false,
+      this.baseUrl,
+    );
   }
 }

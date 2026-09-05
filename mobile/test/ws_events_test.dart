@@ -89,6 +89,18 @@ void main() {
     expect(failed.reason, 'insufficient_quota');
   });
 
+  test('parses translation_delta chunks for the same message', () {
+    final delta = ServerEvent.parse('{"type":"translation_delta","messageId":"m1","delta":"أين"}');
+    expect(delta, isA<TranslationDeltaEvent>());
+    expect((delta as TranslationDeltaEvent).messageId, 'm1');
+    expect(delta.delta, 'أين');
+    expect(delta.reset, isFalse);
+
+    final reset = ServerEvent.parse(
+        '{"type":"translation_delta","messageId":"m1","delta":"أين","reset":true}');
+    expect((reset as TranslationDeltaEvent).reset, isTrue);
+  });
+
   test('parses status, error, limit and session events', () {
     expect(
       ServerEvent.parse('{"type":"status","segmentId":"s","state":"translating"}'),

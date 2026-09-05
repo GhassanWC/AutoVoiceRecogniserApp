@@ -111,6 +111,9 @@ export function attachRealtimeServer(
         case 'segment_start':
           session.handleSegmentStart(message);
           break;
+        case 'stream_start':
+          session.handleStreamStart(message);
+          break;
         case 'segment_end':
           session.handleSegmentEnd(message.segmentId, message.durationMs);
           break;

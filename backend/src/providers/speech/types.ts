@@ -45,6 +45,21 @@ export interface StreamingUtterance {
   /** Utterance position on the provider's audio timeline, milliseconds. */
   startMs: number;
   endMs: number;
+  /**
+   * Wall-clock epoch ms when the provider's VAD detected end of speech for
+   * this utterance (when known) — the anchor for latency measurement.
+   */
+  speechEndAtMs?: number;
+}
+
+export interface StreamingSessionOptions {
+  sampleRate: number;
+  /**
+   * true → the PROVIDER's VAD decides utterance boundaries (continuous audio
+   * flows in, low-latency turn detection cuts utterances). false/absent → the
+   * caller segments audio and calls finalize() at each utterance end.
+   */
+  serverTurnDetection?: boolean;
 }
 
 /**
@@ -70,5 +85,5 @@ export interface StreamingSpeechSession {
 
 export interface StreamingSpeechProvider {
   readonly name: string;
-  createSession(options: { sampleRate: number }): StreamingSpeechSession;
+  createSession(options: StreamingSessionOptions): StreamingSpeechSession;
 }

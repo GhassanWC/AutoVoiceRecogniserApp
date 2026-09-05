@@ -21,9 +21,12 @@ import {
   SegmentStartMessage,
   ServerMessage,
   SessionStartMessage,
+  StreamStartMessage,
   TranscriptFinalPayload,
+  TranslationLatency,
 } from './protocol';
 import {
+  TranslationDelta,
   TranslationJobFailure,
   TranslationJobSuccess,
   TranslationQueue,
@@ -88,6 +91,8 @@ interface RecognizedUtterance {
   speakerLabel: string | null;
   audioMs: number;
   sttProvider: string;
+  /** Wall-clock ms when the provider VAD heard speech end (latency anchor). */
+  speechEndAtMs?: number;
 }
 
 interface RegisteredMessage {
@@ -101,6 +106,8 @@ interface RegisteredMessage {
   languageConfidence: number;
   /** Language the translator detected; set on completion. */
   resolvedLanguage?: string;
+  speechEndAtMs?: number;
+  firstDeltaLatencyMs?: number;
 }
 
 /**
@@ -140,6 +147,14 @@ export class LiveSession {
   private pendingFinalizeSegments: string[] = [];
   private lastSegmentId: string | null = null;
 
+  /** Continuous-streaming mode (live subtitles): the active stream id. */
+  private continuousStreamId: string | null = null;
+  private continuousSampleRate = 16000;
+  private streamReopenAttempts = 0;
+
+  /** speech_end → first-delta / final latency samples for p50/p95 logging. */
+  private readonly latencySamples: Array<{ firstDeltaMs?: number; finalMs: number }> = [];
+
   private translations: TranslationQueue;
   /** messageId → job info, for retries and duplicate protection. */
   private messages = new Map<string, RegisteredMessage>();
@@ -150,6 +165,7 @@ export class LiveSession {
       (result) => this.handleTranslationSuccess(result),
       (failure) => this.handleTranslationFailure(failure),
       deps.translationQueueOptions,
+      (delta) => this.handleTranslationDelta(delta),
     );
   }
 
@@ -247,7 +263,47 @@ export class LiveSession {
     this.deps.send({ type: 'status', segmentId: message.segmentId, state: 'hearing' });
   }
 
+  /**
+   * Continuous-streaming mode: from here on the client sends ALL microphone
+   * audio and the speech provider's server VAD cuts utterances. This is the
+   * live-subtitle path — a local VAD never again decides which room speech
+   * is "worth" uploading.
+   */
+  handleStreamStart(message: StreamStartMessage): void {
+    if (!this.requireSession()) return;
+    if (!this.streamingEnabled) {
+      this.deps.send({
+        type: 'error',
+        code: 'streaming_unsupported',
+        message: 'Live streaming is not available with the configured speech provider.',
+        recoverable: false,
+      });
+      return;
+    }
+    this.continuousStreamId = message.streamId;
+    this.continuousSampleRate = message.sampleRate;
+    this.streamReopenAttempts = 0;
+    if (!this.stream) {
+      this.openStream(message.sampleRate, true);
+    }
+    this.deps.send({ type: 'status', segmentId: message.streamId, state: 'hearing' });
+  }
+
   handleAudioFrame(frame: AudioFrame): void {
+    // Continuous mode: forward straight to the provider, nothing else gates it.
+    if (this.continuousStreamId && frame.segmentId === this.continuousStreamId) {
+      if (Date.now() - this.startedAt > env.MAX_SESSION_MINUTES * 60_000) {
+        this.deps.send({
+          type: 'limit_reached',
+          message: 'This listening session reached its maximum length. Please start again.',
+        });
+        this.continuousStreamId = null;
+        return;
+      }
+      this.stream?.sendAudio(frame.pcm);
+      return;
+    }
+
     const segment = this.segment;
     if (!segment || segment.id !== frame.segmentId) return; // stale frame after drop/reconnect
     if (frame.sequence < segment.nextSequence) return; // duplicate (client retry)
@@ -347,11 +403,11 @@ export class LiveSession {
 
   // ── Streaming pipeline ──────────────────────────────────────────────────────
 
-  private openStream(sampleRate: number): void {
+  private openStream(sampleRate: number, serverTurnDetection = false): void {
     const provider = this.deps.streamingSpeech;
     if (!provider) return;
     try {
-      const stream = provider.createSession({ sampleRate });
+      const stream = provider.createSession({ sampleRate, serverTurnDetection });
       stream.onUtterance((utterance) => this.handleStreamUtterance(provider.name, utterance));
       stream.onFinalized((hadSpeech) => this.handleStreamFinalized(hadSpeech));
       stream.onError((error) => this.handleStreamError(error));
@@ -369,7 +425,11 @@ export class LiveSession {
     if (this.closed || !this.sessionId) return;
     if (!utterance.text) return;
 
-    const segmentId = this.pendingFinalizeSegments[0] ?? this.lastSegmentId ?? newUuid();
+    const segmentId =
+      this.continuousStreamId ??
+      this.pendingFinalizeSegments[0] ??
+      this.lastSegmentId ??
+      newUuid();
     const speakerId = utterance.speakerId;
     const speakerNumber = speakerId?.match(/(\d+)$/)?.[1];
 
@@ -383,6 +443,7 @@ export class LiveSession {
       speakerLabel: speakerNumber ? `Speaker ${speakerNumber}` : null,
       audioMs: Math.max(0, utterance.endMs - utterance.startMs),
       sttProvider: providerName,
+      speechEndAtMs: utterance.speechEndAtMs,
     });
   }
 
@@ -394,13 +455,46 @@ export class LiveSession {
   }
 
   private handleStreamError(error: Error): void {
+    this.stream = null;
+    this.pendingFinalizeSegments = [];
+
+    // Continuous mode has no client segments to fall back on — reopen the
+    // provider stream instead (a moment of audio is lost, the session lives).
+    if (this.continuousStreamId && !this.closed && this.sessionId) {
+      if (this.streamReopenAttempts < 3) {
+        this.streamReopenAttempts += 1;
+        log.warn('speech stream failed in continuous mode, reopening', {
+          sessionId: this.sessionId,
+          attempt: this.streamReopenAttempts,
+          message: error.message,
+        });
+        setTimeout(() => {
+          if (!this.closed && this.sessionId && this.continuousStreamId && !this.stream) {
+            this.openStream(this.continuousSampleRate, true);
+          }
+        }, 500).unref?.();
+        return;
+      }
+      log.error('speech stream failed permanently in continuous mode', {
+        sessionId: this.sessionId,
+        message: error.message,
+      });
+      this.continuousStreamId = null;
+      this.streamFailed = true;
+      this.deps.send({
+        type: 'error',
+        code: 'stream_interrupted',
+        message: 'Live recognition is unavailable right now. Please stop and start again.',
+        recoverable: false,
+      });
+      return;
+    }
+
     log.warn('speech stream failed, falling back to batch recognition', {
       sessionId: this.sessionId,
       message: error.message,
     });
-    this.stream = null;
     this.streamFailed = true;
-    this.pendingFinalizeSegments = [];
     // Audio already forwarded for the current segment is gone; drop it so the
     // client's UI does not wait forever, then continue via the batch path.
     if (this.segment) {
@@ -520,13 +614,50 @@ export class LiveSession {
       speakerId: recognized.speakerId,
       speakerLabel: recognized.speakerLabel,
       languageConfidence: recognized.languageConfidence,
+      speechEndAtMs: recognized.speechEndAtMs,
     });
+
+    if (this.continuousStreamId && recognized.segmentId === this.continuousStreamId) {
+      // Continuous mode meters RECOGNIZED speech, not raw stream time —
+      // an empty room costs the user nothing. Also the cheapest place to
+      // notice an exhausted allowance and end the stream.
+      void recordProcessedSpeech(
+        this.deps.userId,
+        Math.max(recognized.audioMs, 500) / 1000,
+        0,
+      ).catch(() => undefined);
+      void hasRemainingAllowance(this.deps.userId).then((allowed) => {
+        if (!allowed && this.continuousStreamId && this.sessionId && !this.closed) {
+          this.continuousStreamId = null;
+          this.deps.send({
+            type: 'limit_reached',
+            message: 'You have used all of your free translation minutes for this month.',
+          });
+        }
+      });
+    }
 
     // No same-language skip on purpose: language detection can be wrong, and
     // skipping on a wrong label would leave foreign speech untranslated. The
     // translator detects the input language itself and returns text already in
     // the target language naturally unchanged.
     this.translations.enqueue({ messageId, request });
+  }
+
+  /** Forward streamed translation chunks to the client the moment they exist. */
+  private handleTranslationDelta(delta: TranslationDelta): void {
+    if (this.closed || !this.sessionId) return;
+    const entry = this.messages.get(delta.messageId);
+    if (!entry || entry.status !== 'pending') return;
+    if (entry.firstDeltaLatencyMs === undefined && entry.speechEndAtMs !== undefined) {
+      entry.firstDeltaLatencyMs = Math.max(0, Date.now() - entry.speechEndAtMs);
+    }
+    this.deps.send({
+      type: 'translation_delta',
+      messageId: delta.messageId,
+      delta: delta.delta,
+      ...(delta.reset ? { reset: true } : {}),
+    });
   }
 
   private handleTranslationSuccess(result: TranslationJobSuccess): void {
@@ -540,12 +671,22 @@ export class LiveSession {
     const sourceLanguage = result.sourceLanguage ?? entry.request.sourceLanguage;
     entry.resolvedLanguage = sourceLanguage;
 
+    let latency: TranslationLatency | undefined;
+    if (entry.speechEndAtMs !== undefined) {
+      latency = {
+        speechEndToFirstDeltaMs: entry.firstDeltaLatencyMs,
+        speechEndToFinalMs: Math.max(0, Date.now() - entry.speechEndAtMs),
+      };
+      this.recordLatency(latency);
+    }
+
     this.deps.send({
       type: 'translation_complete',
       messageId: result.messageId,
       translatedText: result.translatedText,
       targetLanguage: this.targetLanguage,
       sourceLanguage,
+      latency,
     });
     this.translationCount += 1;
 
@@ -630,6 +771,38 @@ export class LiveSession {
     this.translations.enqueue({ messageId, request: entry.request });
   }
 
+  /** Track speech_end→translation latencies; log p50/p95 every 10 utterances. */
+  private recordLatency(latency: TranslationLatency): void {
+    if (latency.speechEndToFinalMs === undefined) return;
+    this.latencySamples.push({
+      firstDeltaMs: latency.speechEndToFirstDeltaMs,
+      finalMs: latency.speechEndToFinalMs,
+    });
+    log.info('utterance latency', {
+      sessionId: this.sessionId,
+      speechEndToFirstDeltaMs: latency.speechEndToFirstDeltaMs,
+      speechEndToFinalMs: latency.speechEndToFinalMs,
+    });
+    if (this.latencySamples.length % 10 === 0) {
+      const percentile = (values: number[], p: number): number => {
+        const sorted = [...values].sort((a, b) => a - b);
+        return sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))]!;
+      };
+      const firstDeltas = this.latencySamples
+        .map((s) => s.firstDeltaMs)
+        .filter((v): v is number => v !== undefined);
+      const finals = this.latencySamples.map((s) => s.finalMs);
+      log.info('latency percentiles', {
+        sessionId: this.sessionId,
+        samples: this.latencySamples.length,
+        firstDeltaP50: firstDeltas.length ? percentile(firstDeltas, 50) : undefined,
+        firstDeltaP95: firstDeltas.length ? percentile(firstDeltas, 95) : undefined,
+        finalP50: percentile(finals, 50),
+        finalP95: percentile(finals, 95),
+      });
+    }
+  }
+
   private registerMessage(messageId: string, entry: RegisteredMessage): void {
     this.messages.set(messageId, entry);
     if (this.messages.size > MESSAGE_REGISTRY_LIMIT) {
@@ -676,6 +849,8 @@ export class LiveSession {
     this.processedSegmentIds.clear();
     this.pendingFinalizeSegments = [];
     this.streamFailed = false;
+    this.continuousStreamId = null;
+    this.streamReopenAttempts = 0;
   }
 
   /** Socket closed — finalize the session record, drop all buffers. */

@@ -5,29 +5,36 @@
 ```text
 Environmental microphone (native: Android AudioRecord / iOS AVAudioEngine,
                           iOS: .measurement mode, voice-processing DSP off)
-    ↓  16 kHz mono PCM16, ~100 ms chunks
-Adaptive Voice Activity Detection (on-device, Dart)  ← silence never leaves the phone
-    ↓  speech segments, adaptive noise-floor threshold,
-    ↓  1.5 s pre-roll, 900 ms silence hangover, 15 s cap
+    ↓  16 kHz mono PCM16, ~100 ms chunks — streamed CONTINUOUSLY while
+    ↓  listening (the local VAD only drives the waveform/diagnostics and a
+    ↓  pause after ~30 s of absolute silence; it never gates room speech)
 WebSocket  wss://…/live-translation                  ← binary frames + JSON control
     ↓
 Backend LiveSession (one per connection)
     ↓  audio forwarded as it arrives (16 kHz PCM → resampled to 24 kHz)
 OpenAI realtime transcription (one per session: gpt-4o-transcribe-diarize,
-                               far_field noise reduction, NO input language —
-                               it transcribes whatever language it hears)
-    ↓  { transcript, diarized speaker segments }
+                               far_field noise reduction, NO input language,
+                               server VAD turn detection: threshold 0.35,
+                               300 ms end-of-speech window → fast subtitles)
+    ↓  { transcript, diarized speaker segments, speech-end timestamp }
     ↓  speaker ids from the provider, preserved verbatim
 transcript_final event → mobile chat UI shows the message with "Translating…"
     ↓
 translation queue (concurrency 2, retries w/ backoff on 408/429/5xx/network)
-    ↓  OpenAI translation — ALWAYS runs on a non-empty transcript; it is also
-    ↓  the AUTHORITATIVE language detector: returns structured JSON
-    ↓  {sourceLanguage, translatedText} from the actual text
-translation_complete / translation_failed → updates the SAME message
-                                            (language label included; +
-                                            optional local history, TTS)
+    ↓  OpenAI translation, STREAMED — display chunks are forwarded the moment
+    ↓  the model emits them (translation_delta appends into the SAME bubble);
+    ↓  the reply's first line is the detected language, so the translator is
+    ↓  also the AUTHORITATIVE language detector
+translation_complete / translation_failed → finalizes the SAME message
+                     (language label + speech_end→delta/final latency; +
+                      optional local history, TTS)
 ```
+
+Latency is measured per utterance from the provider's speech-end signal:
+`speechEndToFirstDeltaMs` and `speechEndToFinalMs` ride on
+`translation_complete`, are logged in the app's developer diagnostics, and
+the backend logs p50/p95 every 10 utterances. Target: first translated words
+well under a second after a short phrase ends.
 
 Reliability rules for translation:
 

@@ -99,6 +99,20 @@ class MessageBubble extends StatelessWidget {
                         ),
                       ),
                     ),
+                  // Streamed deltas render as they arrive — live subtitles;
+                  // the spinner row only shows before the first word lands.
+                  TranslationStatus.pending when message.translatedText.isNotEmpty => SizedBox(
+                      width: double.infinity,
+                      child: Text(
+                        message.translatedText,
+                        textDirection: targetRtl ? TextDirection.rtl : TextDirection.ltr,
+                        textAlign: TextAlign.start,
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          height: 1.45,
+                        ),
+                      ),
+                    ),
                   TranslationStatus.pending => Row(
                       children: [
                         SizedBox(

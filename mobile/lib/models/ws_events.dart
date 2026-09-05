@@ -90,11 +90,20 @@ sealed class ServerEvent {
                 : null,
           ),
         );
+      case 'translation_delta':
+        return TranslationDeltaEvent(
+          messageId: json['messageId'] as String? ?? '',
+          delta: json['delta'] as String? ?? '',
+          reset: json['reset'] as bool? ?? false,
+        );
       case 'translation_complete':
         return TranslationCompleteEvent(
           messageId: json['messageId'] as String? ?? '',
           translatedText: json['translatedText'] as String? ?? '',
           sourceLanguage: json['sourceLanguage'] as String?,
+          latency: json['latency'] is Map<String, dynamic>
+              ? json['latency'] as Map<String, dynamic>
+              : null,
         );
       case 'translation_failed':
         return TranslationFailedEvent(
@@ -168,17 +177,34 @@ class TranscriptFinalEvent extends ServerEvent {
   final TranslationMessage message;
 }
 
+/// A streamed chunk of translated text — append to the SAME bubble (or
+/// replace its partial text when [reset] is true after a server-side retry).
+class TranslationDeltaEvent extends ServerEvent {
+  const TranslationDeltaEvent({
+    required this.messageId,
+    required this.delta,
+    required this.reset,
+  });
+  final String messageId;
+  final String delta;
+  final bool reset;
+}
+
 class TranslationCompleteEvent extends ServerEvent {
   const TranslationCompleteEvent({
     required this.messageId,
     required this.translatedText,
     this.sourceLanguage,
+    this.latency,
   });
   final String messageId;
   final String translatedText;
 
   /// Authoritative language, detected by the translator from the actual text.
   final String? sourceLanguage;
+
+  /// {speechEndToFirstDeltaMs, speechEndToFinalMs} — developer diagnostics.
+  final Map<String, dynamic>? latency;
 }
 
 class TranslationFailedEvent extends ServerEvent {

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../models/ws_events.dart';
@@ -41,6 +42,13 @@ class LiveTranslationClient {
   String _targetLanguage = 'en';
   bool _saveHistory = false;
 
+  // Continuous audio stream (live-subtitle mode). A fresh stream id per
+  // connection keeps server-side bookkeeping unambiguous across reconnects.
+  bool _audioStreamWanted = false;
+  int _streamSampleRate = 16000;
+  String? _streamId;
+  int _streamSequence = 0;
+
   /// Opens the socket and starts a listening session on the server.
   Future<void> connect({required String targetLanguage, required bool saveHistory}) async {
     _targetLanguage = targetLanguage;
@@ -75,6 +83,7 @@ class LiveTranslationClient {
         'targetLanguage': _targetLanguage,
         'saveHistory': _saveHistory,
       });
+      if (_audioStreamWanted) _openAudioStream();
       _setState(LiveConnectionState.connected);
       _reconnectAttempt = 0;
       _heartbeat?.cancel();
@@ -118,6 +127,43 @@ class LiveTranslationClient {
     });
   }
 
+  /// Live-subtitle mode: from now on ALL microphone audio goes up via
+  /// [sendStreamAudio]; the server's speech provider detects utterances.
+  /// Survives reconnects (a fresh stream id is announced per connection).
+  void startAudioStream(int sampleRate) {
+    _audioStreamWanted = true;
+    _streamSampleRate = sampleRate;
+    if (isConnected) _openAudioStream();
+  }
+
+  /// Stops announcing/streaming audio (Stop Listening).
+  void stopAudioStream() {
+    _audioStreamWanted = false;
+    _streamId = null;
+  }
+
+  void _openAudioStream() {
+    _streamId = const Uuid().v4();
+    _streamSequence = 0;
+    _sendJson({
+      'type': 'stream_start',
+      'streamId': _streamId,
+      'sampleRate': _streamSampleRate,
+      'channels': 1,
+      'encoding': 'pcm16',
+    });
+  }
+
+  /// One chunk of the continuous microphone stream. Dropped silently while
+  /// offline — stale audio is never uploaded late.
+  void sendStreamAudio(Uint8List pcm) {
+    final channel = _channel;
+    final streamId = _streamId;
+    if (channel == null || !isConnected || streamId == null) return;
+    channel.sink.add(encodeAudioFrame(streamId, _streamSequence, pcm));
+    _streamSequence++;
+  }
+
   void sendSegmentStart(String segmentId, int sampleRate) {
     _sendJson({
       'type': 'segment_start',
@@ -156,6 +202,8 @@ class LiveTranslationClient {
   /// Graceful shutdown: no reconnect attempts, socket closed.
   Future<void> disconnect() async {
     _shouldBeConnected = false;
+    _audioStreamWanted = false;
+    _streamId = null;
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
     _heartbeat?.cancel();

@@ -46,6 +46,18 @@ export interface TranslationQueueOptions {
   retryDelaysMs?: number[];
 }
 
+export interface TranslationDelta {
+  messageId: string;
+  delta: string;
+  /**
+   * true on the first delta of a RETRY attempt: earlier partial output from
+   * the failed attempt must be discarded, not appended to.
+   */
+  reset: boolean;
+  /** Milliseconds from job start to this delta (first delta ≙ first latency). */
+  sinceJobStartMs: number;
+}
+
 const DEFAULT_CONCURRENCY = 2;
 const DEFAULT_RETRY_DELAYS_MS = [300, 1_000, 2_000];
 
@@ -62,6 +74,7 @@ export class TranslationQueue {
     private readonly onSuccess: (result: TranslationJobSuccess) => void,
     private readonly onFailure: (failure: TranslationJobFailure) => void,
     options: TranslationQueueOptions = {},
+    private readonly onDelta?: (delta: TranslationDelta) => void,
   ) {
     this.concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
     this.retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
@@ -108,9 +121,24 @@ export class TranslationQueue {
     const maxAttempts = this.retryDelaysMs.length + 1;
     const started = Date.now();
 
+    let deltasSent = false;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const result = await this.provider.translate(job.request);
+        // Stream display text as it is produced when the provider supports it
+        // (live subtitles); otherwise the plain call still works.
+        let firstOfAttempt = true;
+        const result = this.provider.translateStream
+          ? await this.provider.translateStream(job.request, (delta) => {
+              this.onDelta?.({
+                messageId: job.messageId,
+                delta,
+                reset: firstOfAttempt && deltasSent,
+                sinceJobStartMs: Date.now() - started,
+              });
+              firstOfAttempt = false;
+              deltasSent = true;
+            })
+          : await this.provider.translate(job.request);
         this.onSuccess({
           messageId: job.messageId,
           translatedText: result.translatedText,

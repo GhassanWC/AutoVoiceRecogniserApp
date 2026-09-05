@@ -34,6 +34,21 @@ export const segmentStartSchema = z.object({
   encoding: z.literal('pcm16'),
 });
 
+/**
+ * Continuous-streaming mode (the live-subtitle path): after this message the
+ * client streams ALL microphone audio between Start and Stop Listening as
+ * binary frames carrying `streamId` in the segment-id slot; the server's
+ * speech provider does turn detection. Utterance boundaries no longer depend
+ * on the phone's VAD, so quiet far-field speech cannot be discarded locally.
+ */
+export const streamStartSchema = z.object({
+  type: z.literal('stream_start'),
+  streamId: z.string().uuid(),
+  sampleRate: z.number().int().min(8000).max(48000),
+  channels: z.literal(1),
+  encoding: z.literal('pcm16'),
+});
+
 export const segmentEndSchema = z.object({
   type: z.literal('segment_end'),
   segmentId: z.string().uuid(),
@@ -58,6 +73,7 @@ export const pingSchema = z.object({
 export const clientMessageSchema = z.discriminatedUnion('type', [
   sessionStartSchema,
   segmentStartSchema,
+  streamStartSchema,
   segmentEndSchema,
   sessionStopSchema,
   retryTranslationSchema,
@@ -67,6 +83,7 @@ export const clientMessageSchema = z.discriminatedUnion('type', [
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export type SessionStartMessage = z.infer<typeof sessionStartSchema>;
 export type SegmentStartMessage = z.infer<typeof segmentStartSchema>;
+export type StreamStartMessage = z.infer<typeof streamStartSchema>;
 
 // ── Server → client ───────────────────────────────────────────────────────────
 
@@ -127,6 +144,25 @@ export interface TranscriptFinalPayload {
   diagnostics?: TranslationDiagnostics;
 }
 
+/**
+ * A chunk of translated display text, streamed the moment the model emits it.
+ * The client APPENDS it to the SAME message bubble (`messageId`) — unless
+ * `reset` is true (a retry started over), which replaces the partial text.
+ * `translation_complete` still follows with the authoritative full text.
+ */
+export interface TranslationDeltaPayload {
+  type: 'translation_delta';
+  messageId: string;
+  delta: string;
+  reset?: boolean;
+}
+
+/** speech_end → first delta / final, milliseconds; for latency diagnostics. */
+export interface TranslationLatency {
+  speechEndToFirstDeltaMs?: number;
+  speechEndToFinalMs?: number;
+}
+
 export interface TranslationCompletePayload {
   type: 'translation_complete';
   messageId: string;
@@ -137,6 +173,7 @@ export interface TranslationCompletePayload {
    * Replaces the provisional label from transcript_final when present.
    */
   sourceLanguage?: string;
+  latency?: TranslationLatency;
 }
 
 /** Sent only after every retry failed; the client offers a Retry action. */
@@ -160,6 +197,7 @@ export type ServerMessage =
     }
   | TranslationMessagePayload
   | TranscriptFinalPayload
+  | TranslationDeltaPayload
   | TranslationCompletePayload
   | TranslationFailedPayload
   | { type: 'segment_dropped'; segmentId: string; reason: string }

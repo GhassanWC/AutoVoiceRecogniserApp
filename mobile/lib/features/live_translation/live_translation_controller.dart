@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:developer' as developer;
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
@@ -95,8 +96,14 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   // ── Session internals ───────────────────────────────────────────────────────
 
   VadSegmenter? _vad;
-  final Set<String> _openSegments = {};
   DateTime? _sessionStartedAt;
+
+  /// Bandwidth guard: upload pauses only after this much ABSOLUTE silence
+  /// (empty room), and the very chunk that breaks the silence is audible and
+  /// therefore uploaded — audible speech is never withheld.
+  static const Duration _silencePauseAfter = Duration(seconds: 30);
+  static const double _audibleRms = 0.002;
+  DateTime _lastAudibleAt = DateTime.now();
   final List<TranslationMessage> _sessionMessages = [];
   String _sessionId = '';
   bool _usingMock = false;
@@ -157,32 +164,26 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       return;
     }
 
-    // 3. Local VAD so silence never leaves the phone.
+    // 3. Live-subtitle mode: ALL microphone audio streams continuously to the
+    //    backend, whose speech provider detects utterances. The local VAD
+    //    stays only for the waveform, developer diagnostics and a prolonged-
+    //    absolute-silence bandwidth pause — it never again decides whether
+    //    distant/quiet room speech is "worth" uploading.
+    _lastAudibleAt = DateTime.now();
     _vad = VadSegmenter(
       sampleRate: AudioCaptureService.sampleRate,
-      onSegmentStart: (segmentId, sampleRate) {
-        if (!client.isConnected) return;
-        _openSegments.add(segmentId);
-        client.sendSegmentStart(segmentId, sampleRate);
-      },
-      onAudio: (segmentId, sequence, pcm) {
-        if (_openSegments.contains(segmentId)) {
-          client.sendAudio(segmentId, sequence, pcm);
-        }
-      },
-      onSegmentEnd: (segmentId, durationMs) {
-        if (_openSegments.remove(segmentId)) {
-          client.sendSegmentEnd(segmentId, durationMs);
-        }
-      },
+      onSegmentStart: (_, __) {},
+      onAudio: (_, __, ___) {},
+      onSegmentEnd: (_, __) {},
       onLevel: _handleLevel,
       onDiagnostics: _handleVadDiagnostics,
     );
+    client.startAudioStream(AudioCaptureService.sampleRate);
 
     // 4. Native microphone capture (starts the Android foreground service).
     try {
       await audioCapture.start(
-        onAudio: (pcm) => _vad?.addAudio(pcm),
+        onAudio: _handleCapturedAudio,
         onStopped: _handleCaptureStopped,
       );
     } on AudioCaptureUnsupportedException {
@@ -210,11 +211,10 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       mock.stop();
     } else {
       // Order matters: capture stops first so not a single extra sample is
-      // recorded after the user pressed Stop.
+      // recorded — or streamed — after the user pressed Stop.
       await audioCapture.stop();
-      _vad?.flush();
+      client.stopAudioStream();
       _vad = null;
-      _openSegments.clear();
       client.sendSessionStop();
       // Give in-flight segments a moment to come back before closing.
       await Future<void>.delayed(const Duration(milliseconds: 800));
@@ -296,7 +296,26 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       case TranscriptFinalEvent(:final message):
         activityLabel = null;
         _addTranscript(message);
-      case TranslationCompleteEvent(:final messageId, :final translatedText, :final sourceLanguage):
+      case TranslationDeltaEvent(:final messageId, :final delta, :final reset):
+        // Streamed translation: grow the SAME bubble word by word.
+        _updateMessage(
+          messageId,
+          (m) => m.copyWith(translatedText: reset ? delta : m.translatedText + delta),
+        );
+      case TranslationCompleteEvent(
+          :final messageId,
+          :final translatedText,
+          :final sourceLanguage,
+          :final latency
+        ):
+        if (settings.settings.developerDiagnostics && latency != null) {
+          developer.log(
+            '[LATENCY] id=$messageId '
+            'speechEnd→firstDelta=${latency['speechEndToFirstDeltaMs']}ms '
+            'speechEnd→final=${latency['speechEndToFinalMs']}ms',
+            name: 'pipeline',
+          );
+        }
         final languageKnown = sourceLanguage != null && sourceLanguage != 'und';
         _updateMessage(
           messageId,
@@ -425,11 +444,22 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     notifyListeners();
   }
 
+  /// Every captured chunk: level/diagnostics first (updates the audibility
+  /// clock), then continuous upload — held back only during prolonged
+  /// absolute silence.
+  void _handleCapturedAudio(Uint8List pcm) {
+    _vad?.addAudio(pcm);
+    if (DateTime.now().difference(_lastAudibleAt) < _silencePauseAfter) {
+      client.sendStreamAudio(pcm);
+    }
+  }
+
   DateTime _lastVadLog = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// Developer mode: VAD internals in the console. Segment events always log;
-  /// per-chunk level lines are throttled to one per second.
+  /// Tracks audibility for the silence pause; in developer mode also logs VAD
+  /// internals (segment events always, level lines throttled to 1/s).
   void _handleVadDiagnostics(VadDiagnostics d) {
+    if (d.rms >= _audibleRms) _lastAudibleAt = DateTime.now();
     if (!settings.settings.developerDiagnostics) return;
     if (d.event != null) {
       developer.log('[VAD] $d', name: 'vad');
@@ -438,7 +468,8 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     final now = DateTime.now();
     if (now.difference(_lastVadLog).inMilliseconds >= 1000) {
       _lastVadLog = now;
-      developer.log('[VAD] $d', name: 'vad');
+      developer.log('[VAD] $d streaming=${now.difference(_lastAudibleAt) < _silencePauseAfter}',
+          name: 'vad');
     }
   }
 

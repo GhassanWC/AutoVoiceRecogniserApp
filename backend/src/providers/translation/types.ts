@@ -51,4 +51,14 @@ export function isRetryableStatus(status: number): boolean {
 export interface TranslationProvider {
   readonly name: string;
   translate(request: TranslationRequest): Promise<TranslationResult>;
+  /**
+   * Streaming variant: forwards display-text chunks through onDelta as the
+   * model produces them, then resolves with the complete result. The user
+   * sees meaning appear word by word instead of waiting for the whole block.
+   * Optional — callers fall back to translate() when absent.
+   */
+  translateStream?(
+    request: TranslationRequest,
+    onDelta: (delta: string) => void,
+  ): Promise<TranslationResult>;
 }

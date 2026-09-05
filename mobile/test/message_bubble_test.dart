@@ -90,6 +90,31 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
   });
 
+  testWidgets('renders streamed partial translation text while still pending', (tester) async {
+    final streamingMessage = TranslationMessage(
+      id: 'm5',
+      speakerId: 'speaker_1',
+      speakerLabel: 'Speaker 1',
+      sourceLanguage: 'en',
+      languageConfidence: 0.9,
+      originalText: 'Where is the hotel?',
+      translatedText: 'أين', // first delta already arrived
+      targetLanguage: 'ar',
+      timestamp: DateTime(2026, 9, 5, 10, 0),
+      status: TranslationStatus.pending,
+    );
+    await tester.pumpWidget(_wrap(MessageBubble(
+      message: streamingMessage,
+      showOriginal: true,
+      showTimestamp: false,
+      showLanguageLabels: true,
+    )));
+
+    // Live subtitles: the partial text shows instead of a spinner.
+    expect(find.text('أين'), findsOneWidget);
+    expect(find.text('Translating…'), findsNothing);
+  });
+
   testWidgets('shows "Translation failed" with a Retry action and keeps the transcript',
       (tester) async {
     var retried = false;

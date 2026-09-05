@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  TranslationDelta,
   TranslationJobFailure,
   TranslationJobSuccess,
   TranslationQueue,
@@ -145,6 +146,48 @@ describe('TranslationQueue', () => {
 
     expect(provider.calls).toBe(1); // exactly one attempt
     expect(sink.failures[0]).toMatchObject({ attempts: 1, retriesExhausted: false, lastStatus: 401 });
+  });
+
+  it('forwards streaming deltas and resets partial output on retry', async () => {
+    let call = 0;
+    const provider: TranslationProvider = {
+      name: 'streaming',
+      async translate() {
+        throw new Error('translateStream should be preferred');
+      },
+      async translateStream(req, onDelta) {
+        call += 1;
+        onDelta('صباح ');
+        if (call === 1) {
+          // Dies after emitting a partial chunk — the retry must start over.
+          throw new TranslationProviderError('Translation stream interrupted: reset', true);
+        }
+        onDelta('الخير');
+        return { translatedText: 'صباح الخير', sourceLanguage: 'en' };
+      },
+    };
+    const sink = collect();
+    const deltas: TranslationDelta[] = [];
+    const queue = new TranslationQueue(
+      provider,
+      sink.onSuccess,
+      sink.onFailure,
+      FAST_RETRIES,
+      (delta) => deltas.push(delta),
+    );
+    queue.enqueue({ messageId: 'm1', request: request('Good morning.') });
+    await queue.drain();
+
+    expect(deltas.map((d) => [d.delta, d.reset])).toEqual([
+      ['صباح ', false], // attempt 1 partial
+      ['صباح ', true], // attempt 2 starts over → reset replaces the partial
+      ['الخير', false],
+    ]);
+    expect(sink.successes[0]).toMatchObject({
+      translatedText: 'صباح الخير',
+      sourceLanguage: 'en',
+      attempts: 2,
+    });
   });
 
   it('rejects new jobs after close but finishes in-flight ones', async () => {

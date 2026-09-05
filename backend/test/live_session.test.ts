@@ -35,6 +35,8 @@ class FlakyTranslationProvider implements TranslationProvider {
   readonly name = 'flaky';
   calls = 0;
   requests: TranslationRequest[] = [];
+  /** Tests assign this to exercise the streaming-delta path. */
+  translateStream?: TranslationProvider['translateStream'];
 
   constructor(private readonly failures: Error[] = []) {}
 
@@ -265,8 +267,10 @@ class FakeStreamingSession implements StreamingSpeechSession {
 class FakeStreamingProvider implements StreamingSpeechProvider {
   readonly name = 'fake-stream';
   readonly sessions: FakeStreamingSession[] = [];
+  readonly sessionOptions: Array<{ sampleRate: number; serverTurnDetection?: boolean }> = [];
 
-  createSession(): StreamingSpeechSession {
+  createSession(options: { sampleRate: number; serverTurnDetection?: boolean }): StreamingSpeechSession {
+    this.sessionOptions.push(options);
     const session = new FakeStreamingSession();
     this.sessions.push(session);
     return session;
@@ -650,5 +654,85 @@ describe('LiveSession streaming pipeline', () => {
 
     expect(streaming.sessions[0]!.closed).toBe(true);
     expect(sent.find((m) => m.type === 'session_ended')).toMatchObject({ translationCount: 1 });
+  });
+
+  // ── Continuous streaming (live-subtitle mode) ───────────────────────────────
+
+  describe('continuous streaming mode', () => {
+    const STREAM_ID = '123e4567-e89b-42d3-a456-426614174099';
+
+    function startStream(): void {
+      session.handleStreamStart({
+        type: 'stream_start',
+        streamId: STREAM_ID,
+        sampleRate: SAMPLE_RATE,
+        channels: 1,
+        encoding: 'pcm16',
+      });
+    }
+
+    it('opens one provider session with server turn detection and forwards ALL audio', () => {
+      startStream();
+      expect(streaming.sessionOptions[0]).toMatchObject({
+        sampleRate: SAMPLE_RATE,
+        serverTurnDetection: true,
+      });
+
+      // No local segmentation, no VAD gate: every frame goes straight up.
+      for (let i = 0; i < 5; i++) {
+        session.handleAudioFrame({ segmentId: STREAM_ID, sequence: i, pcm: oneSecondPcm() });
+      }
+      expect(streaming.sessions[0]!.audioBytes).toBe(5 * SAMPLE_RATE * 2);
+      expect(sent.find((m) => m.type === 'segment_dropped')).toBeUndefined();
+    });
+
+    it('streams translation deltas into the same message, then finalizes with latency', async () => {
+      translation.translateStream = async (_req, onDelta) => {
+        onDelta('صباح ');
+        onDelta('الخير');
+        return { translatedText: 'صباح الخير', sourceLanguage: 'en' };
+      };
+      startStream();
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: 0, pcm: oneSecondPcm() });
+      streaming.sessions[0]!.emitUtterance({
+        text: 'Good morning.',
+        speechEndAtMs: Date.now() - 350,
+      });
+      await settle();
+
+      const transcript = transcripts()[0]!;
+      expect(transcript).toMatchObject({ segmentId: STREAM_ID, originalText: 'Good morning.' });
+
+      const deltas = sent.filter((m) => m.type === 'translation_delta');
+      expect(deltas).toEqual([
+        expect.objectContaining({ messageId: transcript.messageId, delta: 'صباح ' }),
+        expect.objectContaining({ messageId: transcript.messageId, delta: 'الخير' }),
+      ]);
+
+      const completion = completions()[0]!;
+      expect(completion).toMatchObject({
+        messageId: transcript.messageId,
+        translatedText: 'صباح الخير',
+        sourceLanguage: 'en',
+      });
+      // speech ended ~350 ms before the utterance arrived — latency is anchored there.
+      expect(completion.latency?.speechEndToFinalMs).toBeGreaterThanOrEqual(350);
+      expect(completion.latency?.speechEndToFirstDeltaMs).toBeGreaterThanOrEqual(350);
+      // Deltas precede the completion.
+      expect(sent.indexOf(deltas[0]!)).toBeLessThan(sent.indexOf(completion));
+    });
+
+    it('reopens the provider stream after a mid-session error without ending the session', async () => {
+      startStream();
+      streaming.sessions[0]!.emitError('network blip');
+      await new Promise((resolve) => setTimeout(resolve, 700)); // reopen delay is 500 ms
+
+      expect(streaming.sessions).toHaveLength(2);
+      expect(streaming.sessionOptions[1]).toMatchObject({ serverTurnDetection: true });
+      // The client saw no fatal error and the stream keeps working.
+      expect(sent.find((m) => m.type === 'error')).toBeUndefined();
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: 9, pcm: oneSecondPcm() });
+      expect(streaming.sessions[1]!.audioBytes).toBe(SAMPLE_RATE * 2);
+    });
   });
 });

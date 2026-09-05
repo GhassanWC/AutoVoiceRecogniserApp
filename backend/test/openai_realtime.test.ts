@@ -3,7 +3,10 @@ import {
   RealtimeSegment,
   utterancesFromRealtime,
 } from '../src/providers/speech/openai_realtime';
-import { parseTranslationResponse } from '../src/providers/translation/openai';
+import {
+  createLanguagePrefixParser,
+  parseTranslationResponse,
+} from '../src/providers/translation/openai';
 import { TranslationProviderError } from '../src/providers/translation/types';
 import { resamplePcm16 } from '../src/utils/audio';
 
@@ -77,6 +80,36 @@ describe('resamplePcm16', () => {
   it('returns the buffer unchanged when rates match', () => {
     const input = Buffer.from([1, 2, 3, 4]);
     expect(resamplePcm16(input, 24000, 24000)).toBe(input);
+  });
+});
+
+describe('createLanguagePrefixParser (streaming reply protocol)', () => {
+  it('strips the language line and passes through only display deltas', () => {
+    const parser = createLanguagePrefixParser();
+    const displayed = [
+      parser.push('en'),
+      parser.push('\nصباح'),
+      parser.push(' الخير'),
+      parser.push('.'),
+    ].filter(Boolean);
+
+    expect(displayed).toEqual(['صباح', ' الخير', '.']);
+    expect(parser.language()).toBe('en');
+    expect(parser.text()).toBe('صباح الخير.');
+  });
+
+  it('handles the prefix split across chunks', () => {
+    const parser = createLanguagePrefixParser();
+    expect(parser.push('e')).toBe('');
+    expect(parser.push('s\nمرحباً')).toBe('مرحباً');
+    expect(parser.language()).toBe('es');
+  });
+
+  it('treats a reply with no prefix line as translation-only with unknown language', () => {
+    const parser = createLanguagePrefixParser();
+    parser.push('مرحباً يا أخي');
+    expect(parser.language()).toBe('und');
+    expect(parser.text()).toBe('مرحباً يا أخي');
   });
 });
 

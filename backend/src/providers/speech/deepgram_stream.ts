@@ -1,6 +1,11 @@
 import { WebSocket } from 'ws';
 import { log } from '../../utils/logger';
-import { StreamingSpeechProvider, StreamingSpeechSession, StreamingUtterance } from './types';
+import {
+  StreamingSessionOptions,
+  StreamingSpeechProvider,
+  StreamingSpeechSession,
+  StreamingUtterance,
+} from './types';
 
 /**
  * Deepgram live streaming transcription.
@@ -319,7 +324,9 @@ export class DeepgramStreamingSpeechProvider implements StreamingSpeechProvider 
     if (!apiKey) throw new Error('SPEECH_API_KEY is required for the deepgram speech provider');
   }
 
-  createSession(options: { sampleRate: number }): StreamingSpeechSession {
+  createSession(options: StreamingSessionOptions): StreamingSpeechSession {
+    // serverTurnDetection is implicit for Deepgram: its endpointing always
+    // finalizes utterances server-side; finalize() just forces a flush.
     return new DeepgramLiveSession(this.apiKey, this.model, this.baseUrl, options.sampleRate);
   }
 }

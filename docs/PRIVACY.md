@@ -22,9 +22,12 @@ rules and where the code enforces them.
    session (`stopListening()` ordering). The notification Stop action kills
    capture natively before informing Dart.
 
-4. **Silence never leaves the phone.**
-   The VAD runs on-device; only detected-speech segments (plus a 350 ms
-   pre-roll) are transmitted, over WSS/HTTPS in production.
+4. **Audio streams only between Start Listening and Stop Listening.**
+   While listening is active, microphone audio streams continuously to the
+   backend (over WSS/HTTPS in production) so distant/room speech is never
+   discarded by an on-device gate; prolonged absolute silence (an empty room)
+   pauses the upload as a bandwidth optimization. Stop Listening immediately
+   ends both capture and streaming, and raw audio is never stored anywhere.
 
 5. **Raw audio is never stored.**
    The backend holds segment audio in memory only for the duration of the
