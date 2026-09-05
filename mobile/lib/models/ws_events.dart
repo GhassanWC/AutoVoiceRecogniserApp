@@ -70,6 +70,33 @@ sealed class ServerEvent {
                 : null,
           ),
         );
+      case 'transcript_final':
+        return TranscriptFinalEvent(
+          TranslationMessage(
+            id: json['messageId'] as String? ?? '',
+            speakerId: json['speakerId'] as String?,
+            speakerLabel: json['speakerLabel'] as String?,
+            sourceLanguage: json['sourceLanguage'] as String? ?? 'und',
+            languageConfidence: (json['languageConfidence'] as num?)?.toDouble() ?? 0,
+            transcriptionConfidence: (json['transcriptionConfidence'] as num?)?.toDouble() ?? 0,
+            originalText: json['originalText'] as String? ?? '',
+            translatedText: '',
+            targetLanguage: json['targetLanguage'] as String? ?? 'en',
+            timestamp:
+                DateTime.tryParse(json['timestamp'] as String? ?? '')?.toLocal() ?? DateTime.now(),
+            status: TranslationStatus.pending,
+            diagnostics: json['diagnostics'] is Map<String, dynamic>
+                ? json['diagnostics'] as Map<String, dynamic>
+                : null,
+          ),
+        );
+      case 'translation_complete':
+        return TranslationCompleteEvent(
+          messageId: json['messageId'] as String? ?? '',
+          translatedText: json['translatedText'] as String? ?? '',
+        );
+      case 'translation_failed':
+        return TranslationFailedEvent(messageId: json['messageId'] as String? ?? '');
       case 'segment_dropped':
         return SegmentDroppedEvent(
           segmentId: json['segmentId'] as String? ?? '',
@@ -127,6 +154,24 @@ class PartialTranscriptionEvent extends ServerEvent {
 class TranslationEvent extends ServerEvent {
   const TranslationEvent(this.message);
   final TranslationMessage message;
+}
+
+/// A finalized transcript, shown immediately with "Translating…" — the
+/// translation arrives (or fails) later for the same message id.
+class TranscriptFinalEvent extends ServerEvent {
+  const TranscriptFinalEvent(this.message);
+  final TranslationMessage message;
+}
+
+class TranslationCompleteEvent extends ServerEvent {
+  const TranslationCompleteEvent({required this.messageId, required this.translatedText});
+  final String messageId;
+  final String translatedText;
+}
+
+class TranslationFailedEvent extends ServerEvent {
+  const TranslationFailedEvent({required this.messageId});
+  final String messageId;
 }
 
 class SegmentDroppedEvent extends ServerEvent {

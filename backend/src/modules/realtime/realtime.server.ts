@@ -117,6 +117,9 @@ export function attachRealtimeServer(
         case 'session_stop':
           void session.handleSessionStop();
           break;
+        case 'retry_translation':
+          session.handleRetryTranslation(message.messageId);
+          break;
         case 'ping':
           send({ type: 'pong', t: message.t });
           break;

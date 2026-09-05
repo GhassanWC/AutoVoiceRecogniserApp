@@ -232,6 +232,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
                               showLanguageLabels: settings.showLanguageLabels,
                               onReplay: () => controller.replay(message),
                               onReport: () => controller.reportBadTranslation(message),
+                              onRetry: () => controller.retryTranslation(message),
                             );
                           },
                         ),

@@ -44,6 +44,12 @@ export const sessionStopSchema = z.object({
   type: z.literal('session_stop'),
 });
 
+/** User pressed Retry on a message whose translation failed. */
+export const retryTranslationSchema = z.object({
+  type: z.literal('retry_translation'),
+  messageId: z.string().min(1).max(64),
+});
+
 export const pingSchema = z.object({
   type: z.literal('ping'),
   t: z.number().optional(),
@@ -54,6 +60,7 @@ export const clientMessageSchema = z.discriminatedUnion('type', [
   segmentStartSchema,
   segmentEndSchema,
   sessionStopSchema,
+  retryTranslationSchema,
   pingSchema,
 ]);
 
@@ -96,6 +103,43 @@ export interface TranslationMessagePayload {
   diagnostics?: TranslationDiagnostics;
 }
 
+/**
+ * A finalized transcript, sent the moment STT delivers it — before (and
+ * regardless of whether) translation succeeds. The client shows the message
+ * immediately with a "Translating…" placeholder; `translation_complete` /
+ * `translation_failed` later update the SAME message via `messageId`.
+ * A transcript is never lost because translation failed.
+ */
+export interface TranscriptFinalPayload {
+  type: 'transcript_final';
+  messageId: string;
+  segmentId: string;
+  speakerId: string | null;
+  speakerLabel: string | null;
+  /** Metadata only — translation runs even when this is "und". */
+  sourceLanguage: string;
+  languageConfidence: number;
+  transcriptionConfidence: number;
+  originalText: string;
+  targetLanguage: string;
+  translationStatus: 'pending';
+  timestamp: string;
+  diagnostics?: TranslationDiagnostics;
+}
+
+export interface TranslationCompletePayload {
+  type: 'translation_complete';
+  messageId: string;
+  translatedText: string;
+  targetLanguage: string;
+}
+
+/** Sent only after every retry failed; the client offers a Retry action. */
+export interface TranslationFailedPayload {
+  type: 'translation_failed';
+  messageId: string;
+}
+
 export type ServerMessage =
   | { type: 'session_started'; sessionId: string; targetLanguage: string }
   | { type: 'status'; segmentId: string; state: SegmentState }
@@ -107,6 +151,9 @@ export type ServerMessage =
       text: string;
     }
   | TranslationMessagePayload
+  | TranscriptFinalPayload
+  | TranslationCompletePayload
+  | TranslationFailedPayload
   | { type: 'segment_dropped'; segmentId: string; reason: string }
   | { type: 'limit_reached'; message: string }
   | { type: 'error'; code: string; message: string; recoverable: boolean }

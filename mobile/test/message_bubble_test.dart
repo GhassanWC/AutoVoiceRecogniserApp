@@ -62,6 +62,63 @@ void main() {
     expect(find.textContaining('أين محطة الحافلات؟'), findsOneWidget);
   });
 
+  testWidgets('shows the transcript with "Translating…" while translation is pending',
+      (tester) async {
+    final pending = TranslationMessage(
+      id: 'm3',
+      speakerId: 'speaker_1',
+      speakerLabel: 'Speaker 1',
+      sourceLanguage: 'en',
+      languageConfidence: 0.9,
+      originalText: 'Where is the hotel?',
+      translatedText: '',
+      targetLanguage: 'ar',
+      timestamp: DateTime(2026, 9, 5, 10, 0),
+      status: TranslationStatus.pending,
+    );
+    await tester.pumpWidget(_wrap(MessageBubble(
+      message: pending,
+      showOriginal: true,
+      showTimestamp: false,
+      showLanguageLabels: true,
+    )));
+
+    expect(find.text('Translating…'), findsOneWidget);
+    expect(find.textContaining('Where is the hotel?'), findsOneWidget); // transcript stays
+    expect(find.text('Translation failed'), findsNothing);
+    // Let the progress indicator's animation settle before teardown.
+    await tester.pump(const Duration(seconds: 1));
+  });
+
+  testWidgets('shows "Translation failed" with a Retry action and keeps the transcript',
+      (tester) async {
+    var retried = false;
+    final failed = TranslationMessage(
+      id: 'm4',
+      speakerId: 'speaker_1',
+      speakerLabel: 'Speaker 1',
+      sourceLanguage: 'en',
+      languageConfidence: 0.9,
+      originalText: 'Where is the hotel?',
+      translatedText: '',
+      targetLanguage: 'ar',
+      timestamp: DateTime(2026, 9, 5, 10, 0),
+      status: TranslationStatus.failed,
+    );
+    await tester.pumpWidget(_wrap(MessageBubble(
+      message: failed,
+      showOriginal: true,
+      showTimestamp: false,
+      showLanguageLabels: true,
+      onRetry: () => retried = true,
+    )));
+
+    expect(find.text('Translation failed'), findsOneWidget);
+    expect(find.textContaining('Where is the hotel?'), findsOneWidget); // transcript preserved
+    await tester.tap(find.text('Retry'));
+    expect(retried, isTrue);
+  });
+
   testWidgets('falls back to the generic speaker label', (tester) async {
     final message = TranslationMessage(
       id: 'm2',

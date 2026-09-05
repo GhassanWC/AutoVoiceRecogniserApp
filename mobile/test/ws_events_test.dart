@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:live_translator/models/translation_message.dart';
 import 'package:live_translator/models/ws_events.dart';
 
 void main() {
@@ -40,6 +41,47 @@ void main() {
     expect(message.speakerLabel, 'Speaker 1');
     expect(message.sourceLanguage, 'es');
     expect(message.translatedText, 'مرحباً يا أخي');
+  });
+
+  test('parses a transcript_final event as a pending message', () {
+    final event = ServerEvent.parse(jsonEncode({
+      'type': 'transcript_final',
+      'messageId': 'msg_1',
+      'segmentId': 'seg',
+      'speakerId': 'speaker_2',
+      'speakerLabel': 'Speaker 2',
+      'sourceLanguage': 'und',
+      'languageConfidence': 0.4,
+      'transcriptionConfidence': 0.9,
+      'originalText': 'Hola hermano',
+      'targetLanguage': 'ar',
+      'translationStatus': 'pending',
+      'timestamp': '2026-09-05T12:00:00Z',
+    }));
+
+    expect(event, isA<TranscriptFinalEvent>());
+    final message = (event as TranscriptFinalEvent).message;
+    expect(message.id, 'msg_1');
+    expect(message.status, TranslationStatus.pending);
+    expect(message.originalText, 'Hola hermano');
+    expect(message.sourceLanguage, 'und');
+    expect(message.translatedText, isEmpty);
+  });
+
+  test('parses translation_complete and translation_failed updates', () {
+    final complete = ServerEvent.parse(jsonEncode({
+      'type': 'translation_complete',
+      'messageId': 'msg_1',
+      'translatedText': 'مرحباً يا أخي',
+      'targetLanguage': 'ar',
+    }));
+    expect(complete, isA<TranslationCompleteEvent>());
+    expect((complete as TranslationCompleteEvent).messageId, 'msg_1');
+    expect(complete.translatedText, 'مرحباً يا أخي');
+
+    final failed = ServerEvent.parse('{"type":"translation_failed","messageId":"msg_1"}');
+    expect(failed, isA<TranslationFailedEvent>());
+    expect((failed as TranslationFailedEvent).messageId, 'msg_1');
   });
 
   test('parses status, error, limit and session events', () {

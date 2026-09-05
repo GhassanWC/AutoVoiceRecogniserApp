@@ -20,6 +20,28 @@ export interface TranslationResult {
   translatedText: string;
 }
 
+/**
+ * Thrown by providers so callers can tell transient failures (worth retrying:
+ * network errors, timeouts, 408/429/5xx) from permanent ones (bad API key,
+ * malformed request) without parsing error messages.
+ */
+export class TranslationProviderError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+    readonly status?: number,
+  ) {
+    super(message);
+    this.name = 'TranslationProviderError';
+  }
+}
+
+const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+export function isRetryableStatus(status: number): boolean {
+  return RETRYABLE_STATUSES.has(status);
+}
+
 export interface TranslationProvider {
   readonly name: string;
   translate(request: TranslationRequest): Promise<TranslationResult>;

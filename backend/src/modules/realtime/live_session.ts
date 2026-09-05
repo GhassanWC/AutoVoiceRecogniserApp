@@ -6,7 +6,11 @@ import {
   StreamingSpeechSession,
   StreamingUtterance,
 } from '../../providers/speech';
-import { ConversationTurn, TranslationProvider } from '../../providers/translation';
+import {
+  ConversationTurn,
+  TranslationProvider,
+  TranslationRequest,
+} from '../../providers/translation';
 import { getStore } from '../../storage';
 import { pcm16ToWav, pcmDurationMs } from '../../utils/audio';
 import { newId, newUuid } from '../../utils/ids';
@@ -17,8 +21,14 @@ import {
   SegmentStartMessage,
   ServerMessage,
   SessionStartMessage,
-  TranslationMessagePayload,
+  TranscriptFinalPayload,
 } from './protocol';
+import {
+  TranslationJobFailure,
+  TranslationJobSuccess,
+  TranslationQueue,
+  TranslationQueueOptions,
+} from './translation_queue';
 
 interface ActiveSegment {
   id: string;
@@ -37,15 +47,21 @@ export interface LiveSessionDeps {
   translation: TranslationProvider;
   diarization: SpeakerDiarizationProvider;
   send: (message: ServerMessage) => void;
+  /** Test hook: shorter retry delays / different concurrency. */
+  translationQueueOptions?: TranslationQueueOptions;
 }
 
 const CONTEXT_WINDOW_TURNS = 6;
 const MIN_SEGMENT_MS = 250;
 
+/** How many finished messages stay retryable / dedupe-able per session. */
+const MESSAGE_REGISTRY_LIMIT = 200;
+
 /**
  * Short utterances ("yes", "okay", "hello") exist near-identically in many
  * languages — never claim a language for them unless the provider was
  * genuinely confident, otherwise the UI shows a wrong flag.
+ * This gates the DISPLAYED language only; translation always runs.
  */
 const SHORT_UTTERANCE_MAX_WORDS = 2;
 const SHORT_UTTERANCE_MIN_LANGUAGE_CONFIDENCE = 0.8;
@@ -61,7 +77,7 @@ export function gatedLanguage(text: string, language: string, languageConfidence
   return language;
 }
 
-/** Everything translateAndEmit needs, regardless of which pipeline ran STT. */
+/** Everything transcript emission needs, regardless of which pipeline ran STT. */
 interface RecognizedUtterance {
   segmentId: string;
   text: string;
@@ -74,18 +90,31 @@ interface RecognizedUtterance {
   sttProvider: string;
 }
 
+interface RegisteredMessage {
+  request: TranslationRequest;
+  status: 'pending' | 'done' | 'failed';
+  translatedText?: string;
+  originalText: string;
+  audioMs: number;
+  speakerId: string | null;
+  speakerLabel: string | null;
+  languageConfidence: number;
+}
+
 /**
  * One WebSocket connection = at most one live listening session.
  *
  * Streaming pipeline (Deepgram): all segment audio is forwarded into a single
- * provider stream for the whole session, so multilingual language detection
- * and speaker diarization work across the entire conversation. Segment ends
- * force a provider flush; finalized utterances are translated and emitted.
- * Speaker ids come from the provider verbatim — never re-derived here.
+ * provider stream for the whole session; the stream NEVER waits on
+ * translation. Each finalized utterance is sent to the client immediately as
+ * `transcript_final` (so a transcript is never lost), then translated through
+ * a bounded-concurrency retry queue; `translation_complete` /
+ * `translation_failed` update the same messageId later. `sourceLanguage` is
+ * metadata only — a transcript is ALWAYS translated, "und" included.
  *
  * Batch pipeline (fallback for providers without streaming, and when the
- * stream fails mid-session): buffered PCM → WAV → per-segment recognition
- * → heuristic speaker assignment → translation.
+ * stream fails mid-session): buffered PCM → WAV → per-segment recognition →
+ * heuristic speaker assignment → the same transcript/translation flow.
  *
  * The audio buffer is released as soon as recognition has it; raw audio is
  * never written to disk or to the database (docs/PRIVACY.md).
@@ -100,7 +129,7 @@ export class LiveSession {
   private segment: ActiveSegment | null = null;
   private processedSegmentIds = new Set<string>();
   private context: ConversationTurn[] = [];
-  private queue: Promise<void> = Promise.resolve();
+  private sttQueue: Promise<void> = Promise.resolve();
   private closed = false;
 
   private stream: StreamingSpeechSession | null = null;
@@ -109,7 +138,18 @@ export class LiveSession {
   private pendingFinalizeSegments: string[] = [];
   private lastSegmentId: string | null = null;
 
-  constructor(private readonly deps: LiveSessionDeps) {}
+  private translations: TranslationQueue;
+  /** messageId → job info, for retries and duplicate protection. */
+  private messages = new Map<string, RegisteredMessage>();
+
+  constructor(private readonly deps: LiveSessionDeps) {
+    this.translations = new TranslationQueue(
+      deps.translation,
+      (result) => this.handleTranslationSuccess(result),
+      (failure) => this.handleTranslationFailure(failure),
+      deps.translationQueueOptions,
+    );
+  }
 
   get isStarted(): boolean {
     return this.sessionId !== null;
@@ -284,8 +324,23 @@ export class LiveSession {
       return;
     }
 
-    // Process sequentially so results (and translation context) stay in order.
-    this.enqueue(() => this.processSegment(segment, pcm, durationMs), segmentId);
+    // STT stays sequential so transcripts appear in spoken order; translation
+    // does NOT run inside this chain (it goes through the TranslationQueue).
+    this.sttQueue = this.sttQueue.then(() =>
+      this.processSegment(segment, pcm, durationMs).catch((error) => {
+        log.error('segment recognition failed', {
+          sessionId: this.sessionId,
+          segmentId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        this.deps.send({
+          type: 'error',
+          code: 'recognition_failed',
+          message: 'Speech recognition hiccuped — please keep talking.',
+          recoverable: true,
+        });
+      }),
+    );
   }
 
   // ── Streaming pipeline ──────────────────────────────────────────────────────
@@ -316,7 +371,7 @@ export class LiveSession {
     const speakerId = utterance.speakerId;
     const speakerNumber = speakerId?.match(/(\d+)$/)?.[1];
 
-    const recognized: RecognizedUtterance = {
+    this.emitTranscript({
       segmentId,
       text: utterance.text,
       language: gatedLanguage(utterance.text, utterance.language, utterance.languageConfidence),
@@ -326,8 +381,7 @@ export class LiveSession {
       speakerLabel: speakerNumber ? `Speaker ${speakerNumber}` : null,
       audioMs: Math.max(0, utterance.endMs - utterance.startMs),
       sttProvider: providerName,
-    };
-    this.enqueue(() => this.translateAndEmit(recognized, utterance.language), segmentId);
+    });
   }
 
   private handleStreamFinalized(hadSpeech: boolean): void {
@@ -402,63 +456,35 @@ export class LiveSession {
       languageConfidence: transcript.languageConfidence,
     });
 
-    this.deps.send({
-      type: 'partial_transcription',
+    this.emitTranscript({
       segmentId: segment.id,
-      speakerId: speaker.speakerId,
-      language: transcript.language === 'und' ? null : transcript.language,
       text: transcript.text,
+      language: gatedLanguage(transcript.text, transcript.language, transcript.languageConfidence),
+      languageConfidence: transcript.languageConfidence,
+      transcriptionConfidence: transcript.transcriptionConfidence,
+      speakerId: speaker.speakerId,
+      speakerLabel: speaker.speakerLabel,
+      audioMs: durationMs,
+      sttProvider: this.deps.speech.name,
     });
-
-    await this.translateAndEmit(
-      {
-        segmentId: segment.id,
-        text: transcript.text,
-        language: gatedLanguage(transcript.text, transcript.language, transcript.languageConfidence),
-        languageConfidence: transcript.languageConfidence,
-        transcriptionConfidence: transcript.transcriptionConfidence,
-        speakerId: speaker.speakerId,
-        speakerLabel: speaker.speakerLabel,
-        audioMs: durationMs,
-        sttProvider: this.deps.speech.name,
-      },
-      transcript.language,
-    );
 
     await recordProcessedSpeech(this.deps.userId, durationMs / 1000, 0);
   }
 
-  // ── Shared translate + emit ─────────────────────────────────────────────────
+  // ── Transcript-first delivery + queued translation ──────────────────────────
 
-  private async translateAndEmit(
-    recognized: RecognizedUtterance,
-    detectedLanguage: string,
-  ): Promise<void> {
+  /**
+   * Send the transcript to the client immediately, then queue the translation.
+   * `language` is metadata only: every non-empty transcript is translated,
+   * including "und" — the translator detects the language itself in that case.
+   */
+  private emitTranscript(recognized: RecognizedUtterance): void {
     if (this.closed || !this.sessionId) return;
 
-    this.deps.send({ type: 'status', segmentId: recognized.segmentId, state: 'translating' });
-
-    const translateStarted = Date.now();
-    let translatedText: string;
-    let translateLatencyMs = 0;
-    if (recognized.language === this.targetLanguage) {
-      translatedText = recognized.text; // already in the user's language
-    } else {
-      const result = await this.deps.translation.translate({
-        text: recognized.text,
-        sourceLanguage: recognized.language,
-        targetLanguage: this.targetLanguage,
-        context: this.context,
-      });
-      translatedText = result.translatedText;
-      translateLatencyMs = Date.now() - translateStarted;
-    }
-
-    if (this.closed || !this.sessionId) return;
-
-    const payload: TranslationMessagePayload = {
-      type: 'translation',
-      id: newId('msg'),
+    const messageId = newId('msg');
+    const payload: TranscriptFinalPayload = {
+      type: 'transcript_final',
+      messageId,
       segmentId: recognized.segmentId,
       speakerId: recognized.speakerId,
       speakerLabel: recognized.speakerLabel,
@@ -466,87 +492,151 @@ export class LiveSession {
       languageConfidence: recognized.languageConfidence,
       transcriptionConfidence: recognized.transcriptionConfidence,
       originalText: recognized.text,
-      translatedText,
       targetLanguage: this.targetLanguage,
+      translationStatus: 'pending',
       timestamp: new Date().toISOString(),
       diagnostics: {
         sttProvider: recognized.sttProvider,
-        detectedLanguage,
+        detectedLanguage: recognized.language,
         audioMs: recognized.audioMs,
-        translateLatencyMs,
+        translateLatencyMs: 0,
       },
     };
     this.deps.send(payload);
+
+    const request: TranslationRequest = {
+      text: recognized.text,
+      sourceLanguage: recognized.language,
+      targetLanguage: this.targetLanguage,
+      context: [...this.context],
+    };
+    this.registerMessage(messageId, {
+      request,
+      status: 'pending',
+      originalText: recognized.text,
+      audioMs: recognized.audioMs,
+      speakerId: recognized.speakerId,
+      speakerLabel: recognized.speakerLabel,
+      languageConfidence: recognized.languageConfidence,
+    });
+
+    // No same-language skip on purpose: language detection can be wrong, and
+    // skipping on a wrong label would leave foreign speech untranslated. The
+    // translator detects the input language itself and returns text already in
+    // the target language naturally unchanged.
+    this.translations.enqueue({ messageId, request });
+  }
+
+  private handleTranslationSuccess(result: TranslationJobSuccess): void {
+    const entry = this.messages.get(result.messageId);
+    if (!entry || this.closed || !this.sessionId) return;
+    if (entry.status === 'done') return; // duplicate completion (e.g. double retry)
+    entry.status = 'done';
+    entry.translatedText = result.translatedText;
+
+    this.deps.send({
+      type: 'translation_complete',
+      messageId: result.messageId,
+      translatedText: result.translatedText,
+      targetLanguage: this.targetLanguage,
+    });
     this.translationCount += 1;
 
     this.context.push({
-      sourceLanguage: recognized.language,
-      originalText: recognized.text,
-      translatedText,
+      sourceLanguage: entry.request.sourceLanguage,
+      originalText: entry.originalText,
+      translatedText: result.translatedText,
     });
     if (this.context.length > CONTEXT_WINDOW_TURNS) this.context.shift();
 
     if (this.saveHistory && this.sessionPersisted) {
-      await getStore().addMessage({
-        id: payload.id,
-        sessionId: this.sessionId,
-        speakerId: recognized.speakerId,
-        speakerLabel: recognized.speakerLabel,
-        sourceLanguage: recognized.language,
-        languageConfidence: recognized.languageConfidence,
-        originalText: recognized.text,
-        translatedText,
-        createdAt: payload.timestamp,
-      });
+      void getStore()
+        .addMessage({
+          id: result.messageId,
+          sessionId: this.sessionId,
+          speakerId: entry.speakerId,
+          speakerLabel: entry.speakerLabel,
+          sourceLanguage: entry.request.sourceLanguage,
+          languageConfidence: entry.languageConfidence,
+          originalText: entry.originalText,
+          translatedText: result.translatedText,
+          createdAt: new Date().toISOString(),
+        })
+        .catch(() => undefined);
     }
 
-    // Speech seconds are metered at segment end; characters are metered here.
-    await recordProcessedSpeech(this.deps.userId, 0, translatedText.length).catch(() => undefined);
+    // Characters are metered here; speech seconds were metered at segment end.
+    void recordProcessedSpeech(this.deps.userId, 0, result.translatedText.length).catch(
+      () => undefined,
+    );
 
-    log.info('utterance translated', {
+    log.info('translation complete', {
       sessionId: this.sessionId,
-      segmentId: recognized.segmentId,
-      sttProvider: recognized.sttProvider,
-      audioMs: recognized.audioMs,
-      sourceLanguage: recognized.language,
-      detectedLanguage,
-      languageConfidence: recognized.languageConfidence,
-      transcriptionConfidence: recognized.transcriptionConfidence,
-      speakerId: recognized.speakerId,
-      translateLatencyMs,
+      messageId: result.messageId,
+      attempts: result.attempts,
+      latencyMs: result.latencyMs,
+      sourceLanguage: entry.request.sourceLanguage,
+      outputLength: result.translatedText.length,
     });
   }
 
-  private enqueue(work: () => Promise<void>, segmentId: string): void {
-    this.queue = this.queue.then(() =>
-      work().catch((error) => {
-        log.error('utterance processing failed', {
-          sessionId: this.sessionId,
-          segmentId,
-          message: error instanceof Error ? error.message : String(error),
-        });
-        this.deps.send({
-          type: 'error',
-          code: 'processing_failed',
-          message: 'Translation is temporarily unavailable. Please try again.',
-          recoverable: true,
-        });
-      }),
-    );
+  private handleTranslationFailure(failure: TranslationJobFailure): void {
+    const entry = this.messages.get(failure.messageId);
+    if (entry) entry.status = 'failed';
+    log.error('translation failed permanently', {
+      sessionId: this.sessionId,
+      messageId: failure.messageId,
+      attempts: failure.attempts,
+      retriesExhausted: failure.retriesExhausted,
+      lastStatus: failure.lastStatus,
+      lastError: failure.lastError,
+    });
+    if (this.closed || !this.sessionId) return;
+    // The transcript stays on screen; the client shows a Retry action.
+    this.deps.send({ type: 'translation_failed', messageId: failure.messageId });
+  }
+
+  /** Client pressed Retry: resubmit the SAME text — no audio is re-recorded. */
+  handleRetryTranslation(messageId: string): void {
+    if (!this.requireSession()) return;
+    const entry = this.messages.get(messageId);
+    if (!entry) return; // unknown or evicted — nothing safe to do
+    if (entry.status === 'pending') return; // already in flight
+    if (entry.status === 'done') {
+      // Idempotent: the earlier result may have been lost to a reconnect.
+      this.deps.send({
+        type: 'translation_complete',
+        messageId,
+        translatedText: entry.translatedText ?? '',
+        targetLanguage: this.targetLanguage,
+      });
+      return;
+    }
+    entry.status = 'pending';
+    this.translations.enqueue({ messageId, request: entry.request });
+  }
+
+  private registerMessage(messageId: string, entry: RegisteredMessage): void {
+    this.messages.set(messageId, entry);
+    if (this.messages.size > MESSAGE_REGISTRY_LIMIT) {
+      const oldest = this.messages.keys().next().value;
+      if (oldest) this.messages.delete(oldest);
+    }
   }
 
   async handleSessionStop(): Promise<void> {
     if (!this.sessionId) return;
     if (this.stream) {
       // Flush whatever the provider is still holding, give its results a
-      // moment to arrive, then let in-flight translations finish.
+      // moment to arrive, then let in-flight work finish.
       this.stream.finalize();
       await new Promise((resolve) => setTimeout(resolve, 500));
       await this.stream.close().catch(() => undefined);
       this.stream = null;
     }
-    // Let in-flight segments finish so their results are not lost.
-    await this.queue;
+    // Let in-flight recognition and translations finish so results aren't lost.
+    await this.sttQueue;
+    await this.translations.drain();
     const sessionId = this.sessionId;
     const durationSeconds = Math.round((Date.now() - this.startedAt) / 1000);
 
@@ -578,6 +668,7 @@ export class LiveSession {
   async dispose(): Promise<void> {
     this.closed = true;
     this.segment = null;
+    this.translations.close();
     if (this.stream) {
       await this.stream.close().catch(() => undefined);
       this.stream = null;

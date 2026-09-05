@@ -142,6 +142,11 @@ class LiveTranslationClient {
     _sendJson({'type': 'session_stop'});
   }
 
+  /// Ask the server to re-translate an existing transcript (no new audio).
+  void sendRetryTranslation(String messageId) {
+    _sendJson({'type': 'retry_translation', 'messageId': messageId});
+  }
+
   void _sendJson(Map<String, dynamic> message) {
     final channel = _channel;
     if (channel == null) return;

@@ -19,6 +19,7 @@ class MessageBubble extends StatelessWidget {
     required this.showLanguageLabels,
     this.onReplay,
     this.onReport,
+    this.onRetry,
   });
 
   final TranslationMessage message;
@@ -27,6 +28,9 @@ class MessageBubble extends StatelessWidget {
   final bool showLanguageLabels;
   final Future<void> Function()? onReplay;
   final VoidCallback? onReport;
+
+  /// Resubmits a failed translation (same text, no re-recording).
+  final VoidCallback? onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -80,18 +84,57 @@ class MessageBubble extends StatelessWidget {
                   ],
                 ),
                 const SizedBox(height: 8),
-                SizedBox(
-                  width: double.infinity,
-                  child: Text(
-                    message.translatedText,
-                    textDirection: targetRtl ? TextDirection.rtl : TextDirection.ltr,
-                    textAlign: TextAlign.start,
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      fontWeight: FontWeight.w600,
-                      height: 1.45,
+                // The transcript always stays visible; the translation slot
+                // shows the text, a "Translating…" placeholder, or a Retry.
+                switch (message.status) {
+                  TranslationStatus.done => SizedBox(
+                      width: double.infinity,
+                      child: Text(
+                        message.translatedText,
+                        textDirection: targetRtl ? TextDirection.rtl : TextDirection.ltr,
+                        textAlign: TextAlign.start,
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          height: 1.45,
+                        ),
+                      ),
                     ),
-                  ),
-                ),
+                  TranslationStatus.pending => Row(
+                      children: [
+                        SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: theme.colorScheme.outline,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Translating…',
+                          style: theme.textTheme.titleMedium?.copyWith(
+                            color: theme.colorScheme.outline,
+                            fontStyle: FontStyle.italic,
+                          ),
+                        ),
+                      ],
+                    ),
+                  TranslationStatus.failed => Row(
+                      children: [
+                        Icon(Icons.error_outline_rounded,
+                            size: 18, color: theme.colorScheme.error),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Translation failed',
+                          style: theme.textTheme.titleMedium
+                              ?.copyWith(color: theme.colorScheme.error),
+                        ),
+                        const SizedBox(width: 8),
+                        if (onRetry != null)
+                          TextButton(onPressed: onRetry, child: const Text('Retry')),
+                      ],
+                    ),
+                },
                 if (showOriginal && message.originalText.isNotEmpty) ...[
                   const SizedBox(height: 6),
                   SizedBox(

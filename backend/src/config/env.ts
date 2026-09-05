@@ -41,3 +41,22 @@ if (isProduction && env.JWT_SECRET === 'change-me-in-production') {
   console.error('Refusing to start in production with the default JWT_SECRET.');
   process.exit(1);
 }
+
+// A real provider without its API key must fail startup loudly — silently
+// degrading to mock would ship a fake product. Never print key values.
+/* eslint-disable no-console */
+if (env.SPEECH_PROVIDER !== 'mock' && !env.SPEECH_API_KEY) {
+  console.error(
+    `SPEECH_PROVIDER=${env.SPEECH_PROVIDER} requires SPEECH_API_KEY to be set. Refusing to start.`,
+  );
+  process.exit(1);
+}
+if (env.TRANSLATION_PROVIDER !== 'mock' && !env.TRANSLATION_API_KEY) {
+  console.error(
+    `TRANSLATION_PROVIDER=${env.TRANSLATION_PROVIDER} requires TRANSLATION_API_KEY to be set. Refusing to start.`,
+  );
+  process.exit(1);
+}
+console.log(`Speech provider: ${env.SPEECH_PROVIDER}`);
+console.log(`Translation provider: ${env.TRANSLATION_PROVIDER}`);
+/* eslint-enable no-console */

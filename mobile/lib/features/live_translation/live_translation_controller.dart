@@ -293,6 +293,17 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       case TranslationEvent(:final message):
         activityLabel = null;
         _addMessage(message);
+      case TranscriptFinalEvent(:final message):
+        activityLabel = null;
+        _addTranscript(message);
+      case TranslationCompleteEvent(:final messageId, :final translatedText):
+        _updateMessage(
+          messageId,
+          (m) => m.copyWith(translatedText: translatedText, status: TranslationStatus.done),
+          speak: true,
+        );
+      case TranslationFailedEvent(:final messageId):
+        _updateMessage(messageId, (m) => m.copyWith(status: TranslationStatus.failed));
       case SegmentDroppedEvent():
         activityLabel = null;
         notifyListeners();
@@ -317,25 +328,72 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   void _addMessage(TranslationMessage message) {
     messages.add(message);
     _sessionMessages.add(message);
-    if (settings.settings.developerDiagnostics) {
-      developer.log(
-        '[PIPELINE] provider=${message.diagnostics?['sttProvider']} '
-        'transcript="${message.originalText}" '
-        'language=${message.sourceLanguage} '
-        '(detected=${message.diagnostics?['detectedLanguage']}, '
-        'confidence=${message.languageConfidence.toStringAsFixed(2)}) '
-        'sttConfidence=${message.transcriptionConfidence.toStringAsFixed(2)} '
-        'speaker=${message.speakerId} '
-        'translated="${message.translatedText}" '
-        'audioMs=${message.diagnostics?['audioMs']} '
-        'translateLatencyMs=${message.diagnostics?['translateLatencyMs']}',
-        name: 'pipeline',
-      );
-    }
+    _logPipeline(message);
     notifyListeners();
     if (settings.settings.autoSpeak) {
       tts.speak(message.translatedText, message.targetLanguage);
     }
+  }
+
+  /// Transcript arrived before its translation: display it immediately with a
+  /// "Translating…" placeholder. Reconnect-duplicates (same id) are ignored.
+  void _addTranscript(TranslationMessage message) {
+    if (message.id.isEmpty || messages.any((m) => m.id == message.id)) return;
+    messages.add(message);
+    _sessionMessages.add(message);
+    _logPipeline(message);
+    notifyListeners();
+  }
+
+  /// Updates the existing message in place — never creates a second bubble.
+  void _updateMessage(
+    String messageId,
+    TranslationMessage Function(TranslationMessage) change, {
+    bool speak = false,
+  }) {
+    final index = messages.indexWhere((m) => m.id == messageId);
+    if (index < 0) return;
+    final alreadyDone = messages[index].status == TranslationStatus.done;
+    final updated = change(messages[index]);
+    messages[index] = updated;
+    final sessionIndex = _sessionMessages.indexWhere((m) => m.id == messageId);
+    if (sessionIndex >= 0) _sessionMessages[sessionIndex] = updated;
+    if (settings.settings.developerDiagnostics) {
+      developer.log(
+        '[PIPELINE] update id=$messageId status=${updated.status.name} '
+        'translated="${updated.translatedText}"',
+        name: 'pipeline',
+      );
+    }
+    notifyListeners();
+    // Speak once per message, even if a retry delivers the result twice.
+    if (speak && !alreadyDone && settings.settings.autoSpeak) {
+      tts.speak(updated.translatedText, updated.targetLanguage);
+    }
+  }
+
+  /// User pressed Retry on a failed translation: same text, no new audio.
+  void retryTranslation(TranslationMessage message) {
+    if (message.status != TranslationStatus.failed) return;
+    _updateMessage(message.id, (m) => m.copyWith(status: TranslationStatus.pending));
+    client.sendRetryTranslation(message.id);
+  }
+
+  void _logPipeline(TranslationMessage message) {
+    if (!settings.settings.developerDiagnostics) return;
+    developer.log(
+      '[PIPELINE] id=${message.id} provider=${message.diagnostics?['sttProvider']} '
+      'transcript="${message.originalText}" '
+      'language=${message.sourceLanguage} '
+      '(detected=${message.diagnostics?['detectedLanguage']}, '
+      'confidence=${message.languageConfidence.toStringAsFixed(2)}) '
+      'sttConfidence=${message.transcriptionConfidence.toStringAsFixed(2)} '
+      'speaker=${message.speakerId} '
+      'status=${message.status.name} '
+      'translated="${message.translatedText}" '
+      'audioMs=${message.diagnostics?['audioMs']}',
+      name: 'pipeline',
+    );
   }
 
   void _handleConnectionState(LiveConnectionState next) {

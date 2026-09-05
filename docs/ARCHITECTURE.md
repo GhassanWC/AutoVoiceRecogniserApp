@@ -16,10 +16,30 @@ Backend LiveSession (one per connection)
 Deepgram live stream (one per session: nova-3, language=multi, diarize_model=latest)
     ↓  { text, per-word language, per-word speaker, confidences }
     ↓  speaker ids from the provider, preserved verbatim
-OpenAI translation (after a reliable transcript exists; rolling context window)
+transcript_final event → mobile chat UI shows the message with "Translating…"
     ↓
-translation event → mobile chat UI (+ optional local history, optional TTS)
+translation queue (concurrency 2, retries w/ backoff on 408/429/5xx/network)
+    ↓  OpenAI translation — ALWAYS runs on a non-empty transcript,
+    ↓  even when sourceLanguage is "und" (language is metadata only)
+translation_complete / translation_failed → updates the SAME message
+                                            (+ optional local history, TTS)
 ```
+
+Reliability rules for translation:
+
+- The speech stream never waits on OpenAI: transcripts flow continuously into
+  the queue while earlier utterances are still translating.
+- A transcript is never lost because translation failed: it is on screen from
+  the moment STT finalizes, and a failed translation shows
+  "Translation failed · Retry" — the Retry resubmits the same text over the
+  socket (`retry_translation`), no audio is re-recorded.
+- Transient failures (network errors, timeouts, HTTP 408/429/5xx) retry with
+  ~300 ms → 1 s → 2 s backoff before the user sees anything; permanent errors
+  (bad API key) fail immediately and loudly in the logs.
+- Every utterance has a stable `messageId`; retries and reconnect-duplicates
+  update the existing message, never create a second bubble.
+- Startup refuses to run a real provider without its API key — the backend
+  never silently degrades to mock.
 
 The Deepgram stream lives for the whole session, so switching languages
 mid-conversation needs no reconnect or reconfiguration, and diarized speaker
@@ -121,8 +141,11 @@ Below 0.5 the app shows *"Language detected automatically"* instead of a
 possibly-wrong language name. Very short utterances ("yes", "okay", "hello")
 exist in many languages, so when they arrive with language confidence below
 0.8 the server reports `sourceLanguage: "und"` rather than guessing.
-When the detected language equals the target language, translation is skipped
-(the text is already in the user's language).
+Language detection never gates translation: every non-empty transcript goes
+through the translation queue, even when the detected language equals the
+target — detection can be wrong, and the translator (which detects the input
+language itself from the text) simply returns already-target-language text
+naturally unchanged.
 
 ## Mobile app structure
 
