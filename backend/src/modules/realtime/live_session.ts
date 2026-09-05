@@ -8,11 +8,13 @@ import {
 } from '../../providers/speech';
 import {
   ConversationTurn,
+  RealtimeTranslationProvider,
+  RealtimeTranslationSession,
   TranslationProvider,
   TranslationRequest,
 } from '../../providers/translation';
 import { getStore } from '../../storage';
-import { pcm16ToWav, pcmDurationMs } from '../../utils/audio';
+import { pcm16Rms, pcm16ToWav, pcmDurationMs } from '../../utils/audio';
 import { newId, newUuid } from '../../utils/ids';
 import { log } from '../../utils/logger';
 import { hasRemainingAllowance, recordProcessedSpeech } from '../usage/usage.service';
@@ -48,6 +50,12 @@ export interface LiveSessionDeps {
   /** Streaming recognizer; null → per-segment batch pipeline via `speech`. */
   streamingSpeech?: StreamingSpeechProvider | null;
   translation: TranslationProvider;
+  /**
+   * PRIMARY live path (gpt-realtime-translate): speech in → translated text
+   * deltas out on one socket. When null or failed, continuous sessions fall
+   * back to streamingSpeech + the text translation queue.
+   */
+  realtimeTranslation?: RealtimeTranslationProvider | null;
   diarization: SpeakerDiarizationProvider;
   send: (message: ServerMessage) => void;
   /** Test hook: shorter retry delays / different concurrency. */
@@ -151,6 +159,42 @@ export class LiveSession {
   private continuousStreamId: string | null = null;
   private continuousSampleRate = 16000;
   private streamReopenAttempts = 0;
+
+  /** Primary realtime-translation session state. */
+  private translateSession: RealtimeTranslationSession | null = null;
+  private translateFailed = false;
+  private translateReopenAttempts = 0;
+  /** provider utteranceId → messageId, plus when the utterance began. */
+  private readonly utteranceMessages = new Map<string, { messageId: string; startedAt: number }>();
+
+  /**
+   * Utterance-based failover: the translate endpoint occasionally returns
+   * sessions that accept audio yet never emit a translation. A light
+   * server-side energy tracker detects when an utterance ENDS; if the direct
+   * path produced no delta within FAILOVER_DEADLINE_MS of speech end, that
+   * SAME utterance (kept in a short in-memory buffer, never persisted) is
+   * replayed through the verified STT + text-translation fallback under the
+   * SAME messageId, and the rest of the session stays on the fallback. Short
+   * phrases ("Hello") trigger this exactly like long ones.
+   */
+  private static readonly SPEECH_RMS = 0.01;
+  private static readonly UTTERANCE_START_MS = 150;
+  private static readonly UTTERANCE_END_SILENCE_MS = 600;
+  private static readonly MIN_UTTERANCE_SPEECH_MS = 300;
+  private static readonly FAILOVER_DEADLINE_MS = 1400;
+  private static readonly FAILOVER_PREROLL_MS = 1000;
+  private static readonly FAILOVER_BUFFER_CAP_MS = 20_000;
+
+  private speechActive = false;
+  private utterSpeechMs = 0;
+  private utterSilentMs = 0;
+  private deltaSinceUtteranceStart = false;
+  /** Rolling pre-roll + current-utterance audio, ONLY for failover replay. */
+  private recentAudio: Array<{ pcm: Buffer; ms: number }> = [];
+  private recentAudioMs = 0;
+  private pendingCheck: { messageId: string; audio: Buffer; timer: NodeJS.Timeout } | null = null;
+  /** Consumed by the first fallback utterance after a failover. */
+  private failoverMessageId: string | null = null;
 
   /** speech_end → first-delta / final latency samples for p50/p95 logging. */
   private readonly latencySamples: Array<{ firstDeltaMs?: number; finalMs: number }> = [];
@@ -271,11 +315,12 @@ export class LiveSession {
    */
   handleStreamStart(message: StreamStartMessage): void {
     if (!this.requireSession()) return;
-    if (!this.streamingEnabled) {
+    const translateAvailable = Boolean(this.deps.realtimeTranslation) && !this.translateFailed;
+    if (!translateAvailable && !this.streamingEnabled) {
       this.deps.send({
         type: 'error',
         code: 'streaming_unsupported',
-        message: 'Live streaming is not available with the configured speech provider.',
+        message: 'Live streaming is not available with the configured providers.',
         recoverable: false,
       });
       return;
@@ -283,7 +328,11 @@ export class LiveSession {
     this.continuousStreamId = message.streamId;
     this.continuousSampleRate = message.sampleRate;
     this.streamReopenAttempts = 0;
-    if (!this.stream) {
+    if (translateAvailable) {
+      // PRIMARY: speech → translated text on one socket (gpt-realtime-translate).
+      if (!this.translateSession) this.openTranslateSession(message.sampleRate);
+    } else if (!this.stream) {
+      // FALLBACK: realtime transcription + text translation queue.
       this.openStream(message.sampleRate, true);
     }
     this.deps.send({ type: 'status', segmentId: message.streamId, state: 'hearing' });
@@ -300,7 +349,12 @@ export class LiveSession {
         this.continuousStreamId = null;
         return;
       }
-      this.stream?.sendAudio(frame.pcm);
+      if (this.translateSession) {
+        this.translateSession.sendAudio(frame.pcm);
+        this.trackUtteranceForFailover(frame.pcm);
+      } else {
+        this.stream?.sendAudio(frame.pcm);
+      }
       return;
     }
 
@@ -401,7 +455,308 @@ export class LiveSession {
     );
   }
 
-  // ── Streaming pipeline ──────────────────────────────────────────────────────
+  // ── Primary live path: gpt-realtime-translate ──────────────────────────────
+
+  private openTranslateSession(sampleRate: number): void {
+    const provider = this.deps.realtimeTranslation;
+    if (!provider) return;
+    try {
+      const session = provider.createSession({
+        sampleRate,
+        targetLanguage: this.targetLanguage,
+      });
+      session.onDelta((utteranceId, delta) => this.handleTranslateDelta(utteranceId, delta));
+      session.onUtteranceFinal((utteranceId, translatedText, sourceText) =>
+        this.handleTranslateFinal(utteranceId, translatedText, sourceText),
+      );
+      session.onError((error) => this.handleTranslateError(error));
+      this.translateSession = session;
+      this.speechActive = false;
+      this.utterSpeechMs = 0;
+      this.utterSilentMs = 0;
+    } catch (error) {
+      this.translateFailed = true;
+      log.error('failed to open realtime translation session, using fallback', {
+        sessionId: this.sessionId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      this.openStream(sampleRate, true);
+    }
+  }
+
+  /**
+   * Energy tracker on the audio forwarded to the direct-translate session.
+   * Detects utterance boundaries; at each utterance end with NO delta seen,
+   * arms the failover deadline with a snapshot of that utterance's audio.
+   */
+  private trackUtteranceForFailover(pcm: Buffer): void {
+    const frameMs = pcmDurationMs(pcm.length, {
+      sampleRate: this.continuousSampleRate,
+      channels: 1,
+    });
+    this.recentAudio.push({ pcm, ms: frameMs });
+    this.recentAudioMs += frameMs;
+    while (
+      this.recentAudioMs > LiveSession.FAILOVER_BUFFER_CAP_MS &&
+      this.recentAudio.length > 1
+    ) {
+      this.recentAudioMs -= this.recentAudio.shift()!.ms;
+    }
+
+    if (pcm16Rms(pcm) > LiveSession.SPEECH_RMS) {
+      this.utterSilentMs = 0;
+      this.utterSpeechMs += frameMs;
+      if (!this.speechActive && this.utterSpeechMs >= LiveSession.UTTERANCE_START_MS) {
+        this.speechActive = true;
+        this.deltaSinceUtteranceStart = false;
+        // Keep only ~1 s of pre-roll behind the utterance start.
+        const keepMs = LiveSession.FAILOVER_PREROLL_MS + this.utterSpeechMs;
+        while (this.recentAudioMs > keepMs && this.recentAudio.length > 1) {
+          this.recentAudioMs -= this.recentAudio.shift()!.ms;
+        }
+      }
+      return;
+    }
+
+    this.utterSilentMs += frameMs;
+    if (!this.speechActive) {
+      this.utterSpeechMs = 0;
+      return;
+    }
+    if (this.utterSilentMs >= LiveSession.UTTERANCE_END_SILENCE_MS) {
+      const speechMs = this.utterSpeechMs;
+      this.speechActive = false;
+      this.utterSpeechMs = 0;
+      if (
+        speechMs >= LiveSession.MIN_UTTERANCE_SPEECH_MS &&
+        !this.deltaSinceUtteranceStart &&
+        !this.pendingCheck
+      ) {
+        const messageId = newId('msg');
+        const audio = Buffer.concat(this.recentAudio.map((entry) => entry.pcm));
+        const timer = setTimeout(
+          () => this.failoverUtterance(),
+          LiveSession.FAILOVER_DEADLINE_MS,
+        );
+        timer.unref?.();
+        this.pendingCheck = { messageId, audio, timer };
+      }
+    }
+  }
+
+  /** The armed deadline passed with no direct output — switch to the fallback. */
+  private failoverUtterance(): void {
+    const pending = this.pendingCheck;
+    this.pendingCheck = null;
+    if (!pending || this.closed || !this.sessionId || !this.continuousStreamId) return;
+
+    log.warn(
+      '[FAILOVER] direct translate produced no output for a finished utterance — switching this session to the STT fallback',
+      { sessionId: this.sessionId, messageId: pending.messageId, audioBytes: pending.audio.length },
+    );
+    this.translateFailed = true;
+    const defective = this.translateSession;
+    this.translateSession = null;
+    if (defective) void defective.close().catch(() => undefined);
+    this.recentAudio = [];
+    this.recentAudioMs = 0;
+    this.speechActive = false;
+
+    if (!this.streamingEnabled) {
+      this.continuousStreamId = null;
+      this.deps.send({
+        type: 'error',
+        code: 'stream_interrupted',
+        message: 'Live translation is unavailable right now. Please stop and start again.',
+        recoverable: false,
+      });
+      return;
+    }
+    if (!this.stream) this.openStream(this.continuousSampleRate, true);
+    if (!this.stream) return;
+
+    // Replay the SAME utterance (plus trailing silence so the fallback's
+    // server VAD endpoints it immediately); its transcript will reuse the
+    // reserved messageId, so the user sees one bubble, no duplicates. Live
+    // audio keeps flowing into this stream from here on.
+    this.failoverMessageId = pending.messageId;
+    this.stream.sendAudio(pending.audio);
+    this.stream.sendAudio(Buffer.alloc((this.continuousSampleRate * 2 * 800) / 1000));
+  }
+
+  /** Direct output within the deadline claims the reserved messageId. */
+  private consumePendingMessageId(): string | null {
+    const pending = this.pendingCheck;
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    this.pendingCheck = null;
+    return pending.messageId;
+  }
+
+  /** First delta of an utterance creates the bubble; every delta streams into it. */
+  private handleTranslateDelta(utteranceId: string, delta: string): void {
+    if (this.closed || !this.sessionId) return;
+    // A late delta from a session already failed over must not resurrect it —
+    // the fallback owns this utterance now (no duplicate bubbles).
+    if (this.translateFailed) return;
+    this.deltaSinceUtteranceStart = true;
+    let mapping = this.utteranceMessages.get(utteranceId);
+    if (!mapping) {
+      const messageId = this.consumePendingMessageId() ?? newId('msg');
+      mapping = { messageId, startedAt: Date.now() };
+      this.utteranceMessages.set(utteranceId, mapping);
+      this.registerMessage(messageId, {
+        request: { text: '', sourceLanguage: 'und', targetLanguage: this.targetLanguage },
+        status: 'pending',
+        originalText: '',
+        audioMs: 0,
+        speakerId: null, // diarization is out of the primary MVP path
+        speakerLabel: null,
+        languageConfidence: 0,
+      });
+      // The bubble appears the instant the first translated word exists; the
+      // source transcript (when available) fills in at finalization.
+      this.deps.send({
+        type: 'transcript_final',
+        messageId,
+        segmentId: this.continuousStreamId ?? newUuid(),
+        speakerId: null,
+        speakerLabel: null,
+        sourceLanguage: 'und',
+        languageConfidence: 0,
+        transcriptionConfidence: 0,
+        originalText: '',
+        targetLanguage: this.targetLanguage,
+        translationStatus: 'pending',
+        timestamp: new Date().toISOString(),
+        diagnostics: {
+          sttProvider: this.deps.realtimeTranslation?.name ?? 'realtime-translate',
+          detectedLanguage: 'und',
+          audioMs: 0,
+          translateLatencyMs: 0,
+        },
+      });
+    }
+    this.deps.send({ type: 'translation_delta', messageId: mapping.messageId, delta });
+  }
+
+  private handleTranslateFinal(
+    utteranceId: string,
+    translatedText: string,
+    sourceText: string,
+  ): void {
+    if (this.closed || !this.sessionId) return;
+    if (this.translateFailed) return; // late output after failover — ignore
+    const mapping = this.utteranceMessages.get(utteranceId);
+    if (!mapping) return;
+    this.utteranceMessages.delete(utteranceId);
+
+    const entry = this.messages.get(mapping.messageId);
+    if (entry) {
+      entry.status = 'done';
+      entry.translatedText = translatedText;
+      entry.originalText = sourceText;
+      entry.request.text = sourceText; // a manual Retry can re-run as text translation
+    }
+
+    this.deps.send({
+      type: 'translation_complete',
+      messageId: mapping.messageId,
+      translatedText,
+      targetLanguage: this.targetLanguage,
+      sourceLanguage: 'und', // the translate model does not report it per utterance
+      originalText: sourceText || undefined,
+    });
+    this.translationCount += 1;
+
+    this.context.push({ sourceLanguage: 'und', originalText: sourceText, translatedText });
+    if (this.context.length > CONTEXT_WINDOW_TURNS) this.context.shift();
+
+    if (this.saveHistory && this.sessionPersisted) {
+      void getStore()
+        .addMessage({
+          id: mapping.messageId,
+          sessionId: this.sessionId,
+          speakerId: null,
+          speakerLabel: null,
+          sourceLanguage: 'und',
+          languageConfidence: 0,
+          originalText: sourceText,
+          translatedText,
+          createdAt: new Date().toISOString(),
+        })
+        .catch(() => undefined);
+    }
+
+    // Meter the utterance's rough speech time (wall clock, capped) + output.
+    const speechSeconds = Math.min(30, (Date.now() - mapping.startedAt) / 1000);
+    void recordProcessedSpeech(this.deps.userId, speechSeconds, translatedText.length).catch(
+      () => undefined,
+    );
+    void hasRemainingAllowance(this.deps.userId).then((allowed) => {
+      if (!allowed && this.continuousStreamId && this.sessionId && !this.closed) {
+        this.continuousStreamId = null;
+        this.deps.send({
+          type: 'limit_reached',
+          message: 'You have used all of your free translation minutes for this month.',
+        });
+      }
+    });
+
+    log.info('utterance translated (realtime-translate)', {
+      sessionId: this.sessionId,
+      messageId: mapping.messageId,
+      utteranceMs: Date.now() - mapping.startedAt,
+      outputLength: translatedText.length,
+    });
+  }
+
+  private handleTranslateError(error: Error): void {
+    this.translateSession = null;
+    if (this.closed || !this.sessionId || !this.continuousStreamId) return;
+
+    if (this.translateReopenAttempts < 3) {
+      this.translateReopenAttempts += 1;
+      log.warn('realtime translation session failed, reopening', {
+        sessionId: this.sessionId,
+        attempt: this.translateReopenAttempts,
+        message: error.message,
+      });
+      setTimeout(() => {
+        if (
+          !this.closed &&
+          this.sessionId &&
+          this.continuousStreamId &&
+          !this.translateSession &&
+          !this.translateFailed // an utterance failover may have won meanwhile
+        ) {
+          this.openTranslateSession(this.continuousSampleRate);
+        }
+      }, 500).unref?.();
+      return;
+    }
+
+    // Primary path is gone for this session — switch to the fallback
+    // (realtime transcription + text translation queue) transparently.
+    log.error('realtime translation failed permanently, switching to fallback pipeline', {
+      sessionId: this.sessionId,
+      message: error.message,
+    });
+    this.translateFailed = true;
+    if (this.streamingEnabled && !this.stream) {
+      this.openStream(this.continuousSampleRate, true);
+    } else if (!this.streamingEnabled) {
+      this.continuousStreamId = null;
+      this.deps.send({
+        type: 'error',
+        code: 'stream_interrupted',
+        message: 'Live translation is unavailable right now. Please stop and start again.',
+        recoverable: false,
+      });
+    }
+  }
+
+  // ── Fallback streaming pipeline (STT → text translation) ───────────────────
 
   private openStream(sampleRate: number, serverTurnDetection = false): void {
     const provider = this.deps.streamingSpeech;
@@ -577,7 +932,10 @@ export class LiveSession {
   private emitTranscript(recognized: RecognizedUtterance): void {
     if (this.closed || !this.sessionId) return;
 
-    const messageId = newId('msg');
+    // A failover reserved this id for the replayed utterance — same bubble,
+    // no duplicate. Consumed exactly once.
+    const messageId = this.failoverMessageId ?? newId('msg');
+    this.failoverMessageId = null;
     const payload: TranscriptFinalPayload = {
       type: 'transcript_final',
       messageId,
@@ -813,6 +1171,11 @@ export class LiveSession {
 
   async handleSessionStop(): Promise<void> {
     if (!this.sessionId) return;
+    if (this.translateSession) {
+      // Graceful close flushes any pending translated output server-side.
+      await this.translateSession.close().catch(() => undefined);
+      this.translateSession = null;
+    }
     if (this.stream) {
       // Flush whatever the provider is still holding, give its results a
       // moment to arrive, then let in-flight work finish.
@@ -851,6 +1214,15 @@ export class LiveSession {
     this.streamFailed = false;
     this.continuousStreamId = null;
     this.streamReopenAttempts = 0;
+    this.translateFailed = false;
+    this.translateReopenAttempts = 0;
+    this.utteranceMessages.clear();
+    if (this.pendingCheck) clearTimeout(this.pendingCheck.timer);
+    this.pendingCheck = null;
+    this.failoverMessageId = null;
+    this.recentAudio = [];
+    this.recentAudioMs = 0;
+    this.speechActive = false;
   }
 
   /** Socket closed — finalize the session record, drop all buffers. */
@@ -858,6 +1230,14 @@ export class LiveSession {
     this.closed = true;
     this.segment = null;
     this.translations.close();
+    if (this.pendingCheck) clearTimeout(this.pendingCheck.timer);
+    this.pendingCheck = null;
+    this.recentAudio = [];
+    this.recentAudioMs = 0;
+    if (this.translateSession) {
+      await this.translateSession.close().catch(() => undefined);
+      this.translateSession = null;
+    }
     if (this.stream) {
       await this.stream.close().catch(() => undefined);
       this.stream = null;

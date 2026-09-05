@@ -12,23 +12,30 @@ WebSocket  wss://…/live-translation                  ← binary frames + JSON 
     ↓
 Backend LiveSession (one per connection)
     ↓  audio forwarded as it arrives (16 kHz PCM → resampled to 24 kHz)
-OpenAI realtime transcription (one per session: gpt-4o-transcribe-diarize,
-                               far_field noise reduction, NO input language,
-                               server VAD turn detection: threshold 0.35,
-                               300 ms end-of-speech window → fast subtitles)
-    ↓  { transcript, diarized speaker segments, speech-end timestamp }
-    ↓  speaker ids from the provider, preserved verbatim
-transcript_final event → mobile chat UI shows the message with "Translating…"
-    ↓
-translation queue (concurrency 2, retries w/ backoff on 408/429/5xx/network)
-    ↓  OpenAI translation, STREAMED — display chunks are forwarded the moment
-    ↓  the model emits them (translation_delta appends into the SAME bubble);
-    ↓  the reply's first line is the detected language, so the translator is
-    ↓  also the AUTHORITATIVE language detector
-translation_complete / translation_failed → finalizes the SAME message
-                     (language label + speech_end→delta/final latency; +
-                      optional local history, TTS)
+PRIMARY: OpenAI gpt-realtime-translate (wss://…/v1/realtime/translations,
+         one session per listening session; only the TARGET language is
+         configured — source detection is automatic, no allowlist)
+    ↓  translated transcript deltas, streamed while the speaker talks
+transcript_final (bubble appears on the first translated word)
+translation_delta … translation_delta (append into the SAME bubble)
+translation_complete (full text + source transcript when available)
 ```
+
+**Utterance-based failover** guards the primary path: the endpoint
+occasionally returns sessions that accept audio but never emit a
+translation. A server-side energy tracker detects each utterance's end; if
+no direct delta arrived within ~1.4 s of speech end — a short "Hello"
+included — that SAME utterance (held in a short in-memory buffer, never
+persisted) is replayed under the SAME messageId through the FALLBACK
+pipeline, and the rest of the session stays there: GA realtime transcription
+(gpt-4o-transcribe, `?intent=transcription`, far_field, server VAD 300 ms)
+→ transcript_final → streaming text translation queue (concurrency 2,
+retries on 408/429/5xx/network) → the same delta/complete events. Late
+output from the abandoned session is ignored, so no duplicate bubbles.
+Diarization is out of the critical path (speaker labels show the generic
+"Speaker"); every OpenAI server event type is logged (`[OPENAI] <type>` /
+`[OPENAI ERROR] …`) so a silently-rejected session config can never again
+look like "listening but silent".
 
 Latency is measured per utterance from the provider's speech-end signal:
 `speechEndToFirstDeltaMs` and `speechEndToFinalMs` ride on

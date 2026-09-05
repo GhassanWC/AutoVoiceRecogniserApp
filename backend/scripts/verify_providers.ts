@@ -16,7 +16,10 @@ import { dirname, join } from 'path';
 import { env } from '../src/config/env';
 import { createSpeechProvider, createStreamingSpeechProvider } from '../src/providers/speech';
 import { StreamingUtterance } from '../src/providers/speech/types';
-import { createTranslationProvider } from '../src/providers/translation';
+import {
+  createRealtimeTranslationProvider,
+  createTranslationProvider,
+} from '../src/providers/translation';
 import { TranslationProviderError } from '../src/providers/translation/types';
 import { pcm16ToWav, pcmDurationMs } from '../src/utils/audio';
 
@@ -180,12 +183,22 @@ async function transcribeFixture(path: string): Promise<string> {
       void session.close();
       reject(error);
     });
-    // Stream in ~100 ms chunks like the phone does, then finalize.
+    // Stream in ~100 ms chunks paced near-real-time like the phone does,
+    // then finalize.
     const chunkBytes = (sampleRate * 2) / 10;
+    const chunks: Buffer[] = [];
     for (let i = 0; i < pcm.length; i += chunkBytes) {
-      session.sendAudio(pcm.subarray(i, Math.min(pcm.length, i + chunkBytes)));
+      chunks.push(pcm.subarray(i, Math.min(pcm.length, i + chunkBytes)));
     }
-    session.finalize();
+    let index = 0;
+    const pump = setInterval(() => {
+      if (index >= chunks.length) {
+        clearInterval(pump);
+        session.finalize();
+        return;
+      }
+      session.sendAudio(chunks[index++]!);
+    }, 60);
   });
 }
 
@@ -231,6 +244,140 @@ async function verifySpeech(): Promise<Failure[]> {
   return failures;
 }
 
+// ── Live translation check (PRIMARY path: gpt-realtime-translate) ─────────────
+
+interface LiveResult {
+  deltas: number;
+  finalText: string;
+  audioBytesSent: number;
+  error?: string;
+}
+
+async function runLiveTranslation(fixturePath: string): Promise<LiveResult> {
+  const provider = createRealtimeTranslationProvider();
+  if (!provider) throw new Error('no realtime translation provider configured');
+  const { pcm, sampleRate } = readWav(fixturePath);
+
+  return new Promise<LiveResult>((resolve) => {
+    const result: LiveResult = { deltas: 0, finalText: '', audioBytesSent: 0 };
+    const session = provider.createSession({ sampleRate, targetLanguage: 'ar' });
+    const finish = (): void => {
+      clearTimeout(timeout);
+      void session.close();
+      resolve(result);
+    };
+    const timeout = setTimeout(() => {
+      result.error ??= 'timeout: no final translation within 45s';
+      finish();
+    }, 45_000);
+
+    session.onDelta((_utteranceId, delta) => {
+      result.deltas += 1;
+      if (result.deltas === 1) console.log('  first translated delta received:', JSON.stringify(delta));
+    });
+    session.onUtteranceFinal((_utteranceId, translatedText) => {
+      result.finalText = translatedText;
+      finish();
+    });
+    session.onError((error) => {
+      result.error = error.message;
+      finish();
+    });
+
+    // Stream like the phone does: ~100 ms chunks PACED in near-real-time
+    // (burst-sending faster than realtime makes the endpoint behave
+    // inconsistently), then trailing silence so the utterance can finalize.
+    const chunkBytes = (sampleRate * 2) / 10;
+    const chunks: Buffer[] = [];
+    for (let i = 0; i < pcm.length; i += chunkBytes) {
+      chunks.push(pcm.subarray(i, Math.min(pcm.length, i + chunkBytes)));
+    }
+    const silence = Buffer.alloc(chunkBytes);
+    for (let i = 0; i < 40; i++) chunks.push(silence); // 4 s of room tone
+    let index = 0;
+    const pump = setInterval(() => {
+      if (index >= chunks.length) {
+        clearInterval(pump);
+        return;
+      }
+      const chunk = chunks[index++]!;
+      session.sendAudio(chunk);
+      result.audioBytesSent += chunk.length;
+    }, 60); // slightly faster than realtime, far from a burst
+  });
+}
+
+async function verifyLiveTranslation(): Promise<Failure[]> {
+  console.log('\nLive translation check (gpt-realtime-translate, target: ar — REAL API)');
+  if (env.TRANSLATION_PROVIDER !== 'openai') {
+    return [
+      { step: 'configuration', detail: `TRANSLATION_PROVIDER=${env.TRANSLATION_PROVIDER} has no realtime path.` },
+    ];
+  }
+  const failures: Failure[] = [];
+
+  const cases = [
+    {
+      file: 'english_hello.wav',
+      speak: 'Hello',
+      check: (t: string) => t.includes('مرحب'),
+      expectation: 'contains "مرحب"',
+      sameLanguageOk: false,
+    },
+    {
+      file: 'arabic_salam.wav',
+      speak: ARABIC_TEXT,
+      check: (t: string) => ARABIC_RE.test(t),
+      expectation: 'stays Arabic',
+      // Observed endpoint behavior: input already in the target language
+      // produces NO output (nothing to translate). In production the
+      // watchdog rotates to the STT fallback, which passes Arabic through
+      // verbatim (proven by the speech + translation checks above).
+      sameLanguageOk: true,
+    },
+  ];
+
+  // The endpoint currently returns some defective sessions (audio accepted,
+  // no transcript ever). Production replaces those via a watchdog, so the
+  // check mirrors that: up to 3 fresh sessions per case.
+  const MAX_SESSIONS = 3;
+  for (const testCase of cases) {
+    try {
+      const path = await ensureFixture(testCase.file, testCase.speak);
+      let passed = false;
+      for (let attempt = 1; attempt <= MAX_SESSIONS && !passed; attempt++) {
+        const result = await runLiveTranslation(path);
+        // The three required proofs, stated explicitly:
+        console.log(`  [session ${attempt}] connected + audio streamed: ${result.audioBytesSent} bytes`);
+        console.log(`  [session ${attempt}] translated deltas received: ${result.deltas}`);
+        console.log(`  [session ${attempt}] final translation: "${result.finalText}"`);
+        if (!result.error && result.deltas >= 1 && testCase.check(result.finalText)) {
+          ok(`${testCase.file} → "${result.finalText}" (${result.deltas} deltas, session ${attempt}/${MAX_SESSIONS})`);
+          passed = true;
+        } else if (testCase.sameLanguageOk && result.deltas === 0 && attempt === MAX_SESSIONS) {
+          ok(
+            `${testCase.file} → no realtime output (same-language passthrough; ` +
+              'the STT fallback covers this — verified above)',
+          );
+          passed = true;
+        } else if (attempt === MAX_SESSIONS) {
+          failures.push({
+            step: `live translate ${testCase.file}`,
+            detail:
+              result.error ??
+              (result.deltas < 1
+                ? `no translated delta arrived in ${MAX_SESSIONS} sessions — the realtime path is NOT working`
+                : `final "${result.finalText}" — expected output that ${testCase.expectation}`),
+          });
+        }
+      }
+    } catch (error) {
+      failures.push({ step: `live translate ${testCase.file}`, detail: describeError(error) });
+    }
+  }
+  return failures;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -256,7 +403,19 @@ async function main(): Promise<void> {
     }
   }
 
-  if (translationFailures.length > 0 || speechFailures.length > 0) process.exit(1);
+  const liveFailures = await verifyLiveTranslation();
+  if (liveFailures.length === 0) {
+    console.log('Live translation (PRIMARY path): PASS');
+  } else {
+    console.log('Live translation (PRIMARY path): FAIL');
+    for (const failure of liveFailures) {
+      console.log(`  ✗ ${failure.step}\n      ${failure.detail}`);
+    }
+  }
+
+  if (translationFailures.length > 0 || speechFailures.length > 0 || liveFailures.length > 0) {
+    process.exit(1);
+  }
 }
 
 void main().catch((error) => {

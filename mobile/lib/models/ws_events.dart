@@ -101,6 +101,7 @@ sealed class ServerEvent {
           messageId: json['messageId'] as String? ?? '',
           translatedText: json['translatedText'] as String? ?? '',
           sourceLanguage: json['sourceLanguage'] as String?,
+          originalText: json['originalText'] as String?,
           latency: json['latency'] is Map<String, dynamic>
               ? json['latency'] as Map<String, dynamic>
               : null,
@@ -195,6 +196,7 @@ class TranslationCompleteEvent extends ServerEvent {
     required this.messageId,
     required this.translatedText,
     this.sourceLanguage,
+    this.originalText,
     this.latency,
   });
   final String messageId;
@@ -202,6 +204,9 @@ class TranslationCompleteEvent extends ServerEvent {
 
   /// Authoritative language, detected by the translator from the actual text.
   final String? sourceLanguage;
+
+  /// Source transcript delivered at finalization (realtime-translate path).
+  final String? originalText;
 
   /// {speechEndToFirstDeltaMs, speechEndToFinalMs} — developer diagnostics.
   final Map<String, dynamic>? latency;

@@ -45,6 +45,7 @@ class TranslationMessage {
     TranslationStatus? status,
     String? sourceLanguage,
     double? languageConfidence,
+    String? originalText,
   }) {
     return TranslationMessage(
       id: id,
@@ -53,7 +54,7 @@ class TranslationMessage {
       sourceLanguage: sourceLanguage ?? this.sourceLanguage,
       languageConfidence: languageConfidence ?? this.languageConfidence,
       transcriptionConfidence: transcriptionConfidence,
-      originalText: originalText,
+      originalText: originalText ?? this.originalText,
       translatedText: translatedText ?? this.translatedText,
       targetLanguage: targetLanguage,
       timestamp: timestamp,

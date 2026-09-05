@@ -2,10 +2,16 @@ import { env } from '../../config/env';
 import { GoogleTranslationProvider } from './google';
 import { MockTranslationProvider } from './mock';
 import { OpenAITranslationProvider } from './openai';
+import {
+  OpenAIRealtimeTranslationProvider,
+  RealtimeTranslationProvider,
+} from './openai_realtime_translate';
 import { TranslationProvider } from './types';
 
 export * from './types';
+export type { RealtimeTranslationProvider, RealtimeTranslationSession } from './openai_realtime_translate';
 
+/** Text translator — used by the fallback (STT → text translation) pipeline. */
 export function createTranslationProvider(): TranslationProvider {
   switch (env.TRANSLATION_PROVIDER) {
     case 'openai':
@@ -15,5 +21,23 @@ export function createTranslationProvider(): TranslationProvider {
     case 'mock':
     default:
       return new MockTranslationProvider();
+  }
+}
+
+/**
+ * The PRIMARY live path: gpt-realtime-translate (speech in → translated text
+ * deltas out, one socket per session, automatic source language). null when
+ * the configured translation provider has no realtime mode — live sessions
+ * then use the fallback STT → text-translation pipeline.
+ */
+export function createRealtimeTranslationProvider(): RealtimeTranslationProvider | null {
+  switch (env.TRANSLATION_PROVIDER) {
+    case 'openai':
+      return new OpenAIRealtimeTranslationProvider(
+        env.TRANSLATION_API_KEY,
+        env.REALTIME_TRANSLATION_MODEL || 'gpt-realtime-translate',
+      );
+    default:
+      return null;
   }
 }

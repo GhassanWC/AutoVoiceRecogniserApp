@@ -173,6 +173,12 @@ export interface TranslationCompletePayload {
    * Replaces the provisional label from transcript_final when present.
    */
   sourceLanguage?: string;
+  /**
+   * Source transcript, when it only became available at finalization (the
+   * realtime-translate path streams translation before the source text is
+   * assembled). Replaces the bubble's original-text line.
+   */
+  originalText?: string;
   latency?: TranslationLatency;
 }
 

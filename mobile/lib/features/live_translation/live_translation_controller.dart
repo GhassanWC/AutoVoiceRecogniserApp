@@ -306,6 +306,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
           :final messageId,
           :final translatedText,
           :final sourceLanguage,
+          :final originalText,
           :final latency
         ):
         if (settings.settings.developerDiagnostics && latency != null) {
@@ -326,6 +327,9 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
             // replaces the provisional one from the speech provider.
             sourceLanguage: languageKnown ? sourceLanguage : null,
             languageConfidence: languageKnown ? 0.9 : null,
+            // Realtime-translate delivers the source transcript only at
+            // finalization — fill in the original line then.
+            originalText: (originalText != null && originalText.isNotEmpty) ? originalText : null,
           ),
           speak: true,
         );

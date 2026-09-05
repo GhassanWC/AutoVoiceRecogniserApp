@@ -2,7 +2,7 @@ import { IncomingMessage, Server } from 'http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createDiarizationProvider } from '../../providers/diarization';
 import { SpeechRecognitionProvider, StreamingSpeechProvider } from '../../providers/speech';
-import { TranslationProvider } from '../../providers/translation';
+import { RealtimeTranslationProvider, TranslationProvider } from '../../providers/translation';
 import { log } from '../../utils/logger';
 import { verifyToken } from '../auth/tokens';
 import { LiveSession } from './live_session';
@@ -26,6 +26,7 @@ export function attachRealtimeServer(
     speech: SpeechRecognitionProvider;
     streamingSpeech?: StreamingSpeechProvider | null;
     translation: TranslationProvider;
+    realtimeTranslation?: RealtimeTranslationProvider | null;
   },
 ): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: '/live-translation' });
@@ -49,6 +50,7 @@ export function attachRealtimeServer(
       speech: providers.speech,
       streamingSpeech: providers.streamingSpeech ?? null,
       translation: providers.translation,
+      realtimeTranslation: providers.realtimeTranslation ?? null,
       diarization: createDiarizationProvider(), // stateful → one per connection
       send,
     });

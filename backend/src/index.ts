@@ -8,7 +8,10 @@ import { attachRealtimeServer } from './modules/realtime/realtime.server';
 import { translationRouter } from './modules/sessions/sessions.router';
 import { usersRouter } from './modules/users/users.router';
 import { createSpeechProvider, createStreamingSpeechProvider } from './providers/speech';
-import { createTranslationProvider } from './providers/translation';
+import {
+  createRealtimeTranslationProvider,
+  createTranslationProvider,
+} from './providers/translation';
 import { log } from './utils/logger';
 
 const app = express();
@@ -30,11 +33,15 @@ const httpServer = createServer(app);
 const speech = createSpeechProvider();
 const streamingSpeech = createStreamingSpeechProvider();
 const translation = createTranslationProvider();
-attachRealtimeServer(httpServer, { speech, streamingSpeech, translation });
+const realtimeTranslation = createRealtimeTranslationProvider();
+attachRealtimeServer(httpServer, { speech, streamingSpeech, translation, realtimeTranslation });
 
 httpServer.listen(env.PORT, () => {
   log.info('backend listening', {
     port: env.PORT,
+    liveTranslation: realtimeTranslation
+      ? realtimeTranslation.name
+      : 'none (STT + text translation fallback)',
     speechProvider: speech.name,
     streamingSpeech: streamingSpeech ? streamingSpeech.name : 'none (batch per segment)',
     translationProvider: translation.name,

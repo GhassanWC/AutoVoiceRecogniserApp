@@ -36,9 +36,11 @@ export function createSpeechProvider(): SpeechRecognitionProvider {
 export function createStreamingSpeechProvider(): StreamingSpeechProvider | null {
   switch (env.SPEECH_PROVIDER) {
     case 'openai':
+      // gpt-4o-transcribe-diarize is batch-only and breaks realtime sessions
+      // silently — the realtime default must stay a realtime-capable model.
       return new OpenAIRealtimeSpeechProvider(
         env.SPEECH_API_KEY,
-        env.SPEECH_MODEL || 'gpt-4o-transcribe-diarize',
+        env.SPEECH_MODEL || 'gpt-4o-transcribe',
       );
     case 'deepgram':
       return new DeepgramStreamingSpeechProvider(env.SPEECH_API_KEY, env.SPEECH_MODEL || 'nova-3');

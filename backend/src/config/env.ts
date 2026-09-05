@@ -17,6 +17,8 @@ const schema = z.object({
   TRANSLATION_PROVIDER: z.enum(['mock', 'openai', 'google']).default('mock'),
   TRANSLATION_API_KEY: z.string().optional().default(''),
   TRANSLATION_MODEL: z.string().optional().default(''),
+  /** Live speech→translated-text model. Default: gpt-realtime-translate. */
+  REALTIME_TRANSLATION_MODEL: z.string().optional().default(''),
 
   DIARIZATION_PROVIDER: z.enum(['heuristic', 'none']).default('heuristic'),
 

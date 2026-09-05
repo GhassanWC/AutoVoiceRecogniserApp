@@ -9,24 +9,32 @@ import {
 } from './types';
 
 /**
- * OpenAI realtime transcription (production MVP speech path).
+ * OpenAI realtime transcription — the FALLBACK speech path (the primary live
+ * path is gpt-realtime-translate; see providers/translation).
  *
  * One WebSocket per listening session:
- *   - model gpt-4o-transcribe-diarize — multilingual transcription with
- *     speaker diarization; NO input language is configured, the model
- *     transcribes whatever language it hears (Arabic, Thai, … included — there
- *     is deliberately no source-language allowlist on this path);
+ *   - model gpt-4o-transcribe — multilingual realtime transcription; NO input
+ *     language is configured, the model transcribes whatever language it
+ *     hears. IMPORTANT: gpt-4o-transcribe-diarize is a batch Transcription
+ *     API model and is NOT valid for realtime sessions — configuring it here
+ *     made the server reject the session config, so audio streamed forever
+ *     while no transcription event ever fired. Diarization is therefore out
+ *     of the realtime path; speaker ids are null unless segment events with
+ *     speakers arrive.
  *   - noise_reduction far_field — this product listens to a room (people at a
- *     distance, TV audio), not someone speaking into the handset;
- *   - server turn detection is DISABLED: the phone's VAD segments speech, and
- *     each client segment end commits the audio buffer, which finalizes one
- *     transcription — the exact Finalize semantics LiveSession expects.
+ *     distance, TV audio), not someone speaking into the handset.
  *
  * Language identification is intentionally NOT this provider's job: every
  * utterance reports language "und" and the translation stage (which sees the
  * actual text) is the authoritative language detector.
  */
 
+// GA transcription session: ?intent=transcription WITHOUT the OpenAI-Beta
+// header, configured via the GA session.update {session: {type:
+// 'transcription', …}} shape. (The beta header/beta message shape is
+// rejected with beta_api_shape_disabled; a ?model= realtime session refuses
+// transcription session updates; a transcription model as ?model= is
+// invalid_model.)
 const REALTIME_URL = 'wss://api.openai.com/v1/realtime?intent=transcription';
 const REALTIME_SAMPLE_RATE = 24_000;
 /** OpenAI rejects commits of less than ~100 ms of audio; stay safely above. */
@@ -143,7 +151,7 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
     baseUrl: string = REALTIME_URL,
   ) {
     this.ws = new WebSocket(baseUrl, {
-      headers: { Authorization: `Bearer ${apiKey}`, 'OpenAI-Beta': 'realtime=v1' },
+      headers: { Authorization: `Bearer ${apiKey}` },
     });
     this.ws.on('open', () => this.handleOpen());
     this.ws.on('message', (data: Buffer) => this.handleMessage(data));
@@ -208,19 +216,26 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
       this.ws.close();
       return;
     }
-    // Configuration first, then any queued audio. No input language is set —
-    // the model transcribes the language it hears, per utterance. far_field
-    // noise reduction: this product listens to a room, not a handset.
+    // GA transcription-session configuration, sent before any queued audio.
+    // No input language is set — the model transcribes the language it hears,
+    // per utterance. far_field noise reduction: this product listens to a
+    // room, not a handset.
     this.ws.send(
       JSON.stringify({
-        type: 'transcription_session.update',
+        type: 'session.update',
         session: {
-          input_audio_format: 'pcm16',
-          input_audio_transcription: { model: this.model },
-          input_audio_noise_reduction: { type: 'far_field' },
-          // Continuous mode: OpenAI's VAD cuts utterances (fast subtitles).
-          // Segmented mode: the caller commits, turn detection stays off.
-          turn_detection: this.serverTurnDetection ? SERVER_VAD_CONFIG : null,
+          type: 'transcription',
+          audio: {
+            input: {
+              format: { type: 'audio/pcm', rate: REALTIME_SAMPLE_RATE },
+              noise_reduction: { type: 'far_field' },
+              transcription: { model: this.model },
+              // Continuous mode: OpenAI's VAD cuts utterances (fast
+              // subtitles). Segmented mode: the caller commits, turn
+              // detection stays off.
+              turn_detection: this.serverTurnDetection ? SERVER_VAD_CONFIG : null,
+            },
+          },
         },
       }),
     );
@@ -236,6 +251,24 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
       event = JSON.parse(data.toString('utf8')) as RealtimeEvent;
     } catch {
       return;
+    }
+
+    const type = event.type ?? 'unknown';
+    // REQUIRED diagnostics: every server event type is visible (high-volume
+    // deltas at debug); errors always print type/code/message loudly. Never
+    // audio payloads, never keys. A quietly-rejected session config must
+    // never again look like "listening but silent".
+    if (type.includes('error') || event.error) {
+      log.error('[OPENAI ERROR]', {
+        type,
+        code: event.error?.code,
+        errorType: event.error?.type,
+        message: event.error?.message,
+      });
+    } else if (type.endsWith('.delta')) {
+      log.debug(`[OPENAI] ${type}`);
+    } else {
+      log.info(`[OPENAI] ${type}`);
     }
 
     switch (event.type) {
@@ -287,17 +320,8 @@ class OpenAIRealtimeSession implements StreamingSpeechSession {
         this.finalizedHandler(false);
         break;
 
-      case 'error':
-        // Some errors are per-request (e.g. a rejected commit) — log them and
-        // keep the session; the socket-level close handler covers fatal ones.
-        log.warn('openai realtime error event', {
-          code: event.error?.code,
-          message: event.error?.message,
-        });
-        break;
-
       default:
-        break; // deltas, commit acks, session acks — not needed
+        break; // deltas, commit acks, session acks — logged above, not acted on
     }
   }
 
@@ -314,7 +338,8 @@ export class OpenAIRealtimeSpeechProvider implements StreamingSpeechProvider {
 
   constructor(
     private readonly apiKey: string,
-    private readonly model: string = 'gpt-4o-transcribe-diarize',
+    // gpt-4o-transcribe-diarize is batch-only — NEVER pass it here.
+    private readonly model: string = 'gpt-4o-transcribe',
     private readonly baseUrl: string = REALTIME_URL,
   ) {
     if (!apiKey) throw new Error('SPEECH_API_KEY is required for the openai speech provider');
