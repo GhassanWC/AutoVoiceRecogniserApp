@@ -177,7 +177,6 @@ export class LiveSession {
    * SAME messageId, and the rest of the session stays on the fallback. Short
    * phrases ("Hello") trigger this exactly like long ones.
    */
-  private static readonly SPEECH_RMS = 0.01;
   private static readonly UTTERANCE_START_MS = 150;
   private static readonly UTTERANCE_END_SILENCE_MS = 600;
   private static readonly MIN_UTTERANCE_SPEECH_MS = 300;
@@ -185,10 +184,31 @@ export class LiveSession {
   private static readonly FAILOVER_PREROLL_MS = 1000;
   private static readonly FAILOVER_BUFFER_CAP_MS = 20_000;
 
+  /**
+   * The energy detector is ADAPTIVE, not a fixed threshold: distant/TV speech
+   * can be clearly audible well below a near-field level, and this detector
+   * only decides when to ARM the failover deadline (never whether audio is
+   * uploaded), so it is deliberately more sensitive than the phone's old VAD.
+   * speechThreshold = max(0.0035, noiseFloor × 2), with a lower release
+   * threshold for hysteresis so speech does not flicker on/off; the floor
+   * follows quiet audio and rises only glacially during speech.
+   */
+  private static readonly FAILOVER_MIN_THRESHOLD = 0.0035;
+  private static readonly FAILOVER_MIN_RELEASE = 0.0025;
+  private static readonly FAILOVER_FLOOR_MIN = 0.0012;
+  private static readonly FAILOVER_FLOOR_MAX = 0.02;
+
+  private failoverNoiseFloor = 0.002;
   private speechActive = false;
   private utterSpeechMs = 0;
   private utterSilentMs = 0;
   private deltaSinceUtteranceStart = false;
+  /**
+   * When the provider emits speech_started/speech_stopped events, those are
+   * the PRIMARY utterance-boundary signal and the energy detector becomes a
+   * backup (it keeps maintaining the replay buffer and noise floor).
+   */
+  private providerBoundaries = false;
   /** Rolling pre-roll + current-utterance audio, ONLY for failover replay. */
   private recentAudio: Array<{ pcm: Buffer; ms: number }> = [];
   private recentAudioMs = 0;
@@ -470,10 +490,13 @@ export class LiveSession {
         this.handleTranslateFinal(utteranceId, translatedText, sourceText),
       );
       session.onError((error) => this.handleTranslateError(error));
+      session.onSpeechBoundary?.((boundary) => this.handleProviderSpeechBoundary(boundary));
       this.translateSession = session;
       this.speechActive = false;
       this.utterSpeechMs = 0;
       this.utterSilentMs = 0;
+      // A reopened session may not emit VAD events — energy backup re-arms.
+      this.providerBoundaries = false;
     } catch (error) {
       this.translateFailed = true;
       log.error('failed to open realtime translation session, using fallback', {
@@ -503,7 +526,40 @@ export class LiveSession {
       this.recentAudioMs -= this.recentAudio.shift()!.ms;
     }
 
-    if (pcm16Rms(pcm) > LiveSession.SPEECH_RMS) {
+    const rms = pcm16Rms(pcm);
+    // Hysteresis: opening an utterance needs the onset threshold; staying in
+    // one only needs the lower release threshold, so quiet trailing syllables
+    // and natural level dips do not flicker speech off.
+    const onset = Math.max(
+      LiveSession.FAILOVER_MIN_THRESHOLD,
+      this.failoverNoiseFloor * 2,
+    );
+    const release = Math.max(
+      LiveSession.FAILOVER_MIN_RELEASE,
+      this.failoverNoiseFloor * 1.4,
+    );
+    const isSpeech = rms >= (this.speechActive ? release : onset);
+
+    // Noise-floor adaptation: follow drops quickly, converge onto steady
+    // sub-threshold ambience, and rise only glacially while sound is above
+    // the threshold — sustained distant speech must never become "noise".
+    if (rms < this.failoverNoiseFloor) {
+      this.failoverNoiseFloor = this.failoverNoiseFloor * 0.9 + rms * 0.1;
+    } else if (!this.speechActive && rms < onset) {
+      this.failoverNoiseFloor = this.failoverNoiseFloor * 0.995 + rms * 0.005;
+    } else {
+      this.failoverNoiseFloor = Math.min(
+        this.failoverNoiseFloor * 1.0002,
+        LiveSession.FAILOVER_FLOOR_MAX,
+      );
+    }
+    this.failoverNoiseFloor = Math.max(this.failoverNoiseFloor, LiveSession.FAILOVER_FLOOR_MIN);
+
+    // Boundary decisions belong to the provider's VAD events when the
+    // session emits them; the energy path below is the backup.
+    if (this.providerBoundaries) return;
+
+    if (isSpeech) {
       this.utterSilentMs = 0;
       this.utterSpeechMs += frameMs;
       if (!this.speechActive && this.utterSpeechMs >= LiveSession.UTTERANCE_START_MS) {
@@ -527,21 +583,33 @@ export class LiveSession {
       const speechMs = this.utterSpeechMs;
       this.speechActive = false;
       this.utterSpeechMs = 0;
-      if (
-        speechMs >= LiveSession.MIN_UTTERANCE_SPEECH_MS &&
-        !this.deltaSinceUtteranceStart &&
-        !this.pendingCheck
-      ) {
-        const messageId = newId('msg');
-        const audio = Buffer.concat(this.recentAudio.map((entry) => entry.pcm));
-        const timer = setTimeout(
-          () => this.failoverUtterance(),
-          LiveSession.FAILOVER_DEADLINE_MS,
-        );
-        timer.unref?.();
-        this.pendingCheck = { messageId, audio, timer };
+      if (speechMs >= LiveSession.MIN_UTTERANCE_SPEECH_MS) {
+        this.armFailoverCheck();
       }
     }
+  }
+
+  /** Provider VAD events (primary boundary signal when the endpoint sends them). */
+  private handleProviderSpeechBoundary(boundary: 'started' | 'stopped'): void {
+    if (this.closed || !this.sessionId || !this.continuousStreamId) return;
+    this.providerBoundaries = true;
+    if (boundary === 'started') {
+      this.deltaSinceUtteranceStart = false;
+      this.speechActive = true;
+      return;
+    }
+    this.speechActive = false;
+    this.armFailoverCheck();
+  }
+
+  /** Utterance just ended with no direct output yet → start the deadline. */
+  private armFailoverCheck(): void {
+    if (this.deltaSinceUtteranceStart || this.pendingCheck) return;
+    const messageId = newId('msg');
+    const audio = Buffer.concat(this.recentAudio.map((entry) => entry.pcm));
+    const timer = setTimeout(() => this.failoverUtterance(), LiveSession.FAILOVER_DEADLINE_MS);
+    timer.unref?.();
+    this.pendingCheck = { messageId, audio, timer };
   }
 
   /** The armed deadline passed with no direct output — switch to the fallback. */
@@ -1223,6 +1291,8 @@ export class LiveSession {
     this.recentAudio = [];
     this.recentAudioMs = 0;
     this.speechActive = false;
+    this.providerBoundaries = false;
+    this.failoverNoiseFloor = 0.002;
   }
 
   /** Socket closed — finalize the session record, drop all buffers. */

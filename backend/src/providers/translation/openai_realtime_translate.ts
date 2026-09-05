@@ -32,6 +32,13 @@ export interface RealtimeTranslationSession {
     handler: (utteranceId: string, translatedText: string, sourceText: string) => void,
   ): void;
   onError(handler: (error: Error) => void): void;
+  /**
+   * Provider VAD utterance boundaries (speech_started / speech_stopped),
+   * when the endpoint emits them — the preferred failover-arming signal.
+   * Optional: callers must keep an energy-based backup for sessions/endpoints
+   * that never send these.
+   */
+  onSpeechBoundary?(handler: (boundary: 'started' | 'stopped') => void): void;
 }
 
 export interface RealtimeTranslationProvider {
@@ -117,6 +124,7 @@ class OpenAIRealtimeTranslateSession implements RealtimeTranslationSession {
   private finalHandler: (utteranceId: string, translatedText: string, sourceText: string) => void =
     () => undefined;
   private errorHandler: (error: Error) => void = () => undefined;
+  private speechBoundaryHandler: (boundary: 'started' | 'stopped') => void = () => undefined;
 
   constructor(
     apiKey: string,
@@ -151,6 +159,10 @@ class OpenAIRealtimeTranslateSession implements RealtimeTranslationSession {
 
   onError(handler: (error: Error) => void): void {
     this.errorHandler = handler;
+  }
+
+  onSpeechBoundary(handler: (boundary: 'started' | 'stopped') => void): void {
+    this.speechBoundaryHandler = handler;
   }
 
   sendAudio(pcm: Buffer): void {
@@ -267,6 +279,13 @@ class OpenAIRealtimeTranslateSession implements RealtimeTranslationSession {
         break;
       default:
         log.info(`[OPENAI] ${type}`);
+        // Provider VAD boundaries (with or without the "session." prefix)
+        // are the preferred failover-arming signal upstream.
+        if (type.endsWith('input_audio_buffer.speech_started')) {
+          this.speechBoundaryHandler('started');
+        } else if (type.endsWith('input_audio_buffer.speech_stopped')) {
+          this.speechBoundaryHandler('stopped');
+        }
         // Any explicit end-of-transcript signal finalizes right away.
         if (/output_transcript\.(done|completed)/.test(type)) this.flush(true);
         if (type === 'session.closed') this.flush(true);

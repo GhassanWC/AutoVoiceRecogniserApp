@@ -67,6 +67,7 @@ class FakeTranslateSession implements RealtimeTranslationSession {
   private deltaHandler: (utteranceId: string, delta: string) => void = () => undefined;
   private finalHandler: (id: string, text: string, source: string) => void = () => undefined;
   private errorHandler: (error: Error) => void = () => undefined;
+  private boundaryHandler: (boundary: 'started' | 'stopped') => void = () => undefined;
 
   sendAudio(pcm: Buffer): void {
     this.audioBytes += pcm.length;
@@ -83,9 +84,15 @@ class FakeTranslateSession implements RealtimeTranslationSession {
   onError(handler: (error: Error) => void): void {
     this.errorHandler = handler;
   }
+  onSpeechBoundary(handler: (boundary: 'started' | 'stopped') => void): void {
+    this.boundaryHandler = handler;
+  }
 
   emitDelta(utteranceId: string, delta: string): void {
     this.deltaHandler(utteranceId, delta);
+  }
+  emitSpeechBoundary(boundary: 'started' | 'stopped'): void {
+    this.boundaryHandler(boundary);
   }
   emitFinal(utteranceId: string, text: string, source: string): void {
     this.finalHandler(utteranceId, text, source);
@@ -149,15 +156,16 @@ class FallbackSttProvider implements StreamingSpeechProvider {
   }
 }
 
-/** 100 ms @16 kHz frames: clearly audible speech vs room silence. */
-function loudFrame(): Buffer {
+/** 100 ms @16 kHz square-wave frame; RMS = amplitude / 32768. */
+function toneFrame(amplitude: number): Buffer {
   const pcm = Buffer.alloc(3200);
-  for (let i = 0; i < 1600; i++) pcm.writeInt16LE(8000, i * 2);
+  for (let i = 0; i < 1600; i++) pcm.writeInt16LE(amplitude, i * 2);
   return pcm;
 }
-function silentFrame(): Buffer {
-  return Buffer.alloc(3200);
-}
+const loudFrame = () => toneFrame(8000); // near-field speech, RMS ≈ 0.244
+const distantFrame = () => toneFrame(131); // TV/distant speech, RMS ≈ 0.004
+const roomToneFrame = () => toneFrame(49); // quiet room, RMS ≈ 0.0015
+const silentFrame = () => Buffer.alloc(3200);
 
 describe('LiveSession primary realtime-translate path', () => {
   const STREAM_ID = '123e4567-e89b-42d3-a456-426614174099';
@@ -347,6 +355,56 @@ describe('LiveSession primary realtime-translate path', () => {
     expect(fallback.created).toBe(0); // deadline was disarmed
     expect(transcripts()).toHaveLength(1);
     expect(completions()[0]!.messageId).toBe(transcripts()[0]!.messageId);
+  });
+
+  it('distant/TV-level speech (RMS ≈ 0.004 over a quiet floor) arms failover', async () => {
+    // Quiet room first so the adaptive floor settles near 0.0015 — with the
+    // old fixed 0.01 threshold this speech would have been invisible.
+    let seq = 0;
+    for (let i = 0; i < 20; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: roomToneFrame() });
+    }
+    for (let i = 0; i < 5; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: distantFrame() });
+    }
+    for (let i = 0; i < 7; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: roomToneFrame() });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+
+    expect(fallback.created).toBe(1); // low-volume speech still protected
+    expect(translate.sessions[0]!.closed).toBe(true);
+  });
+
+  it('quiet room noise alone never arms failover', async () => {
+    for (let i = 0; i < 40; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: i, pcm: roomToneFrame() });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+
+    expect(fallback.created).toBe(0);
+    expect(translate.sessions[0]!.closed).toBe(false);
+  });
+
+  it('provider speech_started/stopped events own the boundary when available', async () => {
+    const stream = translate.sessions[0]!;
+    stream.emitSpeechBoundary('started');
+    let seq = 0;
+    for (let i = 0; i < 5; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: loudFrame() });
+    }
+    for (let i = 0; i < 7; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: silentFrame() });
+    }
+    // Energy-detected "end" is suppressed while provider events are active —
+    // nothing arms until the provider says the utterance stopped.
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    expect(fallback.created).toBe(0);
+
+    stream.emitSpeechBoundary('stopped'); // still no delta → deadline arms
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+    expect(fallback.created).toBe(1);
+    expect(translate.sessions[0]!.closed).toBe(true);
   });
 
   it('late direct output after failover never creates a duplicate', async () => {

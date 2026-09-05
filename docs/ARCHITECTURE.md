@@ -23,7 +23,11 @@ translation_complete (full text + source transcript when available)
 
 **Utterance-based failover** guards the primary path: the endpoint
 occasionally returns sessions that accept audio but never emit a
-translation. A server-side energy tracker detects each utterance's end; if
+translation. Utterance boundaries come from the provider's own
+speech_started/speech_stopped events when the session emits them; otherwise
+a server-side ADAPTIVE energy tracker detects them — threshold
+max(0.0035, noiseFloor × 2) with hysteresis, floor following quiet audio —
+never a fixed near-field level, so distant/TV speech is protected too. If
 no direct delta arrived within ~1.4 s of speech end — a short "Hello"
 included — that SAME utterance (held in a short in-memory buffer, never
 persisted) is replayed under the SAME messageId through the FALLBACK
