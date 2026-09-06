@@ -176,6 +176,8 @@ describe('LiveSession primary realtime-translate path', () => {
   let translate: FakeTranslateProvider;
   let fallback: FallbackSttProvider;
   let detector: ((text: string) => Promise<string>) | null;
+  let metadataTranscriber: ((pcm: Buffer, rate: number) => Promise<string>) | null;
+  let transcriberCalls: Array<{ bytes: number; rate: number }>;
 
   beforeEach(async () => {
     setStore(new MemoryStore());
@@ -184,6 +186,8 @@ describe('LiveSession primary realtime-translate path', () => {
     translate = new FakeTranslateProvider();
     fallback = new FallbackSttProvider();
     detector = null;
+    metadataTranscriber = null;
+    transcriberCalls = [];
     session = new LiveSession({
       userId: 'user_test',
       speech: new MockSpeechProvider(),
@@ -193,6 +197,10 @@ describe('LiveSession primary realtime-translate path', () => {
       diarization: new HeuristicDiarizationProvider(),
       send: (message) => messages.push(message),
       languageDetector: (text) => (detector ? detector(text) : Promise.resolve('und')),
+      metadataTranscriber: (pcm, rate) => {
+        transcriberCalls.push({ bytes: pcm.length, rate });
+        return metadataTranscriber ? metadataTranscriber(pcm, rate) : Promise.resolve('');
+      },
       translationQueueOptions: { retryDelaysMs: [5, 5, 5] },
     });
     await session.handleSessionStart({
@@ -324,6 +332,95 @@ describe('LiveSession primary realtime-translate path', () => {
       expect.objectContaining({ languageCode: 'en', languageName: 'English' }),
     ]);
     expect(sent.indexOf(completions()[0]!)).toBeLessThan(sent.indexOf(languages()[0]!));
+  });
+
+  it('CASE B: no source transcript → buffered utterance AUDIO resolves the label', async () => {
+    // Speak (energy tracker snapshots the utterance), direct deltas flow.
+    let seq = 0;
+    for (let i = 0; i < 5; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: loudFrame() });
+    }
+    translate.sessions[0]!.emitDelta('utterance_1', 'مرحبا'); // translation immediate
+    for (let i = 0; i < 7; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: silentFrame() });
+    }
+    metadataTranscriber = async () => 'สวัสดีครับทุกคน'; // what the audio really said
+    translate.sessions[0]!.emitFinal('utterance_1', 'مرحبا', ''); // NO source transcript
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    // The snippet sent for metadata is bounded audio, never persisted text.
+    expect(transcriberCalls).toHaveLength(1);
+    expect(transcriberCalls[0]!.rate).toBe(16000);
+    expect(transcriberCalls[0]!.bytes).toBeGreaterThan(0);
+    expect(transcriberCalls[0]!.bytes).toBeLessThanOrEqual(128000); // ≤ 4 s @16 kHz
+    expect(languages()).toEqual([
+      expect.objectContaining({
+        messageId: starts()[0]!.messageId, // SAME bubble
+        languageCode: 'th',
+        languageName: 'Thai',
+      }),
+    ]);
+    // Translation was never blocked: completion precedes the label event.
+    expect(sent.indexOf(completions()[0]!)).toBeLessThan(sent.indexOf(languages()[0]!));
+  });
+
+  it('CASE B caps the metadata snippet at ~4 s even for long utterances', async () => {
+    let seq = 0;
+    for (let i = 0; i < 80; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: loudFrame() }); // 8 s
+    }
+    translate.sessions[0]!.emitDelta('utterance_1', 'مرحبا');
+    for (let i = 0; i < 7; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: silentFrame() });
+    }
+    metadataTranscriber = async () => 'নমস্কার, কেমন আছেন';
+    translate.sessions[0]!.emitFinal('utterance_1', 'مرحبا', '');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(transcriberCalls[0]!.bytes).toBe(128000); // exactly the 4 s cap
+    expect(languages()[0]).toMatchObject({ languageCode: 'bn', languageName: 'Bengali' });
+  });
+
+  it('CASE B retries transient metadata failures twice, then succeeds', async () => {
+    let seq = 0;
+    for (let i = 0; i < 5; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: loudFrame() });
+    }
+    translate.sessions[0]!.emitDelta('utterance_1', 'مرحبا');
+    for (let i = 0; i < 7; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: silentFrame() });
+    }
+    let calls = 0;
+    metadataTranscriber = async () => {
+      calls += 1;
+      if (calls < 3) throw new Error('HTTP 500');
+      return 'Hello everybody';
+    };
+    detector = async () => 'en'; // Latin script → classifier
+    translate.sessions[0]!.emitFinal('utterance_1', 'مرحبا', '');
+    await new Promise((resolve) => setTimeout(resolve, 1700)); // 300 ms + 1 s backoff
+
+    expect(calls).toBe(3);
+    expect(languages()[0]).toMatchObject({ languageCode: 'en', languageName: 'English' });
+  });
+
+  it('CASE B gives up quietly only after genuine repeated failure', async () => {
+    let seq = 0;
+    for (let i = 0; i < 5; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: loudFrame() });
+    }
+    translate.sessions[0]!.emitDelta('utterance_1', 'مرحبا');
+    for (let i = 0; i < 7; i++) {
+      session.handleAudioFrame({ segmentId: STREAM_ID, sequence: seq++, pcm: silentFrame() });
+    }
+    metadataTranscriber = async () => {
+      throw new Error('HTTP 500');
+    };
+    translate.sessions[0]!.emitFinal('utterance_1', 'مرحبا', '');
+    await new Promise((resolve) => setTimeout(resolve, 1700));
+
+    expect(languages()).toHaveLength(0); // bubble legitimately stays "Speaker"
+    expect(completions()).toHaveLength(1); // translation untouched
   });
 
   it('unknown language sends no event and breaks nothing — the bubble stays "Speaker"', async () => {

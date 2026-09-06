@@ -22,6 +22,11 @@ import {
 } from '../src/providers/translation';
 import { TranslationProviderError } from '../src/providers/translation/types';
 import { pcm16ToWav, pcmDurationMs } from '../src/utils/audio';
+import {
+  createMetadataTranscriber,
+  createModelLanguageDetector,
+  detectLanguageByScript,
+} from '../src/utils/language_detect';
 
 const FIXTURES_DIR = join(__dirname, '..', 'fixtures');
 const ARABIC_TEXT = 'السلام عليكم';
@@ -378,6 +383,58 @@ async function verifyLiveTranslation(): Promise<Failure[]> {
   return failures;
 }
 
+// ── Language metadata check (audio → gpt-4o-mini-transcribe → code) ───────────
+
+/**
+ * The MANDATORY label path for utterances where the realtime translation
+ * session omits the source transcript: buffered utterance audio →
+ * gpt-4o-mini-transcribe (no source language given) → script detector →
+ * (Latin only) tiny classifier → ISO code. Exercised here with REAL speech
+ * audio and REAL API calls for the product's key languages.
+ */
+async function verifyLanguageMetadata(): Promise<Failure[]> {
+  console.log('\nLanguage metadata check (buffered-audio → language code — REAL API)');
+  if (env.TRANSLATION_PROVIDER !== 'openai') {
+    return [
+      { step: 'configuration', detail: `TRANSLATION_PROVIDER=${env.TRANSLATION_PROVIDER} — no OpenAI key for metadata.` },
+    ];
+  }
+  const transcribe = createMetadataTranscriber(env.TRANSLATION_API_KEY);
+  const classify = createModelLanguageDetector(env.TRANSLATION_API_KEY);
+  const failures: Failure[] = [];
+
+  const cases = [
+    { file: 'thai_hello.wav', speak: 'สวัสดีครับทุกคน ยินดีต้อนรับ', expected: 'th' },
+    { file: 'bengali_hello.wav', speak: 'আসসালামু আলাইকুম, আপনি কেমন আছেন?', expected: 'bn' },
+    { file: 'hindi_hello.wav', speak: 'नमस्ते, आप कैसे हैं? आज मौसम अच्छा है।', expected: 'hi' },
+    { file: 'english_good_morning.wav', speak: 'Good morning', expected: 'en' },
+    { file: 'arabic_salam.wav', speak: ARABIC_TEXT, expected: 'ar' },
+  ];
+
+  for (const testCase of cases) {
+    try {
+      const path = await ensureFixture(testCase.file, testCase.speak);
+      const { pcm, sampleRate } = readWav(path);
+      // Same 4 s snippet rule as production.
+      const snippet = pcm.subarray(0, Math.min(pcm.length, sampleRate * 2 * 4));
+      const transcript = await transcribe(snippet, sampleRate);
+      let code = detectLanguageByScript(transcript);
+      if (!code) code = await classify(transcript);
+      if (code === testCase.expected) {
+        ok(`${testCase.file} → "${transcript}" → ${code}`);
+      } else {
+        failures.push({
+          step: `language metadata ${testCase.file}`,
+          detail: `transcript "${transcript}" → code "${code}", expected "${testCase.expected}"`,
+        });
+      }
+    } catch (error) {
+      failures.push({ step: `language metadata ${testCase.file}`, detail: describeError(error) });
+    }
+  }
+  return failures;
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -413,7 +470,22 @@ async function main(): Promise<void> {
     }
   }
 
-  if (translationFailures.length > 0 || speechFailures.length > 0 || liveFailures.length > 0) {
+  const metadataFailures = await verifyLanguageMetadata();
+  if (metadataFailures.length === 0) {
+    console.log('Language metadata: PASS');
+  } else {
+    console.log('Language metadata: FAIL');
+    for (const failure of metadataFailures) {
+      console.log(`  ✗ ${failure.step}\n      ${failure.detail}`);
+    }
+  }
+
+  if (
+    translationFailures.length > 0 ||
+    speechFailures.length > 0 ||
+    liveFailures.length > 0 ||
+    metadataFailures.length > 0
+  ) {
     process.exit(1);
   }
 }

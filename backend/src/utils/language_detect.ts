@@ -1,3 +1,4 @@
+import { pcm16ToWav } from './audio';
 import { log } from './logger';
 
 /**
@@ -99,8 +100,42 @@ export function detectLanguageByScript(text: string): string | null {
 }
 
 const DETECT_TIMEOUT_MS = 5_000;
+const METADATA_TRANSCRIBE_TIMEOUT_MS = 15_000;
 
 export type LanguageDetector = (text: string) => Promise<string>;
+
+/** Transcribes a short PCM16 snippet purely to identify its language. */
+export type MetadataTranscriber = (pcm: Buffer, sampleRate: number) => Promise<string>;
+
+/**
+ * Batch transcription of a buffered utterance snippet via
+ * gpt-4o-mini-transcribe (multilingual, no source language specified) — used
+ * ONLY when the realtime translation session provided no source transcript.
+ * One short REST call per affected utterance; never a second realtime
+ * session, never persisted audio. Throws on failure so callers can retry.
+ */
+export function createMetadataTranscriber(
+  apiKey: string,
+  model = 'gpt-4o-mini-transcribe',
+): MetadataTranscriber {
+  return async (pcm: Buffer, sampleRate: number): Promise<string> => {
+    const wav = pcm16ToWav(pcm, { sampleRate, channels: 1 });
+    const form = new FormData();
+    form.append('file', new Blob([new Uint8Array(wav)], { type: 'audio/wav' }), 'snippet.wav');
+    form.append('model', model);
+    const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: form,
+      signal: AbortSignal.timeout(METADATA_TRANSCRIBE_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      throw new Error(`metadata transcription failed (HTTP ${response.status})`);
+    }
+    const json = (await response.json()) as { text?: string };
+    return (json.text ?? '').trim();
+  };
+}
 
 /**
  * Tiny model-based detector for scripts shared across languages (Latin).

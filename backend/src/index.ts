@@ -12,7 +12,10 @@ import {
   createRealtimeTranslationProvider,
   createTranslationProvider,
 } from './providers/translation';
-import { createModelLanguageDetector } from './utils/language_detect';
+import {
+  createMetadataTranscriber,
+  createModelLanguageDetector,
+} from './utils/language_detect';
 import { log } from './utils/logger';
 
 const app = express();
@@ -41,12 +44,19 @@ const languageDetector =
   env.TRANSLATION_PROVIDER === 'openai' && env.TRANSLATION_API_KEY
     ? createModelLanguageDetector(env.TRANSLATION_API_KEY)
     : null;
+// Audio-based language ID (gpt-4o-mini-transcribe on a ≤4 s snippet) for
+// utterances where the realtime session omitted the source transcript.
+const metadataTranscriber =
+  env.TRANSLATION_PROVIDER === 'openai' && env.TRANSLATION_API_KEY
+    ? createMetadataTranscriber(env.TRANSLATION_API_KEY)
+    : null;
 attachRealtimeServer(httpServer, {
   speech,
   streamingSpeech,
   translation,
   realtimeTranslation,
   languageDetector,
+  metadataTranscriber,
 });
 
 httpServer.listen(env.PORT, () => {

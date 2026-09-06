@@ -19,6 +19,7 @@ import {
   detectLanguageByScript,
   LANGUAGE_NAMES,
   LanguageDetector,
+  MetadataTranscriber,
 } from '../../utils/language_detect';
 import { newId, newUuid } from '../../utils/ids';
 import { log } from '../../utils/logger';
@@ -68,6 +69,12 @@ export interface LiveSessionDeps {
    * handles the rest). Metadata only — runs after translation output.
    */
   languageDetector?: LanguageDetector | null;
+  /**
+   * Batch transcriber for a short buffered-audio snippet — the MANDATORY
+   * language-label path when the realtime translation session omits the
+   * source transcript. Metadata only, never in the delta path.
+   */
+  metadataTranscriber?: MetadataTranscriber | null;
   /** Test hook: shorter retry delays / different concurrency. */
   translationQueueOptions?: TranslationQueueOptions;
 }
@@ -226,6 +233,17 @@ export class LiveSession {
   private pendingCheck: { messageId: string; audio: Buffer; timer: NodeJS.Timeout } | null = null;
   /** Consumed by the first fallback utterance after a failover. */
   private failoverMessageId: string | null = null;
+
+  /**
+   * Snapshot of the most recently ENDED utterance's audio (pre-roll + speech,
+   * RAM only), kept solely so the language label can be resolved when the
+   * realtime translation session omits the source transcript. Consumed by
+   * the utterance's language job; capped and never persisted.
+   */
+  private lastUtteranceAudio: Buffer | null = null;
+  private static readonly UTTERANCE_SNAPSHOT_CAP_MS = 8_000;
+  /** ~First seconds of speech are enough to identify a language. */
+  private static readonly METADATA_SNIPPET_MS = 4_000;
 
   /** speech_end → first-delta / final latency samples for p50/p95 logging. */
   private readonly latencySamples: Array<{ firstDeltaMs?: number; finalMs: number }> = [];
@@ -601,9 +619,21 @@ export class LiveSession {
       this.speechActive = false;
       this.utterSpeechMs = 0;
       if (speechMs >= LiveSession.MIN_UTTERANCE_SPEECH_MS) {
+        this.snapshotUtteranceAudio();
         this.armFailoverCheck();
       }
     }
+  }
+
+  /**
+   * Keep the just-finished utterance's audio (pre-roll + speech, capped, RAM
+   * only) so its language label can be resolved from AUDIO when the realtime
+   * session provides no source transcript.
+   */
+  private snapshotUtteranceAudio(): void {
+    const capBytes = (this.continuousSampleRate * 2 * LiveSession.UTTERANCE_SNAPSHOT_CAP_MS) / 1000;
+    const audio = Buffer.concat(this.recentAudio.map((entry) => entry.pcm));
+    this.lastUtteranceAudio = audio.length > capBytes ? audio.subarray(0, capBytes) : audio;
   }
 
   /** Provider VAD events (primary boundary signal when the endpoint sends them). */
@@ -613,9 +643,15 @@ export class LiveSession {
     if (boundary === 'started') {
       this.deltaSinceUtteranceStart = false;
       this.speechActive = true;
+      // Fresh utterance: keep only a short pre-roll behind it so a later
+      // audio snapshot starts near the speech, not in the previous utterance.
+      while (this.recentAudioMs > 400 && this.recentAudio.length > 1) {
+        this.recentAudioMs -= this.recentAudio.shift()!.ms;
+      }
       return;
     }
     this.speechActive = false;
+    this.snapshotUtteranceAudio();
     this.armFailoverCheck();
   }
 
@@ -646,6 +682,7 @@ export class LiveSession {
     this.recentAudio = [];
     this.recentAudioMs = 0;
     this.speechActive = false;
+    this.lastUtteranceAudio = null; // fallback path labels from its transcript
 
     if (!this.streamingEnabled) {
       this.continuousStreamId = null;
@@ -793,9 +830,75 @@ export class LiveSession {
     });
 
     // Source-language LABEL, resolved after the translation is already out —
-    // this never delays deltas; without a source transcript it stays unknown
-    // and the bubble simply shows "Speaker".
-    this.detectAndNotifyLanguage(mapping.messageId, sourceText);
+    // this never delays deltas. MANDATORY job: with no source transcript it
+    // falls back to transcribing the buffered utterance AUDIO (never the
+    // Arabic translation, which would obviously classify as Arabic).
+    this.runLanguageJob(mapping.messageId, sourceText);
+  }
+
+  /** Fire-and-forget wrapper; the label must never fail anything else. */
+  private runLanguageJob(messageId: string, sourceTranscript: string): void {
+    void this.languageJob(messageId, sourceTranscript).catch((error) => {
+      log.warn('[LANG] job failed permanently', {
+        messageId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+
+  private async languageJob(messageId: string, sourceTranscript: string): Promise<void> {
+    let transcript = sourceTranscript.trim();
+    let source = 'realtime_transcript';
+
+    if (!transcript) {
+      // Case B (the real-world failure): no source transcript from the
+      // realtime session — transcribe a short snippet of the buffered
+      // utterance audio purely for language identification.
+      const audio = this.lastUtteranceAudio;
+      this.lastUtteranceAudio = null; // consume once
+      const transcriber = this.deps.metadataTranscriber;
+      if (!audio || audio.length < 3200 || !transcriber) return;
+      source = 'audio_metadata_transcription';
+      const snippetBytes =
+        (this.continuousSampleRate * 2 * LiveSession.METADATA_SNIPPET_MS) / 1000;
+      const snippet = audio.length > snippetBytes ? audio.subarray(0, snippetBytes) : audio;
+      transcript = (
+        await this.withMetadataRetries(() => transcriber(snippet, this.continuousSampleRate))
+      ).trim();
+      if (!transcript) {
+        log.info('[LANG]', { messageId, source, transcript: '', code: 'und' });
+        return;
+      }
+    }
+
+    // Detection uses ONLY the source transcript — never translatedText.
+    let code: string | null = detectLanguageByScript(transcript);
+    if (!code && this.deps.languageDetector) {
+      const detected = await this.withMetadataRetries(() =>
+        this.deps.languageDetector!(transcript),
+      ).catch(() => 'und');
+      if (detected && detected !== 'und') code = detected;
+    }
+    log.info('[LANG]', {
+      messageId,
+      source,
+      transcript: source === 'audio_metadata_transcription' ? transcript.slice(0, 120) : undefined,
+      code: code ?? 'und',
+    });
+    if (code) this.notifyLanguage(messageId, code);
+  }
+
+  /** Transient metadata-API failures retry twice (300 ms, 1 s) before giving up. */
+  private async withMetadataRetries<T>(work: () => Promise<T>): Promise<T> {
+    const delays = [300, 1000];
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await work();
+      } catch (error) {
+        if (attempt >= delays.length) throw error;
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      }
+    }
   }
 
   /** Sends the language label event when a usable code is known. */
@@ -1354,6 +1457,7 @@ export class LiveSession {
     this.speechActive = false;
     this.providerBoundaries = false;
     this.failoverNoiseFloor = 0.002;
+    this.lastUtteranceAudio = null;
   }
 
   /** Socket closed — finalize the session record, drop all buffers. */
@@ -1365,6 +1469,7 @@ export class LiveSession {
     this.pendingCheck = null;
     this.recentAudio = [];
     this.recentAudioMs = 0;
+    this.lastUtteranceAudio = null;
     if (this.translateSession) {
       await this.translateSession.close().catch(() => undefined);
       this.translateSession = null;
