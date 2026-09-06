@@ -457,6 +457,14 @@ describe('LiveSession streaming pipeline', () => {
       translatedText: 'مرحباً يا أخي',
       sourceLanguage: 'es', // authoritative, from the translator
     });
+    // The uniform label event follows, after the translation was delivered.
+    const language = sent.find((m) => m.type === 'language_detected');
+    expect(language).toMatchObject({
+      messageId: transcripts()[0]!.messageId,
+      languageCode: 'es',
+      languageName: 'Spanish',
+    });
+    expect(sent.indexOf(completions()[0]!)).toBeLessThan(sent.indexOf(language!));
   });
 
   it('exposes the real failure reason on translation_failed', async () => {

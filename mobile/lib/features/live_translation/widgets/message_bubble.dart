@@ -42,7 +42,9 @@ class MessageBubble extends StatelessWidget {
     final flag = detectedLanguageFlag(message.sourceLanguage, message.languageConfidence);
 
     return Semantics(
-      label: '${message.speakerLabel ?? 'Speaker'}, $languageLabel',
+      label: languageLabel == null
+          ? (message.speakerLabel ?? 'Speaker')
+          : '${message.speakerLabel ?? 'Speaker'}, $languageLabel',
       child: GestureDetector(
         onLongPress: () => _showActions(context),
         child: Card(
@@ -64,7 +66,9 @@ class MessageBubble extends StatelessWidget {
                       child: Text(
                         [
                           message.speakerLabel ?? 'Speaker',
-                          if (showLanguageLabels) languageLabel,
+                          // Unknown language → just "Speaker", never a
+                          // "Language detected…" placeholder.
+                          if (showLanguageLabels && languageLabel != null) languageLabel,
                           if (showLanguageLabels && flag != null) flag,
                         ].join(' · '),
                         overflow: TextOverflow.ellipsis,

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { LiveSession } from '../src/modules/realtime/live_session';
 import {
+  LanguageDetectedPayload,
   ServerMessage,
   TranscriptFinalPayload,
   TranslationCompletePayload,
@@ -174,6 +175,7 @@ describe('LiveSession primary realtime-translate path', () => {
   let session: LiveSession;
   let translate: FakeTranslateProvider;
   let fallback: FallbackSttProvider;
+  let detector: ((text: string) => Promise<string>) | null;
 
   beforeEach(async () => {
     setStore(new MemoryStore());
@@ -181,6 +183,7 @@ describe('LiveSession primary realtime-translate path', () => {
     sent = messages;
     translate = new FakeTranslateProvider();
     fallback = new FallbackSttProvider();
+    detector = null;
     session = new LiveSession({
       userId: 'user_test',
       speech: new MockSpeechProvider(),
@@ -189,6 +192,7 @@ describe('LiveSession primary realtime-translate path', () => {
       realtimeTranslation: translate,
       diarization: new HeuristicDiarizationProvider(),
       send: (message) => messages.push(message),
+      languageDetector: (text) => (detector ? detector(text) : Promise.resolve('und')),
       translationQueueOptions: { retryDelaysMs: [5, 5, 5] },
     });
     await session.handleSessionStart({
@@ -216,6 +220,9 @@ describe('LiveSession primary realtime-translate path', () => {
   }
   function completions(): TranslationCompletePayload[] {
     return sent.filter((m): m is TranslationCompletePayload => m.type === 'translation_complete');
+  }
+  function languages(): LanguageDetectedPayload[] {
+    return sent.filter((m): m is LanguageDetectedPayload => m.type === 'language_detected');
   }
 
   it('prefers realtime-translate over the STT fallback and passes the target language', () => {
@@ -284,6 +291,51 @@ describe('LiveSession primary realtime-translate path', () => {
     // Audio now flows to the fallback, not a dead translate session.
     session.handleAudioFrame({ segmentId: STREAM_ID, sequence: 0, pcm: Buffer.alloc(3200) });
     expect(sent.find((m) => m.type === 'error')).toBeUndefined(); // seamless switch
+  });
+
+  // ── Source-language label (metadata only, never blocks deltas) ─────────────
+
+  it('script-detects the source language after final and updates the same messageId', () => {
+    const stream = translate.sessions[0]!;
+    stream.emitDelta('utterance_1', 'مرحباً');
+    stream.emitFinal('utterance_1', 'مرحباً', 'สวัสดีครับ'); // spoken Thai
+
+    expect(languages()).toEqual([
+      expect.objectContaining({
+        messageId: starts()[0]!.messageId, // SAME bubble
+        languageCode: 'th',
+        languageName: 'Thai',
+      }),
+    ]);
+    // Deltas and the completion were never held back for the label: the
+    // language event comes strictly AFTER the completed translation.
+    expect(sent.indexOf(deltas()[0]!)).toBeLessThan(sent.indexOf(languages()[0]!));
+    expect(sent.indexOf(completions()[0]!)).toBeLessThan(sent.indexOf(languages()[0]!));
+  });
+
+  it('uses the model detector for Latin-script text, still after the translation', async () => {
+    detector = async () => 'en';
+    const stream = translate.sessions[0]!;
+    stream.emitDelta('utterance_1', 'مرحباً');
+    stream.emitFinal('utterance_1', 'مرحباً', 'Hello there');
+    await new Promise((resolve) => setTimeout(resolve, 20)); // async detector
+
+    expect(languages()).toEqual([
+      expect.objectContaining({ languageCode: 'en', languageName: 'English' }),
+    ]);
+    expect(sent.indexOf(completions()[0]!)).toBeLessThan(sent.indexOf(languages()[0]!));
+  });
+
+  it('unknown language sends no event and breaks nothing — the bubble stays "Speaker"', async () => {
+    const stream = translate.sessions[0]!;
+    stream.emitDelta('utterance_1', 'مرحباً');
+    stream.emitFinal('utterance_1', 'مرحباً', '12345 !!'); // undetectable
+    stream.emitDelta('utterance_2', 'صباح'); // pipeline keeps flowing
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(languages()).toHaveLength(0);
+    expect(completions()).toHaveLength(1);
+    expect(starts()).toHaveLength(2);
   });
 
   // ── Utterance-based failover ────────────────────────────────────────────────

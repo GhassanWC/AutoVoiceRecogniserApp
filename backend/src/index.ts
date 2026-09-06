@@ -12,6 +12,7 @@ import {
   createRealtimeTranslationProvider,
   createTranslationProvider,
 } from './providers/translation';
+import { createModelLanguageDetector } from './utils/language_detect';
 import { log } from './utils/logger';
 
 const app = express();
@@ -34,7 +35,19 @@ const speech = createSpeechProvider();
 const streamingSpeech = createStreamingSpeechProvider();
 const translation = createTranslationProvider();
 const realtimeTranslation = createRealtimeTranslationProvider();
-attachRealtimeServer(httpServer, { speech, streamingSpeech, translation, realtimeTranslation });
+// Source-language LABEL metadata for Latin-script text (script analysis
+// covers the rest) — a few tokens per utterance, never in the delta path.
+const languageDetector =
+  env.TRANSLATION_PROVIDER === 'openai' && env.TRANSLATION_API_KEY
+    ? createModelLanguageDetector(env.TRANSLATION_API_KEY)
+    : null;
+attachRealtimeServer(httpServer, {
+  speech,
+  streamingSpeech,
+  translation,
+  realtimeTranslation,
+  languageDetector,
+});
 
 httpServer.listen(env.PORT, () => {
   log.info('backend listening', {

@@ -15,6 +15,11 @@ import {
 } from '../../providers/translation';
 import { getStore } from '../../storage';
 import { pcm16Rms, pcm16ToWav, pcmDurationMs } from '../../utils/audio';
+import {
+  detectLanguageByScript,
+  LANGUAGE_NAMES,
+  LanguageDetector,
+} from '../../utils/language_detect';
 import { newId, newUuid } from '../../utils/ids';
 import { log } from '../../utils/logger';
 import { hasRemainingAllowance, recordProcessedSpeech } from '../usage/usage.service';
@@ -58,6 +63,11 @@ export interface LiveSessionDeps {
   realtimeTranslation?: RealtimeTranslationProvider | null;
   diarization: SpeakerDiarizationProvider;
   send: (message: ServerMessage) => void;
+  /**
+   * Model-based language identifier for Latin-script text (script analysis
+   * handles the rest). Metadata only — runs after translation output.
+   */
+  languageDetector?: LanguageDetector | null;
   /** Test hook: shorter retry delays / different concurrency. */
   translationQueueOptions?: TranslationQueueOptions;
 }
@@ -781,6 +791,44 @@ export class LiveSession {
       utteranceMs: Date.now() - mapping.startedAt,
       outputLength: translatedText.length,
     });
+
+    // Source-language LABEL, resolved after the translation is already out —
+    // this never delays deltas; without a source transcript it stays unknown
+    // and the bubble simply shows "Speaker".
+    this.detectAndNotifyLanguage(mapping.messageId, sourceText);
+  }
+
+  /** Sends the language label event when a usable code is known. */
+  private notifyLanguage(messageId: string, code: string): void {
+    if (this.closed || !this.sessionId) return;
+    const languageCode = code.trim().toLowerCase();
+    if (!/^[a-z]{2,3}$/.test(languageCode) || languageCode === 'und') return;
+    this.deps.send({
+      type: 'language_detected',
+      messageId,
+      languageCode,
+      languageName: LANGUAGE_NAMES[languageCode] ?? languageCode,
+    });
+  }
+
+  /**
+   * Metadata only, strictly after translation output: script analysis first
+   * (free, instant), then the tiny model detector for Latin-script text.
+   * Fire-and-forget — an unknown label just leaves the bubble as "Speaker".
+   */
+  private detectAndNotifyLanguage(messageId: string, sourceText: string): void {
+    const text = sourceText.trim();
+    if (!text) return;
+    const byScript = detectLanguageByScript(text);
+    if (byScript) {
+      this.notifyLanguage(messageId, byScript);
+      return;
+    }
+    const detector = this.deps.languageDetector;
+    if (!detector) return;
+    void detector(text)
+      .then((code) => this.notifyLanguage(messageId, code))
+      .catch(() => undefined);
   }
 
   private handleTranslateError(error: Error): void {
@@ -1141,6 +1189,15 @@ export class LiveSession {
           createdAt: new Date().toISOString(),
         })
         .catch(() => undefined);
+    }
+
+    // Language label event (uniform across paths). The text translator's own
+    // verdict is authoritative when present; otherwise detect from the source
+    // transcript — always after the translation was already delivered.
+    if (sourceLanguage && sourceLanguage !== 'und') {
+      this.notifyLanguage(result.messageId, sourceLanguage);
+    } else if (entry.originalText) {
+      this.detectAndNotifyLanguage(result.messageId, entry.originalText);
     }
 
     // Characters are metered here; speech seconds were metered at segment end.

@@ -104,6 +104,42 @@ void main() {
     expect(message.sourceLanguage, 'en');
   });
 
+  test('language_detected upgrades the SAME bubble after translation completed', () async {
+    await client.emit(started('msg_1'));
+    await client.emit(const TranslationDeltaEvent(messageId: 'msg_1', delta: 'مرحباً', reset: false));
+    await client.emit(const TranslationCompleteEvent(messageId: 'msg_1', translatedText: 'مرحباً'));
+    // Language metadata arrives strictly AFTER the translation — must still land.
+    await client.emit(const LanguageDetectedEvent(
+      messageId: 'msg_1',
+      languageCode: 'th',
+      languageName: 'Thai',
+    ));
+
+    expect(controller.messages, hasLength(1)); // same bubble, no duplicate
+    final message = controller.messages.single;
+    expect(message.sourceLanguage, 'th');
+    expect(message.languageConfidence, greaterThanOrEqualTo(0.5)); // label renders
+    expect(message.translatedText, 'مرحباً'); // translation untouched
+    expect(message.status, TranslationStatus.done);
+  });
+
+  test('unknown language_detected is ignored without crashing', () async {
+    await client.emit(started('msg_1'));
+    await client.emit(const LanguageDetectedEvent(
+      messageId: 'msg_1',
+      languageCode: 'und',
+      languageName: '',
+    ));
+    await client.emit(const LanguageDetectedEvent(
+      messageId: 'msg_missing',
+      languageCode: 'th',
+      languageName: 'Thai',
+    ));
+
+    expect(controller.messages, hasLength(1));
+    expect(controller.messages.single.sourceLanguage, 'und'); // stays "Speaker"
+  });
+
   test('multiple deltas and the completion never create duplicate bubbles', () async {
     await client.emit(started('msg_1'));
     for (final delta in ['مر', 'ح', 'ب', 'اً']) {

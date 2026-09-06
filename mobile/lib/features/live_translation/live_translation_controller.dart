@@ -359,6 +359,15 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
           speak: true,
           createIfMissing: true, // never lose a finished translation to a race
         );
+      case LanguageDetectedEvent(:final messageId, :final languageCode):
+        // Metadata only: upgrade the existing bubble's language label in
+        // place. Unknown codes are ignored — the label simply stays "Speaker".
+        if (languageCode.isNotEmpty && languageCode != 'und') {
+          _updateMessage(
+            messageId,
+            (m) => m.copyWith(sourceLanguage: languageCode, languageConfidence: 0.9),
+          );
+        }
       case TranslationFailedEvent(:final messageId, :final reason, :final status):
         if (settings.settings.developerDiagnostics) {
           developer.log(

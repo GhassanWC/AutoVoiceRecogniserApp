@@ -116,6 +116,12 @@ sealed class ServerEvent {
               ? json['latency'] as Map<String, dynamic>
               : null,
         );
+      case 'language_detected':
+        return LanguageDetectedEvent(
+          messageId: json['messageId'] as String? ?? '',
+          languageCode: json['languageCode'] as String? ?? 'und',
+          languageName: json['languageName'] as String? ?? '',
+        );
       case 'translation_failed':
         return TranslationFailedEvent(
           messageId: json['messageId'] as String? ?? '',
@@ -239,6 +245,20 @@ class TranslationCompleteEvent extends ServerEvent {
 
   /// {speechEndToFirstDeltaMs, speechEndToFinalMs} — developer diagnostics.
   final Map<String, dynamic>? latency;
+}
+
+/// Late-arriving source-language metadata for an existing message. Never
+/// delays translation — it only upgrades the bubble's "Speaker" label to
+/// "Speaker · <Language> <flag>".
+class LanguageDetectedEvent extends ServerEvent {
+  const LanguageDetectedEvent({
+    required this.messageId,
+    required this.languageCode,
+    required this.languageName,
+  });
+  final String messageId;
+  final String languageCode;
+  final String languageName;
 }
 
 class TranslationFailedEvent extends ServerEvent {

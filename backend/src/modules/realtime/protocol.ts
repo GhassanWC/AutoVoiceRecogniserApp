@@ -200,6 +200,20 @@ export interface TranslationCompletePayload {
   latency?: TranslationLatency;
 }
 
+/**
+ * Late-arriving source-language metadata for an existing message. Detection
+ * runs strictly AFTER translation output is under way — it never delays
+ * deltas — and the client upgrades the same bubble's label in place.
+ */
+export interface LanguageDetectedPayload {
+  type: 'language_detected';
+  messageId: string;
+  /** ISO 639-1 code, e.g. "th". */
+  languageCode: string;
+  /** Display name, e.g. "Thai". */
+  languageName: string;
+}
+
 /** Sent only after every retry failed; the client offers a Retry action. */
 export interface TranslationFailedPayload {
   type: 'translation_failed';
@@ -224,6 +238,7 @@ export type ServerMessage =
   | TranslationStartedPayload
   | TranslationDeltaPayload
   | TranslationCompletePayload
+  | LanguageDetectedPayload
   | TranslationFailedPayload
   | { type: 'segment_dropped'; segmentId: string; reason: string }
   | { type: 'limit_reached'; message: string }

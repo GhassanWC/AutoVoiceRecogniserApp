@@ -163,7 +163,9 @@ void main() {
       showLanguageLabels: true,
     )));
 
+    // Unknown language → just "Speaker", never a "Language detected…" text.
     expect(find.textContaining('Speaker'), findsOneWidget);
-    expect(find.textContaining('Language detected automatically'), findsOneWidget);
+    expect(find.textContaining('Language detected'), findsNothing);
+    expect(find.text('Speaker'), findsOneWidget); // no trailing separator
   });
 }
