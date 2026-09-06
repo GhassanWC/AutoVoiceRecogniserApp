@@ -145,6 +145,24 @@ export interface TranscriptFinalPayload {
 }
 
 /**
+ * Direct realtime-translation path: announces a NEW in-progress message
+ * BEFORE its first translation_delta, so the client always has a bubble to
+ * stream into (there is no transcript yet on this path — the source text
+ * arrives with translation_complete when available).
+ */
+export interface TranslationStartedPayload {
+  type: 'translation_started';
+  messageId: string;
+  segmentId: string;
+  speakerId: string | null;
+  speakerLabel: string | null;
+  /** "und" — the direct path does not identify the source language. */
+  sourceLanguage: string;
+  targetLanguage: string;
+  timestamp: string;
+}
+
+/**
  * A chunk of translated display text, streamed the moment the model emits it.
  * The client APPENDS it to the SAME message bubble (`messageId`) — unless
  * `reset` is true (a retry started over), which replaces the partial text.
@@ -203,6 +221,7 @@ export type ServerMessage =
     }
   | TranslationMessagePayload
   | TranscriptFinalPayload
+  | TranslationStartedPayload
   | TranslationDeltaPayload
   | TranslationCompletePayload
   | TranslationFailedPayload

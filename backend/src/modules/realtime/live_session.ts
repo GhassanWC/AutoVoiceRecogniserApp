@@ -159,6 +159,7 @@ export class LiveSession {
   private continuousStreamId: string | null = null;
   private continuousSampleRate = 16000;
   private streamReopenAttempts = 0;
+  private audioFramesReceived = 0;
 
   /** Primary realtime-translation session state. */
   private translateSession: RealtimeTranslationSession | null = null;
@@ -369,6 +370,12 @@ export class LiveSession {
         this.continuousStreamId = null;
         return;
       }
+      if (this.audioFramesReceived === 0) {
+        log.info('[2] BACKEND_AUDIO_RECEIVED (first frame)', { streamId: frame.segmentId });
+      } else if (this.audioFramesReceived % 100 === 0) {
+        log.info('[2] BACKEND_AUDIO_RECEIVED', { frames: this.audioFramesReceived });
+      }
+      this.audioFramesReceived += 1;
       if (this.translateSession) {
         this.translateSession.sendAudio(frame.pcm);
         this.trackUtteranceForFailover(frame.pcm);
@@ -667,6 +674,7 @@ export class LiveSession {
     // A late delta from a session already failed over must not resurrect it —
     // the fallback owns this utterance now (no duplicate bubbles).
     if (this.translateFailed) return;
+    log.info('[3] OPENAI_TRANSLATION_DELTA', { utteranceId, delta });
     this.deltaSinceUtteranceStart = true;
     let mapping = this.utteranceMessages.get(utteranceId);
     if (!mapping) {
@@ -682,29 +690,25 @@ export class LiveSession {
         speakerLabel: null,
         languageConfidence: 0,
       });
-      // The bubble appears the instant the first translated word exists; the
-      // source transcript (when available) fills in at finalization.
+      // Explicit bubble announcement BEFORE the first delta, so the client
+      // always has a message to stream into; the source transcript (when
+      // available) arrives with translation_complete.
+      log.info('[4] WS_SENT_TO_MOBILE translation_started', { messageId });
       this.deps.send({
-        type: 'transcript_final',
+        type: 'translation_started',
         messageId,
         segmentId: this.continuousStreamId ?? newUuid(),
         speakerId: null,
         speakerLabel: null,
         sourceLanguage: 'und',
-        languageConfidence: 0,
-        transcriptionConfidence: 0,
-        originalText: '',
         targetLanguage: this.targetLanguage,
-        translationStatus: 'pending',
         timestamp: new Date().toISOString(),
-        diagnostics: {
-          sttProvider: this.deps.realtimeTranslation?.name ?? 'realtime-translate',
-          detectedLanguage: 'und',
-          audioMs: 0,
-          translateLatencyMs: 0,
-        },
       });
     }
+    log.info('[5] WS_SENT_TO_MOBILE translation_delta', {
+      messageId: mapping.messageId,
+      delta,
+    });
     this.deps.send({ type: 'translation_delta', messageId: mapping.messageId, delta });
   }
 

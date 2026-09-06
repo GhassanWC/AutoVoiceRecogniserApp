@@ -296,11 +296,35 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       case TranscriptFinalEvent(:final message):
         activityLabel = null;
         _addTranscript(message);
+      case TranslationStartedEvent(
+          :final messageId,
+          :final speakerId,
+          :final speakerLabel,
+          :final sourceLanguage,
+          :final targetLanguage,
+          :final timestamp
+        ):
+        // Direct realtime-translate path: bubble exists BEFORE any delta.
+        _logStage('[6] FLUTTER_RECEIVED translation_started id=$messageId');
+        activityLabel = null;
+        _ensureMessage(
+          messageId,
+          speakerId: speakerId,
+          speakerLabel: speakerLabel,
+          sourceLanguage: sourceLanguage,
+          targetLanguage: targetLanguage,
+          timestamp: timestamp,
+        );
+        notifyListeners();
       case TranslationDeltaEvent(:final messageId, :final delta, :final reset):
-        // Streamed translation: grow the SAME bubble word by word.
+        _logStage('[7] FLUTTER_RECEIVED translation_delta id=$messageId delta="$delta"');
+        // Streamed translation: grow the SAME bubble word by word. Defensive:
+        // an unknown messageId (ordering/network race) creates the bubble
+        // instead of silently dropping translated text.
         _updateMessage(
           messageId,
           (m) => m.copyWith(translatedText: reset ? delta : m.translatedText + delta),
+          createIfMissing: true,
         );
       case TranslationCompleteEvent(
           :final messageId,
@@ -309,6 +333,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
           :final originalText,
           :final latency
         ):
+        _logStage('[7] FLUTTER_RECEIVED translation_complete id=$messageId');
         if (settings.settings.developerDiagnostics && latency != null) {
           developer.log(
             '[LATENCY] id=$messageId '
@@ -332,6 +357,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
             originalText: (originalText != null && originalText.isNotEmpty) ? originalText : null,
           ),
           speak: true,
+          createIfMissing: true, // never lose a finished translation to a race
         );
       case TranslationFailedEvent(:final messageId, :final reason, :final status):
         if (settings.settings.developerDiagnostics) {
@@ -378,30 +404,70 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     if (message.id.isEmpty || messages.any((m) => m.id == message.id)) return;
     messages.add(message);
     _sessionMessages.add(message);
+    _logStage('[8] CHAT_MESSAGE_CREATED id=${message.id} (transcript_final)');
     _logPipeline(message);
     notifyListeners();
   }
 
-  /// Updates the existing message in place — never creates a second bubble.
+  /// Numbered live-trace stages for developer diagnostics.
+  void _logStage(String stage) {
+    if (!settings.settings.developerDiagnostics) return;
+    developer.log(stage, name: 'trace');
+  }
+
+  /// Creates the in-progress bubble for [messageId] if it does not exist yet
+  /// (translation_started, or a delta/complete that arrived first). Returns
+  /// the message index, or -1 for an empty id.
+  int _ensureMessage(
+    String messageId, {
+    String? speakerId,
+    String? speakerLabel,
+    String sourceLanguage = 'und',
+    String? targetLanguage,
+    DateTime? timestamp,
+  }) {
+    if (messageId.isEmpty) return -1;
+    final existing = messages.indexWhere((m) => m.id == messageId);
+    if (existing >= 0) return existing;
+    final message = TranslationMessage(
+      id: messageId,
+      speakerId: speakerId,
+      speakerLabel: speakerLabel,
+      sourceLanguage: sourceLanguage,
+      languageConfidence: 0,
+      originalText: '',
+      translatedText: '',
+      targetLanguage: targetLanguage ?? settings.settings.targetLanguage,
+      timestamp: timestamp ?? DateTime.now(),
+      status: TranslationStatus.pending,
+    );
+    messages.add(message);
+    _sessionMessages.add(message);
+    _logStage('[8] CHAT_MESSAGE_CREATED id=$messageId');
+    return messages.length - 1;
+  }
+
+  /// Updates the message in place — never creates a second bubble for the
+  /// same id. With [createIfMissing], an unknown id gets a bubble first
+  /// (defense against event ordering/network races) instead of being dropped.
   void _updateMessage(
     String messageId,
     TranslationMessage Function(TranslationMessage) change, {
     bool speak = false,
+    bool createIfMissing = false,
   }) {
-    final index = messages.indexWhere((m) => m.id == messageId);
+    var index = messages.indexWhere((m) => m.id == messageId);
+    if (index < 0 && createIfMissing) index = _ensureMessage(messageId);
     if (index < 0) return;
     final alreadyDone = messages[index].status == TranslationStatus.done;
     final updated = change(messages[index]);
     messages[index] = updated;
     final sessionIndex = _sessionMessages.indexWhere((m) => m.id == messageId);
     if (sessionIndex >= 0) _sessionMessages[sessionIndex] = updated;
-    if (settings.settings.developerDiagnostics) {
-      developer.log(
-        '[PIPELINE] update id=$messageId status=${updated.status.name} '
-        'translated="${updated.translatedText}"',
-        name: 'pipeline',
-      );
-    }
+    _logStage(
+      '[8] CHAT_MESSAGE_UPDATED id=$messageId status=${updated.status.name} '
+      'translated="${updated.translatedText}"',
+    );
     notifyListeners();
     // Speak once per message, even if a retry delivers the result twice.
     if (speak && !alreadyDone && settings.settings.autoSpeak) {
@@ -451,10 +517,17 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   /// Every captured chunk: level/diagnostics first (updates the audibility
   /// clock), then continuous upload — held back only during prolonged
   /// absolute silence.
+  DateTime _lastStage1Log = DateTime.fromMillisecondsSinceEpoch(0);
+
   void _handleCapturedAudio(Uint8List pcm) {
     _vad?.addAudio(pcm);
     if (DateTime.now().difference(_lastAudibleAt) < _silencePauseAfter) {
       client.sendStreamAudio(pcm);
+      final now = DateTime.now();
+      if (now.difference(_lastStage1Log).inMilliseconds >= 1000) {
+        _lastStage1Log = now;
+        _logStage('[1] MOBILE_AUDIO_SENT (${pcm.length} bytes/chunk, connected=${client.isConnected})');
+      }
     }
   }
 

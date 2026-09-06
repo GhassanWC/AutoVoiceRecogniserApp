@@ -5,6 +5,7 @@ import {
   TranscriptFinalPayload,
   TranslationCompletePayload,
   TranslationDeltaPayload,
+  TranslationStartedPayload,
 } from '../src/modules/realtime/protocol';
 import { HeuristicDiarizationProvider } from '../src/providers/diarization/heuristic';
 import { MockSpeechProvider } from '../src/providers/speech/mock';
@@ -207,6 +208,9 @@ describe('LiveSession primary realtime-translate path', () => {
   function transcripts(): TranscriptFinalPayload[] {
     return sent.filter((m): m is TranscriptFinalPayload => m.type === 'transcript_final');
   }
+  function starts(): TranslationStartedPayload[] {
+    return sent.filter((m): m is TranslationStartedPayload => m.type === 'translation_started');
+  }
   function deltas(): TranslationDeltaPayload[] {
     return sent.filter((m): m is TranslationDeltaPayload => m.type === 'translation_delta');
   }
@@ -227,18 +231,18 @@ describe('LiveSession primary realtime-translate path', () => {
     expect(translate.sessions[0]!.audioBytes).toBe(5 * 3200);
   });
 
-  it('creates one bubble per utterance: transcript_final, streamed deltas, then final', () => {
+  it('announces the bubble with translation_started BEFORE the first delta, then finalizes', () => {
     const stream = translate.sessions[0]!;
     stream.emitDelta('utterance_1', 'مرح');
     stream.emitDelta('utterance_1', 'باً');
     stream.emitFinal('utterance_1', 'مرحباً', 'Hello');
 
-    expect(transcripts()).toHaveLength(1); // one bubble, created on first delta
-    const messageId = transcripts()[0]!.messageId;
-    expect(transcripts()[0]).toMatchObject({
+    expect(starts()).toHaveLength(1); // one bubble announcement
+    const messageId = starts()[0]!.messageId;
+    expect(starts()[0]).toMatchObject({
       segmentId: STREAM_ID,
-      originalText: '',
-      translationStatus: 'pending',
+      sourceLanguage: 'und',
+      targetLanguage: 'ar',
       speakerId: null, // diarization is out of the primary MVP path
     });
     expect(deltas().map((d) => [d.messageId, d.delta])).toEqual([
@@ -251,8 +255,8 @@ describe('LiveSession primary realtime-translate path', () => {
       originalText: 'Hello', // source transcript fills in at finalization
       targetLanguage: 'ar',
     });
-    // Order: bubble → deltas → final.
-    expect(sent.indexOf(transcripts()[0]!)).toBeLessThan(sent.indexOf(deltas()[0]!));
+    // Order on the wire: translation_started strictly before any delta.
+    expect(sent.indexOf(starts()[0]!)).toBeLessThan(sent.indexOf(deltas()[0]!));
     expect(sent.indexOf(deltas()[1]!)).toBeLessThan(sent.indexOf(completions()[0]!));
   });
 
@@ -263,8 +267,8 @@ describe('LiveSession primary realtime-translate path', () => {
     stream.emitDelta('utterance_2', 'صباح الخير');
     stream.emitFinal('utterance_2', 'صباح الخير', 'Good morning');
 
-    expect(transcripts()).toHaveLength(2);
-    expect(new Set(transcripts().map((t) => t.messageId)).size).toBe(2);
+    expect(starts()).toHaveLength(2);
+    expect(new Set(starts().map((t) => t.messageId)).size).toBe(2);
     expect(completions().map((c) => c.translatedText)).toEqual(['مرحباً', 'صباح الخير']);
     expect(sent.find((m) => m.type === 'session_ended')).toBeUndefined();
   });
@@ -341,7 +345,7 @@ describe('LiveSession primary realtime-translate path', () => {
     expect(fallback.created).toBe(0); // no failover
     expect(translate.sessions).toHaveLength(1);
     expect(translate.sessions[0]!.closed).toBe(false); // healthy session kept
-    expect(transcripts()).toHaveLength(1); // the direct bubble
+    expect(starts()).toHaveLength(1); // the direct bubble announcement
   });
 
   it('a direct delta within the deadline claims the reserved messageId', async () => {
@@ -353,8 +357,8 @@ describe('LiveSession primary realtime-translate path', () => {
     await new Promise((resolve) => setTimeout(resolve, 1500));
 
     expect(fallback.created).toBe(0); // deadline was disarmed
-    expect(transcripts()).toHaveLength(1);
-    expect(completions()[0]!.messageId).toBe(transcripts()[0]!.messageId);
+    expect(starts()).toHaveLength(1);
+    expect(completions()[0]!.messageId).toBe(starts()[0]!.messageId);
   });
 
   it('distant/TV-level speech (RMS ≈ 0.004 over a quiet floor) arms failover', async () => {
@@ -421,7 +425,8 @@ describe('LiveSession primary realtime-translate path', () => {
     translate.sessions[0]!.emitFinal('utterance_1', 'مرحباً', 'Hello');
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    expect(transcripts()).toHaveLength(1); // still one bubble
+    expect(transcripts()).toHaveLength(1); // still one bubble (the fallback's)
+    expect(starts()).toHaveLength(0); // no direct-path bubble ever announced
     expect(completions()).toHaveLength(1); // still one final translation
     expect(deltas()).toHaveLength(0); // no stray streamed deltas either
   });

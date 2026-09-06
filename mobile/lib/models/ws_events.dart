@@ -90,6 +90,16 @@ sealed class ServerEvent {
                 : null,
           ),
         );
+      case 'translation_started':
+        return TranslationStartedEvent(
+          messageId: json['messageId'] as String? ?? '',
+          speakerId: json['speakerId'] as String?,
+          speakerLabel: json['speakerLabel'] as String?,
+          sourceLanguage: json['sourceLanguage'] as String? ?? 'und',
+          targetLanguage: json['targetLanguage'] as String? ?? 'en',
+          timestamp:
+              DateTime.tryParse(json['timestamp'] as String? ?? '')?.toLocal() ?? DateTime.now(),
+        );
       case 'translation_delta':
         return TranslationDeltaEvent(
           messageId: json['messageId'] as String? ?? '',
@@ -176,6 +186,25 @@ class TranslationEvent extends ServerEvent {
 class TranscriptFinalEvent extends ServerEvent {
   const TranscriptFinalEvent(this.message);
   final TranslationMessage message;
+}
+
+/// Direct realtime-translation path: a NEW in-progress message announced
+/// BEFORE its first delta. The client must create the bubble immediately.
+class TranslationStartedEvent extends ServerEvent {
+  const TranslationStartedEvent({
+    required this.messageId,
+    required this.speakerId,
+    required this.speakerLabel,
+    required this.sourceLanguage,
+    required this.targetLanguage,
+    required this.timestamp,
+  });
+  final String messageId;
+  final String? speakerId;
+  final String? speakerLabel;
+  final String sourceLanguage;
+  final String targetLanguage;
+  final DateTime timestamp;
 }
 
 /// A streamed chunk of translated text — append to the SAME bubble (or

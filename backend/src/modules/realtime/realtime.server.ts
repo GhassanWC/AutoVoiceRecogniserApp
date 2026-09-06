@@ -73,6 +73,23 @@ export function attachRealtimeServer(
     let messageCount = 0;
     let windowStart = Date.now();
 
+    // Control messages MUST be handled strictly in order: session_start is
+    // async (allowance check), and the client sends stream_start immediately
+    // after it — often coalesced into the same TCP packet. Handling
+    // stream_start synchronously while session_start is still awaiting made
+    // the server reject it with no_session, silently discarding ALL of the
+    // session's audio ("mic active, nothing ever appears"). Audio frames stay
+    // outside the chain: they are order-tolerant and must not queue.
+    let controlChain: Promise<void> = Promise.resolve();
+    const enqueueControl = (work: () => void | Promise<void>): void => {
+      controlChain = controlChain.then(work).catch((error) => {
+        log.error('control message handling failed', {
+          userId: claims.sub,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    };
+
     socket.on('message', (data: Buffer, isBinary: boolean) => {
       const now = Date.now();
       if (now - windowStart >= 1000) {
@@ -108,22 +125,22 @@ export function attachRealtimeServer(
       const message = result.data;
       switch (message.type) {
         case 'session_start':
-          void session.handleSessionStart(message);
+          enqueueControl(() => session.handleSessionStart(message));
           break;
         case 'segment_start':
-          session.handleSegmentStart(message);
+          enqueueControl(() => session.handleSegmentStart(message));
           break;
         case 'stream_start':
-          session.handleStreamStart(message);
+          enqueueControl(() => session.handleStreamStart(message));
           break;
         case 'segment_end':
-          session.handleSegmentEnd(message.segmentId, message.durationMs);
+          enqueueControl(() => session.handleSegmentEnd(message.segmentId, message.durationMs));
           break;
         case 'session_stop':
-          void session.handleSessionStop();
+          enqueueControl(() => session.handleSessionStop());
           break;
         case 'retry_translation':
-          session.handleRetryTranslation(message.messageId);
+          enqueueControl(() => session.handleRetryTranslation(message.messageId));
           break;
         case 'ping':
           send({ type: 'pong', t: message.t });
