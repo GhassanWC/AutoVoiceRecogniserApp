@@ -33,6 +33,10 @@ abstract class LocalSpeechEngine {
 class WhisperLocalSpeechEngine implements LocalSpeechEngine {
   WhisperEngine? _engine;
 
+  /// whisper.cpp build identification, for load-failure diagnostics.
+  static String get nativeVersion => WhisperEngine.version;
+  static String get nativeSystemInfo => WhisperEngine.systemInfo;
+
   @override
   bool get isLoaded => _engine != null;
 

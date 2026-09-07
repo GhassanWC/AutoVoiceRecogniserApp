@@ -12,6 +12,7 @@ import '../../models/ws_events.dart';
 import '../../services/audio/audio_capture_service.dart';
 import '../../services/audio/vad_segmenter.dart';
 import '../../services/auth/api_client.dart';
+import '../../services/local/local_model_doctor.dart';
 import '../../services/local/local_pipeline.dart';
 import '../../services/local/local_speech_engine.dart';
 import '../../services/local/local_translation_engine.dart';
@@ -239,12 +240,36 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       return;
     }
 
+    // Precheck + [WHISPER LOAD] logging on EVERY start: existence, exact
+    // size, fresh SHA-256, readability and ggml magic — right before the
+    // native load, with the model untouched in Application Support.
+    final precheck = await whisperPreloadChecks(spec: spec, manager: offlineModels);
+    if (!precheck.ok) {
+      _failStart('Offline model failed verification '
+          '(${precheck.failureSummary.isEmpty ? 'see [WHISPER LOAD] log' : precheck.failureSummary}). '
+          'Delete and re-download it in Settings → Developer.');
+      return;
+    }
+
     final engine = _localEngine ??= WhisperLocalSpeechEngine();
     try {
-      await engine.load(await offlineModels.pathFor(spec));
-    } catch (_) {
-      _failStart('Could not load the offline model. Try deleting and '
-          're-downloading it in Settings → Developer → Offline AI.');
+      developer.log(
+        '[WHISPER LOAD] version=${WhisperLocalSpeechEngine.nativeVersion} '
+        'systemInfo=${WhisperLocalSpeechEngine.nativeSystemInfo}',
+        name: 'whisper',
+      );
+      await engine.load(precheck.modelPath);
+    } catch (error, stack) {
+      // The ACTUAL native failure, never just a generic message.
+      developer.log(
+        '[WHISPER LOAD ERROR] type=${error.runtimeType} message=$error '
+        'stack=${stack.toString().split('\n').take(10).join(' | ')}',
+        name: 'whisper',
+      );
+      _failStart('Could not load the offline model — '
+          '${error.runtimeType}: $error. '
+          'Run Settings → Developer → Test Offline Model for full diagnostics '
+          '(try the small-q5_1 baseline model first).');
       return;
     }
 

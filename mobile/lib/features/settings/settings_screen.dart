@@ -1,7 +1,11 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/app_settings.dart';
+import '../../services/local/local_model_doctor.dart';
+import '../../services/local/local_speech_engine.dart';
 import '../../services/local/offline_model_manager.dart';
 import '../../services/storage/history_store.dart';
 import '../../services/storage/settings_store.dart';
@@ -142,8 +146,60 @@ class SettingsScreen extends StatelessWidget {
               onTap: () => _pickOfflineModel(context, controller),
             ),
             _OfflineModelsTile(modelKey: settings.onDeviceModel),
+            ListTile(
+              leading: const Icon(Icons.rule_outlined),
+              title: const Text('Test Offline Model'),
+              subtitle: const Text('Load the selected model without the microphone'),
+              onTap: () => _testOfflineModel(context, settings.onDeviceModel),
+            ),
           ],
           const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  /// Loads the selected model in isolation and shows "Model load: PASS" or
+  /// the exact filesystem/native failure — the microphone is never started.
+  Future<void> _testOfflineModel(BuildContext context, String modelKey) async {
+    final navigator = Navigator.of(context);
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(width: 16),
+            Expanded(child: Text('Verifying + loading model…\n(SHA-256 of a large file takes a moment)')),
+          ],
+        ),
+      ),
+    ));
+
+    final report = await runModelLoadTest(
+      spec: offlineModelForKey(modelKey),
+      manager: sharedOfflineModels,
+      engineFactory: WhisperLocalSpeechEngine.new,
+    );
+
+    navigator.pop(); // close the progress dialog
+    if (!context.mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(report.passed ? 'Model load: PASS' : 'Model load: FAILED'),
+        content: SingleChildScrollView(
+          child: SelectableText(
+            report.details,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Close'),
+          ),
         ],
       ),
     );
