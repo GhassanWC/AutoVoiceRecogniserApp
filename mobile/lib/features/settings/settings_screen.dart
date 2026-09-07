@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/app_settings.dart';
+import '../../services/local/offline_model_manager.dart';
 import '../../services/storage/history_store.dart';
 import '../../services/storage/settings_store.dart';
 import '../../utils/languages.dart';
@@ -125,7 +126,73 @@ class SettingsScreen extends StatelessWidget {
             value: settings.developerDiagnostics,
             onChanged: (value) => controller.update((s) => s.copyWith(developerDiagnostics: value)),
           ),
+          ListTile(
+            leading: const Icon(Icons.psychology_outlined),
+            title: const Text('Translation Engine'),
+            subtitle: Text(settings.translationEngine == TranslationEngine.onDevice
+                ? 'On-device (experimental) — audio never leaves this iPhone'
+                : 'OpenAI (cloud)'),
+            onTap: () => _pickEngine(context, controller),
+          ),
+          if (settings.translationEngine == TranslationEngine.onDevice) ...[
+            ListTile(
+              leading: const Icon(Icons.memory_outlined),
+              title: const Text('Offline Whisper Model'),
+              subtitle: Text(offlineModelForKey(settings.onDeviceModel).displayName),
+              onTap: () => _pickOfflineModel(context, controller),
+            ),
+            _OfflineModelsTile(modelKey: settings.onDeviceModel),
+          ],
           const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  void _pickEngine(BuildContext context, SettingsController controller) {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('Translation Engine'),
+        children: [
+          for (final engine in TranslationEngine.values)
+            ListTile(
+              title: Text(engine.label),
+              subtitle: Text(engine == TranslationEngine.onDevice
+                  ? 'Experimental. 100% offline: local Whisper + local translation. '
+                      'No OpenAI, no backend, no API keys.'
+                  : 'Cloud pipeline (current production).'),
+              trailing: controller.settings.translationEngine == engine
+                  ? const Icon(Icons.check_rounded)
+                  : null,
+              onTap: () {
+                controller.update((s) => s.copyWith(translationEngine: engine));
+                Navigator.pop(dialogContext);
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
+  void _pickOfflineModel(BuildContext context, SettingsController controller) {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: const Text('Offline Whisper Model'),
+        children: [
+          for (final spec in kOfflineModelCatalog)
+            ListTile(
+              title: Text('${spec.displayName} (${spec.sizeLabel})'),
+              subtitle: Text(spec.notes),
+              trailing: controller.settings.onDeviceModel == spec.key
+                  ? const Icon(Icons.check_rounded)
+                  : null,
+              onTap: () {
+                controller.update((s) => s.copyWith(onDeviceModel: spec.key));
+                Navigator.pop(dialogContext);
+              },
+            ),
         ],
       ),
     );
@@ -234,6 +301,99 @@ class SettingsScreen extends StatelessWidget {
     );
     if (result != null) {
       await controller.update((s) => s.copyWith(serverUrl: result));
+    }
+  }
+}
+
+/// Download / manage the Offline AI models: shows size before downloading,
+/// progress while downloading, verification, storage used when ready, and a
+/// delete/re-download action. Models are fetched once, never bundled in the
+/// App Store binary.
+class _OfflineModelsTile extends StatefulWidget {
+  const _OfflineModelsTile({required this.modelKey});
+
+  final String modelKey;
+
+  @override
+  State<_OfflineModelsTile> createState() => _OfflineModelsTileState();
+}
+
+class _OfflineModelsTileState extends State<_OfflineModelsTile> {
+  final OfflineModelManager _manager = sharedOfflineModels;
+
+  @override
+  void initState() {
+    super.initState();
+    _manager.addListener(_onChanged);
+    _refresh();
+  }
+
+  @override
+  void didUpdateWidget(covariant _OfflineModelsTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.modelKey != widget.modelKey) _refresh();
+  }
+
+  void _refresh() {
+    _manager.isReady(offlineModelForKey(widget.modelKey));
+  }
+
+  void _onChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _manager.removeListener(_onChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final spec = offlineModelForKey(widget.modelKey);
+    switch (_manager.state) {
+      case OfflineModelState.downloading:
+        return ListTile(
+          leading: const Icon(Icons.downloading_outlined),
+          title: Text('Downloading… ${(_manager.progress * 100).toStringAsFixed(0)}%'),
+          subtitle: LinearProgressIndicator(value: _manager.progress),
+        );
+      case OfflineModelState.verifying:
+        return const ListTile(
+          leading: Icon(Icons.verified_outlined),
+          title: Text('Verifying download…'),
+          subtitle: LinearProgressIndicator(),
+        );
+      case OfflineModelState.ready:
+        return ListTile(
+          leading: const Icon(Icons.offline_pin_outlined),
+          title: const Text('Offline AI ready'),
+          subtitle: Text('Storage used: ${formatBytes(_manager.storageUsedBytes)}'),
+          trailing: IconButton(
+            icon: const Icon(Icons.delete_outline),
+            tooltip: 'Delete model (re-download any time)',
+            onPressed: () => _manager.delete(spec),
+          ),
+        );
+      case OfflineModelState.failed:
+        return ListTile(
+          leading: Icon(Icons.error_outline, color: Theme.of(context).colorScheme.error),
+          title: Text(_manager.errorMessage ?? 'Download failed'),
+          trailing: TextButton(
+            onPressed: () => _manager.download(spec),
+            child: const Text('Retry'),
+          ),
+        );
+      case OfflineModelState.notDownloaded:
+        return ListTile(
+          leading: const Icon(Icons.cloud_download_outlined),
+          title: const Text('Download Offline AI'),
+          subtitle: Text('${spec.displayName} — one-time ${spec.sizeLabel} download'),
+          trailing: TextButton(
+            onPressed: () => _manager.download(spec),
+            child: const Text('Download'),
+          ),
+        );
     }
   }
 }

@@ -5,12 +5,17 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
+import '../../models/app_settings.dart';
 import '../../models/conversation_session.dart';
 import '../../models/translation_message.dart';
 import '../../models/ws_events.dart';
 import '../../services/audio/audio_capture_service.dart';
 import '../../services/audio/vad_segmenter.dart';
 import '../../services/auth/api_client.dart';
+import '../../services/local/local_pipeline.dart';
+import '../../services/local/local_speech_engine.dart';
+import '../../services/local/local_translation_engine.dart';
+import '../../services/local/offline_model_manager.dart';
 import '../../services/mock/mock_conversation_service.dart';
 import '../../services/permissions/mic_permission_service.dart';
 import '../../services/storage/history_store.dart';
@@ -43,7 +48,11 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     HistoryStore? history,
     TtsService? tts,
     MockConversationService? mock,
-  })  : permissions = permissions ?? MicPermissionService(),
+    LocalSpeechEngine? localEngine,
+    OfflineModelManager? offlineModels,
+  })  : _localEngine = localEngine,
+        offlineModels = offlineModels ?? sharedOfflineModels,
+        permissions = permissions ?? MicPermissionService(),
         audioCapture = audioCapture ?? AudioCaptureService(),
         history = history ?? HistoryStore(),
         tts = tts ?? TtsService(),
@@ -94,6 +103,15 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   bool get isListening => state == ListeningState.listening;
 
   // ── Session internals ───────────────────────────────────────────────────────
+
+  /// Shared across the controller and Settings (download/manage UI).
+  final OfflineModelManager offlineModels;
+  LocalSpeechEngine? _localEngine;
+  LocalPipeline? _localPipeline;
+
+  /// True while the experimental on-device engine drives this session:
+  /// no WebSocket, no backend, no cloud — audio never leaves the phone.
+  bool _localMode = false;
 
   VadSegmenter? _vad;
   DateTime? _sessionStartedAt;
@@ -150,6 +168,14 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
         return;
     }
 
+    // On-device engine (A/B experiment): no WebSocket, no backend, no cloud
+    // calls, no API keys — the entire pipeline below runs on the phone.
+    _localMode = settings.settings.translationEngine == TranslationEngine.onDevice;
+    if (_localMode) {
+      await _startLocalEngine();
+      return;
+    }
+
     // 2. Connect and open the server session.
     _api.serverUrlOverride = settings.settings.serverUrl;
     final connected = _waitForConnection(const Duration(seconds: 12));
@@ -203,12 +229,104 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     notifyListeners();
   }
 
+  /// Starts the fully on-device pipeline: existing far-field capture + VAD
+  /// (unchanged tuning) → local Whisper → local translator → same chat UI.
+  Future<void> _startLocalEngine() async {
+    final spec = offlineModelForKey(settings.settings.onDeviceModel);
+    if (!await offlineModels.isReady(spec)) {
+      _failStart('Download Offline AI first: Settings → Developer → Offline AI '
+          '(${spec.displayName}, ${spec.sizeLabel} one-time download).');
+      return;
+    }
+
+    final engine = _localEngine ??= WhisperLocalSpeechEngine();
+    try {
+      await engine.load(await offlineModels.pathFor(spec));
+    } catch (_) {
+      _failStart('Could not load the offline model. Try deleting and '
+          're-downloading it in Settings → Developer → Offline AI.');
+      return;
+    }
+
+    final pipeline = LocalPipeline(
+      engine: engine,
+      translator: const PassthroughLocalTranslator(),
+      targetLanguage: settings.settings.targetLanguage,
+      onMessageCreated: (messageId) {
+        _ensureMessage(messageId);
+        notifyListeners();
+      },
+      onMessageResolved: (
+        messageId, {
+        required originalText,
+        required sourceLanguage,
+        required translatedText,
+        required translated,
+      }) {
+        final known = sourceLanguage != 'und';
+        _updateMessage(
+          messageId,
+          (m) => m.copyWith(
+            originalText: originalText.isEmpty ? null : originalText,
+            translatedText: translatedText,
+            status: TranslationStatus.done,
+            sourceLanguage: known ? sourceLanguage : null,
+            languageConfidence: known ? 0.9 : null,
+          ),
+        );
+      },
+      diagnosticsLog: (line) {
+        if (settings.settings.developerDiagnostics) developer.log(line, name: 'local');
+      },
+    );
+    _localPipeline = pipeline;
+
+    // The SAME VAD that powers the cloud path — same far-field thresholds,
+    // pre-roll and hangover — now feeds the local recognizer instead.
+    _lastAudibleAt = DateTime.now();
+    _vad = VadSegmenter(
+      sampleRate: AudioCaptureService.sampleRate,
+      onSegmentStart: pipeline.handleSegmentStart,
+      onAudio: pipeline.handleAudio,
+      onSegmentEnd: (segmentId, durationMs) =>
+          pipeline.handleSegmentEnd(segmentId, durationMs, AudioCaptureService.sampleRate),
+      onLevel: _handleLevel,
+      onDiagnostics: _handleVadDiagnostics,
+    );
+
+    try {
+      await audioCapture.start(
+        onAudio: _handleCapturedAudio,
+        onStopped: _handleCaptureStopped,
+      );
+    } on AudioCaptureUnsupportedException {
+      _failStart('Microphone capture is not available on this platform.');
+      return;
+    } catch (_) {
+      _failStart('Could not start the microphone. It may be in use by another app.');
+      return;
+    }
+
+    _sessionStartedAt = DateTime.now();
+    state = ListeningState.listening;
+    notifyListeners();
+  }
+
   Future<void> stopListening() async {
     if (state == ListeningState.idle) return;
     final startedAt = _sessionStartedAt;
 
     if (_usingMock) {
       mock.stop();
+    } else if (_localMode) {
+      // On-device: stop capture, let the last VAD segment finalize, and wait
+      // for queued local inference so its bubble still resolves.
+      await audioCapture.stop();
+      _vad?.flush();
+      _vad = null;
+      await _localPipeline?.drain();
+      _localPipeline = null;
+      _localMode = false;
     } else {
       // Order matters: capture stops first so not a single extra sample is
       // recorded — or streamed — after the user pressed Stop.
@@ -530,6 +648,9 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   void _handleCapturedAudio(Uint8List pcm) {
     _vad?.addAudio(pcm);
+    // On-device engine: audio NEVER leaves the phone — the VAD above feeds
+    // the local pipeline and nothing is uploaded.
+    if (_localMode) return;
     if (DateTime.now().difference(_lastAudibleAt) < _silencePauseAfter) {
       client.sendStreamAudio(pcm);
       final now = DateTime.now();
@@ -628,6 +749,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     WidgetsBinding.instance.removeObserver(this);
     mock.stop();
     audioCapture.stop();
+    _localEngine?.dispose();
     _eventSubscription?.cancel();
     _connectionSubscription?.cancel();
     client.dispose();

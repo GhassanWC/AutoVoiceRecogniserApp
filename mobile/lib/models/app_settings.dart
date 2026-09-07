@@ -2,6 +2,18 @@ import 'package:flutter/material.dart';
 
 enum AppTextSize { small, medium, large, extraLarge }
 
+/// A/B experiment: cloud pipeline vs fully on-device AI. With [onDevice]
+/// selected there are NO OpenAI calls, NO backend speech API, NO cloud
+/// translation, NO API keys involved — raw audio never leaves the iPhone.
+enum TranslationEngine { openai, onDevice }
+
+extension TranslationEngineLabel on TranslationEngine {
+  String get label => switch (this) {
+        TranslationEngine.openai => 'OpenAI',
+        TranslationEngine.onDevice => 'On-device',
+      };
+}
+
 extension AppTextSizeScale on AppTextSize {
   double get scale => switch (this) {
         AppTextSize.small => 0.9,
@@ -32,6 +44,8 @@ class AppSettings {
     this.serverUrl = '',
     this.mockMode = false,
     this.developerDiagnostics = false,
+    this.translationEngine = TranslationEngine.openai,
+    this.onDeviceModel = 'large-v3-turbo-q5_0',
   });
 
   final String targetLanguage;
@@ -55,6 +69,12 @@ class AppSettings {
   /// Developer mode: log VAD and translation-pipeline diagnostics.
   final bool developerDiagnostics;
 
+  /// A/B experiment: which engine drives live translation.
+  final TranslationEngine translationEngine;
+
+  /// Which offline Whisper model to use (key into the offline model catalog).
+  final String onDeviceModel;
+
   AppSettings copyWith({
     String? targetLanguage,
     bool? showOriginalText,
@@ -68,6 +88,8 @@ class AppSettings {
     String? serverUrl,
     bool? mockMode,
     bool? developerDiagnostics,
+    TranslationEngine? translationEngine,
+    String? onDeviceModel,
   }) {
     return AppSettings(
       targetLanguage: targetLanguage ?? this.targetLanguage,
@@ -82,6 +104,8 @@ class AppSettings {
       serverUrl: serverUrl ?? this.serverUrl,
       mockMode: mockMode ?? this.mockMode,
       developerDiagnostics: developerDiagnostics ?? this.developerDiagnostics,
+      translationEngine: translationEngine ?? this.translationEngine,
+      onDeviceModel: onDeviceModel ?? this.onDeviceModel,
     );
   }
 
@@ -98,6 +122,8 @@ class AppSettings {
         'serverUrl': serverUrl,
         'mockMode': mockMode,
         'developerDiagnostics': developerDiagnostics,
+        'translationEngine': translationEngine.name,
+        'onDeviceModel': onDeviceModel,
       };
 
   factory AppSettings.fromJson(Map<String, dynamic> json) => AppSettings(
@@ -113,5 +139,8 @@ class AppSettings {
         serverUrl: json['serverUrl'] as String? ?? '',
         mockMode: json['mockMode'] as bool? ?? false,
         developerDiagnostics: json['developerDiagnostics'] as bool? ?? false,
+        translationEngine: TranslationEngine.values.asNameMap()[json['translationEngine']] ??
+            TranslationEngine.openai,
+        onDeviceModel: json['onDeviceModel'] as String? ?? 'large-v3-turbo-q5_0',
       );
 }

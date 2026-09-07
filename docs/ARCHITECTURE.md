@@ -1,5 +1,9 @@
 # Architecture
 
+> **Experimental on-device engine**: a fully offline Whisper-based pipeline
+> can be selected in Settings → Developer → Translation Engine (A/B against
+> the cloud pipeline below). See docs/ONDEVICE.md.
+
 ## The pipeline
 
 ```text

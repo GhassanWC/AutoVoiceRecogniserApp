@@ -33,6 +33,43 @@ import UIKit
       name: "app.livetranslator/audio_events", binaryMessenger: messenger)
     events.setStreamHandler(audioCapture)
 
+    // Thermal/battery/memory snapshots for on-device AI instrumentation.
+    let stats = FlutterMethodChannel(
+      name: "app.livetranslator/devicestats", binaryMessenger: messenger)
+    stats.setMethodCallHandler { call, result in
+      guard call.method == "getStats" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      let thermal: String
+      switch ProcessInfo.processInfo.thermalState {
+      case .nominal: thermal = "nominal"
+      case .fair: thermal = "fair"
+      case .serious: thermal = "serious"
+      case .critical: thermal = "critical"
+      @unknown default: thermal = "unknown"
+      }
+      UIDevice.current.isBatteryMonitoringEnabled = true
+      let battery = UIDevice.current.batteryLevel
+      var memoryMb = -1
+      var info = task_vm_info_data_t()
+      var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+      let kerr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+          task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+      }
+      if kerr == KERN_SUCCESS {
+        memoryMb = Int(info.phys_footprint / (1024 * 1024))
+      }
+      result([
+        "thermalState": thermal,
+        "batteryPercent": battery < 0 ? -1 : Int(battery * 100),
+        "memoryFootprintMb": memoryMb,
+      ])
+    }
+
     control.setMethodCallHandler { [weak self] call, result in
       guard let self else { return }
       switch call.method {
