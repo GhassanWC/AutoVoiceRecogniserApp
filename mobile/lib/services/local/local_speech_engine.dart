@@ -1,6 +1,4 @@
-import 'dart:typed_data';
-
-import 'package:whisper_cpp_flutter_plus/whisper_cpp_flutter_plus.dart';
+import 'package:flutter/services.dart';
 
 import 'local_language_detect.dart';
 
@@ -13,9 +11,11 @@ class LocalTranscript {
   final String language;
 }
 
-/// Abstract so the pipeline and tests never touch the native plugin directly.
+/// Abstract so the pipeline and tests never touch the native bridge directly.
 abstract class LocalSpeechEngine {
-  Future<void> load(String modelPath);
+  /// [model] is the engine's model identifier — for WhisperKit, the Core ML
+  /// variant name (downloaded + cached natively on first load).
+  Future<void> load(String model);
   bool get isLoaded;
 
   /// Transcribes one PCM16LE mono 16 kHz utterance. Language is auto-detected
@@ -25,51 +25,57 @@ abstract class LocalSpeechEngine {
   Future<void> dispose();
 }
 
-/// whisper.cpp via the whisper_cpp_flutter_plus plugin (MIT; models are the
-/// user-downloaded multilingual ggml weights — NEVER .en variants).
+/// WhisperKit (Swift-native, Core ML, MIT) through the
+/// `app.livetranslator/whisperkit` MethodChannel in AppDelegate.swift.
 ///
-/// This is the ONLY file that touches the plugin API, so a plugin upgrade or
-/// API drift is contained here.
-class WhisperLocalSpeechEngine implements LocalSpeechEngine {
-  WhisperEngine? _engine;
+/// This replaced the whisper.cpp FFI plugin after its native model loader
+/// crashed the process on real iPhones (uncaught C++ exceptions across the
+/// FFI boundary → SIGABRT). A Swift bridge fails as a catchable
+/// PlatformException instead — the app can never be killed by a load again.
+///
+/// This is the ONLY file that touches the bridge API, so any change to the
+/// native side is contained here.
+class WhisperKitSpeechEngine implements LocalSpeechEngine {
+  static const MethodChannel _channel =
+      MethodChannel('app.livetranslator/whisperkit');
 
-  /// whisper.cpp build identification, for load-failure diagnostics.
-  static String get nativeVersion => WhisperEngine.version;
-  static String get nativeSystemInfo => WhisperEngine.systemInfo;
+  bool _loaded = false;
 
   @override
-  bool get isLoaded => _engine != null;
+  bool get isLoaded => _loaded;
 
+  /// Loads (and on first use downloads) the WhisperKit model [model]
+  /// (a variant name from the catalog, e.g. "openai_whisper-small").
   @override
-  Future<void> load(String modelPath) async {
-    if (_engine != null) return;
-    _engine = await WhisperEngine.load(modelPath);
+  Future<void> load(String model) async {
+    if (_loaded) return;
+    try {
+      await _channel.invokeMethod<Map<Object?, Object?>>(
+        'load',
+        {'variant': model},
+      );
+      _loaded = true;
+    } on MissingPluginException {
+      throw StateError(
+          'On-device recognition is only available on iOS in this build.');
+    }
   }
 
   @override
   Future<LocalTranscript> transcribe(Uint8List pcm16, int sampleRate) async {
-    final engine = _engine;
-    if (engine == null) {
-      throw StateError('Whisper model not loaded');
+    if (!_loaded) {
+      throw StateError('WhisperKit model not loaded');
     }
-    // PCM16LE → normalized float samples, as whisper.cpp expects.
-    final data = ByteData.sublistView(pcm16);
-    final samples = Float32List(pcm16.length ~/ 2);
-    for (var i = 0; i < samples.length; i++) {
-      samples[i] = data.getInt16(i * 2, Endian.little) / 32768.0;
-    }
-
-    final task = engine.transcribe(
-      samples,
-      options: const TranscribeOptions(language: 'auto'),
+    final reply = await _channel.invokeMethod<Map<Object?, Object?>>(
+      'transcribe',
+      {'pcm16': pcm16, 'sampleRate': sampleRate},
     );
-    final result = await task.result;
-    final text = result.text.trim();
+    final text = (reply?['text'] as String? ?? '').trim();
 
-    // Whisper reports the detected language; script analysis backs it up
+    // WhisperKit reports the detected language; script analysis backs it up
     // (and can only ever refine unique-script text, e.g. Urdu vs Arabic).
     String language = 'und';
-    final reported = result.language.toLowerCase();
+    final reported = (reply?['language'] as String? ?? '').toLowerCase();
     if (reported.length >= 2 && reported != 'auto') {
       language = reported.substring(0, 2);
     }
@@ -81,7 +87,11 @@ class WhisperLocalSpeechEngine implements LocalSpeechEngine {
 
   @override
   Future<void> dispose() async {
-    _engine?.dispose();
-    _engine = null;
+    _loaded = false;
+    try {
+      await _channel.invokeMethod<void>('unload');
+    } on MissingPluginException {
+      // Non-iOS platform — nothing was loaded natively.
+    }
   }
 }

@@ -1,9 +1,2 @@
 #include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"
 #include "Generated.xcconfig"
-
-// FFI guarantee for the on-device Whisper bridge: -u makes the linker REQUIRE
-// these wf_* symbols at build time (pulling the bridge object into the link
-// if it is static, or binding against the dynamic framework's exports). If
-// they ever go missing again, the build fails at link — never on TestFlight
-// with "Failed to lookup symbol 'wf_context_create'".
-OTHER_LDFLAGS = $(inherited) -Wl,-u,_wf_context_create -Wl,-u,_wf_version -Wl,-u,_wf_system_info

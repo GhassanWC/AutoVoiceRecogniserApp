@@ -1,13 +1,8 @@
-# Committed deliberately (previously auto-generated at build time): the
-# whisper_cpp_flutter_plus FFI bridge resolves its wf_* C symbols through
-# dlsym(RTLD_DEFAULT, …), which only works reliably when the plugin is built
-# as a DYNAMIC framework whose export table carries those symbols. Static
-# linkage (SPM's default, or :linkage => :static) lets the linker drop the
-# unreferenced bridge object from the Release archive → "Failed to lookup
-# symbol 'wf_context_create'" at runtime. use_frameworks! below keeps plugin
-# pods dynamic; the -u linker pins in Flutter/*.xcconfig turn any regression
-# into a LINK-TIME failure instead of a TestFlight runtime failure.
-platform :ios, '15.0'
+# Committed deliberately (previously auto-generated at build time) so the
+# permission_handler macro below survives every pod install. iOS 16 is the
+# floor because on-device speech uses the WhisperKit SPM package (added to
+# the Runner Xcode project), which requires it.
+platform :ios, '16.0'
 
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 

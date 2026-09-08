@@ -12,11 +12,10 @@ import '../../models/ws_events.dart';
 import '../../services/audio/audio_capture_service.dart';
 import '../../services/audio/vad_segmenter.dart';
 import '../../services/auth/api_client.dart';
-import '../../services/local/local_model_doctor.dart';
 import '../../services/local/local_pipeline.dart';
 import '../../services/local/local_speech_engine.dart';
 import '../../services/local/local_translation_engine.dart';
-import '../../services/local/offline_model_manager.dart';
+import '../../services/local/whisperkit_models.dart';
 import '../../services/mock/mock_conversation_service.dart';
 import '../../services/permissions/mic_permission_service.dart';
 import '../../services/storage/history_store.dart';
@@ -50,9 +49,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     TtsService? tts,
     MockConversationService? mock,
     LocalSpeechEngine? localEngine,
-    OfflineModelManager? offlineModels,
   })  : _localEngine = localEngine,
-        offlineModels = offlineModels ?? sharedOfflineModels,
         permissions = permissions ?? MicPermissionService(),
         audioCapture = audioCapture ?? AudioCaptureService(),
         history = history ?? HistoryStore(),
@@ -105,8 +102,6 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   // ── Session internals ───────────────────────────────────────────────────────
 
-  /// Shared across the controller and Settings (download/manage UI).
-  final OfflineModelManager offlineModels;
   LocalSpeechEngine? _localEngine;
   LocalPipeline? _localPipeline;
 
@@ -231,51 +226,32 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   }
 
   /// Starts the fully on-device pipeline: existing far-field capture + VAD
-  /// (unchanged tuning) → local Whisper → local translator → same chat UI.
+  /// (unchanged tuning) → WhisperKit (Core ML) → local translator → same
+  /// chat UI. WhisperKit downloads the model itself on first load; a Swift
+  /// failure surfaces as a catchable PlatformException, never a process kill.
   Future<void> _startLocalEngine() async {
-    final spec = offlineModelForKey(settings.settings.onDeviceModel);
-    if (!await offlineModels.isReady(spec)) {
-      _failStart('Download Offline AI first: Settings → Developer → Offline AI '
-          '(${spec.displayName}, ${spec.sizeLabel} one-time download).');
-      return;
-    }
-
-    // Precheck + [WHISPER LOAD] logging on EVERY start: existence, exact
-    // size, fresh SHA-256, readability and ggml magic — right before the
-    // native load, with the model untouched in Application Support.
-    final precheck = await whisperPreloadChecks(spec: spec, manager: offlineModels);
-    if (!precheck.ok) {
-      _failStart('Offline model failed verification '
-          '(${precheck.failureSummary.isEmpty ? 'see [WHISPER LOAD] log' : precheck.failureSummary}). '
-          'Delete and re-download it in Settings → Developer.');
-      return;
-    }
-
-    final engine = _localEngine ??= WhisperLocalSpeechEngine();
+    final spec = whisperKitModelForKey(settings.settings.onDeviceModel);
+    final engine = _localEngine ??= WhisperKitSpeechEngine();
     try {
-      // Sentinel around every native FFI call: if the process dies in there
-      // (SIGABRT/SIGSEGV/jetsam), the next run reports the crash evidence.
-      await markNativeLoadAttempt(
-          manager: offlineModels, spec: spec, phase: 'start_listening_native_load');
+      developer.log('[WHISPERKIT LOAD] variant=${spec.variant}', name: 'whisperkit');
+      final started = DateTime.now();
+      await engine.load(spec.variant);
       developer.log(
-        '[WHISPER LOAD] version=${WhisperLocalSpeechEngine.nativeVersion} '
-        'systemInfo=${WhisperLocalSpeechEngine.nativeSystemInfo}',
-        name: 'whisper',
+        '[WHISPERKIT LOAD] PASS '
+        '(${DateTime.now().difference(started).inMilliseconds}ms)',
+        name: 'whisperkit',
       );
-      await engine.load(precheck.modelPath);
-      await clearNativeLoadAttempt(manager: offlineModels, spec: spec);
     } catch (error, stack) {
-      await clearNativeLoadAttempt(manager: offlineModels, spec: spec);
       // The ACTUAL native failure, never just a generic message.
       developer.log(
-        '[WHISPER LOAD ERROR] type=${error.runtimeType} message=$error '
+        '[WHISPERKIT LOAD ERROR] type=${error.runtimeType} message=$error '
         'stack=${stack.toString().split('\n').take(10).join(' | ')}',
-        name: 'whisper',
+        name: 'whisperkit',
       );
-      _failStart('Could not load the offline model — '
+      _failStart('Could not load the on-device model — '
           '${error.runtimeType}: $error. '
-          'Run Settings → Developer → Test Offline Model for full diagnostics '
-          '(try the small-q5_1 baseline model first).');
+          'Run Settings → Developer → Test WhisperKit for full diagnostics '
+          '(first use needs a one-time ${spec.sizeLabel} download on Wi-Fi).');
       return;
     }
 

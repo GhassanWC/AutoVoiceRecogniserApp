@@ -8,34 +8,49 @@ raw audio never leaves the iPhone.
 ```text
 iPhone environmental microphone (UNCHANGED far-field capture + adaptive VAD)
     ↓ per utterance, PCM16 in RAM only
-local Whisper (whisper.cpp via whisper_cpp_flutter_plus, multilingual ggml,
-               language auto-detected per utterance + script-analysis backup)
+    ↓ MethodChannel app.livetranslator/whisperkit (Swift bridge in AppDelegate)
+WhisperKit (Swift-native, Core ML, MIT — multilingual variants only,
+            language auto-detected per utterance + script-analysis backup)
     ↓ transcript + ISO 639-1 code  →  "Speaker · Thai 🇹🇭" etc.
 local translator (Phase A: passthrough; Phase B: M2M100)
     ↓
 the SAME chat-bubble flow as the cloud engine (same messageId updates)
 ```
 
+> **History**: Phase A originally used whisper.cpp via the
+> `whisper_cpp_flutter_plus` FFI plugin. Its native model loader crashed the
+> whole process on real iPhones (uncaught C++ exceptions across the FFI
+> boundary → SIGABRT — see `IOS-LOCAL-STT-TRIAGE.md`), so the decision gate
+> replaced it with WhisperKit. There is NO Dart FFI in the speech path
+> anymore; a Swift failure surfaces as a catchable PlatformException. The
+> old ggml downloads are auto-deleted once at app start
+> (`legacy_model_cleanup.dart`).
+
 ## Model download (App Store binary stays small)
 
-Models are fetched once on demand into Application Support/offline_models,
-SHA-256-verified, deletable/re-downloadable (Settings → Developer → Offline
-AI). Catalog (multilingual only — never `.en`):
+WhisperKit downloads + caches Core ML models itself on first load, from
+huggingface.co/argmaxinc/whisperkit-coreml — no manual download manager and
+no checksums to pin. Catalog in `whisperkit_models.dart` (multilingual only —
+never `.en`; the settings keys are unchanged so stored choices survive):
 
-| Key | File | Size | Notes |
+| Key | WhisperKit variant | Size | Notes |
 |---|---|---|---|
-| `large-v3-turbo-q5_0` | ggml-large-v3-turbo-q5_0.bin | 547 MB | best accuracy; heavier thermals |
-| `small-q5_1` | ggml-small-q5_1.bin | 181 MB | fallback if the phone runs hot |
+| `large-v3-turbo-q5_0` | openai_whisper-large-v3-v20240930_626MB | ~626 MB | best accuracy |
+| `small-q5_1` | openai_whisper-small | ~500 MB | lighter/cooler fallback |
 
-Checksums are pinned in `offline_model_manager.dart` from
-huggingface.co/ggerganov/whisper.cpp.
+The WhisperKit SPM package (argmaxinc/WhisperKit, pinned 1.1.0) is a Runner
+Xcode project dependency; it raised the iOS floor to 16.0.
 
 ## Phase A — validate local Whisper on a real iPhone (current state)
 
 Wired end-to-end and unit-tested; **not yet validated on hardware** — that
 is the point of the next TestFlight run:
 
-1. Settings → Developer → Translation Engine → On-device; download the model.
+0. Settings → Developer → **Test WhisperKit**: init + model load (timed,
+   first run downloads on Wi-Fi), then speak a short phrase → transcript +
+   language must appear. Run this before anything else.
+1. Settings → Developer → Translation Engine → On-device (first Start
+   Listening loads — and if needed downloads — the model).
 2. Enable Diagnostics Logging; enable airplane mode after the download.
 3. Speak / play YouTube per language: English, Arabic, Thai, Bengali, Hindi —
    each bubble must show the correct transcript and language flag.

@@ -1,6 +1,7 @@
 import AVFoundation
 import Flutter
 import UIKit
+import WhisperKit
 
 /// Native microphone capture for Live Translator.
 ///
@@ -12,6 +13,7 @@ import UIKit
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private let audioCapture = AudioCaptureManager()
+  private let whisperKitBridge = WhisperKitBridge()
 
   override func application(
     _ application: UIApplication,
@@ -32,6 +34,15 @@ import UIKit
     let events = FlutterEventChannel(
       name: "app.livetranslator/audio_events", binaryMessenger: messenger)
     events.setStreamHandler(audioCapture)
+
+    // On-device speech recognition (Phase A): WhisperKit behind one small
+    // MethodChannel. Replaces the whisper.cpp FFI plugin, whose native
+    // loader could abort the whole process.
+    let whisperKit = FlutterMethodChannel(
+      name: "app.livetranslator/whisperkit", binaryMessenger: messenger)
+    whisperKit.setMethodCallHandler { [weak self] call, result in
+      self?.whisperKitBridge.handle(call, result: result)
+    }
 
     // Thermal/battery/memory snapshots for on-device AI instrumentation.
     let stats = FlutterMethodChannel(
@@ -134,6 +145,126 @@ import UIKit
       "audioSessionActive": audioCapture.isRunning,
       "inputAvailable": session.isInputAvailable,
     ]
+  }
+}
+
+/// WhisperKit (Core ML, Swift-native) behind one MethodChannel:
+///
+///   Flutter → load(variant) / transcribe(pcm16) / unload → WhisperKit
+///           ← {text, language} per utterance
+///
+/// The Flutter side keeps ALL capture/VAD behavior; this bridge only ever
+/// receives finished 16 kHz mono PCM16 utterances and returns the transcript
+/// with the language Whisper detected. Models download from
+/// huggingface.co/argmaxinc/whisperkit-coreml on first load and are cached
+/// by WhisperKit locally.
+final class WhisperKitBridge {
+  private var pipe: WhisperKit?
+  private var variant: String?
+  private var loading = false
+
+  func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "load":
+      load(call, result: result)
+    case "transcribe":
+      transcribe(call, result: result)
+    case "unload":
+      pipe = nil
+      variant = nil
+      result(nil)
+    case "isLoaded":
+      result(pipe == nil ? nil : variant)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private func load(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let requested = (call.arguments as? [String: Any])?["variant"] as? String else {
+      result(FlutterError(code: "bad_args", message: "variant is required", details: nil))
+      return
+    }
+    if pipe != nil, variant == requested {
+      result(["initMs": 0, "alreadyLoaded": true, "variant": requested])
+      return
+    }
+    if loading {
+      result(FlutterError(code: "busy", message: "a model load is already in progress", details: nil))
+      return
+    }
+    loading = true
+    pipe = nil
+    variant = nil
+    let started = Date()
+    Task { [weak self] in
+      do {
+        // download:true fetches the Core ML model on first use (Wi-Fi sized:
+        // hundreds of MB); later loads come from WhisperKit's local cache.
+        let config = WhisperKitConfig(
+          model: requested, prewarm: true, load: true, download: true)
+        let loaded = try await WhisperKit(config)
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        await MainActor.run {
+          guard let self else { return }
+          self.pipe = loaded
+          self.variant = requested
+          self.loading = false
+          result(["initMs": ms, "alreadyLoaded": false, "variant": requested])
+        }
+      } catch {
+        await MainActor.run {
+          self?.loading = false
+          result(FlutterError(
+            code: "whisperkit_load_failed", message: "\(error)", details: nil))
+        }
+      }
+    }
+  }
+
+  private func transcribe(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let pipe else {
+      result(FlutterError(code: "not_loaded", message: "load a model first", details: nil))
+      return
+    }
+    guard let data = ((call.arguments as? [String: Any])?["pcm16"]
+      as? FlutterStandardTypedData)?.data, !data.isEmpty else {
+      result(FlutterError(code: "bad_args", message: "pcm16 audio is required", details: nil))
+      return
+    }
+    // PCM16LE mono 16 kHz → normalized Float samples, as WhisperKit expects.
+    let count = data.count / 2
+    var samples = [Float](repeating: 0, count: count)
+    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+      let int16 = raw.bindMemory(to: Int16.self)
+      for i in 0..<count {
+        samples[i] = Float(Int16(littleEndian: int16[i])) / 32768.0
+      }
+    }
+    Task {
+      do {
+        // Language is auto-detected PER UTTERANCE — never configured; the
+        // room may switch between languages freely (product rule).
+        let options = DecodingOptions(
+          task: .transcribe,
+          language: nil,
+          usePrefillPrompt: true,
+          detectLanguage: true,
+          skipSpecialTokens: true)
+        let results = try await pipe.transcribe(audioArray: samples, decodeOptions: options)
+        let text = results.map(\.text).joined(separator: " ")
+          .trimmingCharacters(in: .whitespacesAndNewlines)
+        let language = results.first?.language ?? "und"
+        await MainActor.run {
+          result(["text": text, "language": language])
+        }
+      } catch {
+        await MainActor.run {
+          result(FlutterError(
+            code: "whisperkit_transcribe_failed", message: "\(error)", details: nil))
+        }
+      }
+    }
   }
 }
 

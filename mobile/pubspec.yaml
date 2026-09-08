@@ -18,10 +18,10 @@ dependencies:
   intl: ^0.19.0
   flutter_tts: ^4.0.2
   google_fonts: ^6.2.1
-  # Experimental on-device engine (whisper.cpp) + offline model management.
-  whisper_cpp_flutter_plus: ^0.4.1
+  # On-device speech uses WhisperKit natively on iOS (SPM package in the
+  # Runner Xcode project) — no Dart FFI engine anymore. path_provider stays
+  # for the one-shot legacy ggml model cleanup.
   path_provider: ^2.1.4
-  crypto: ^3.0.5
 
 dev_dependencies:
   flutter_test:

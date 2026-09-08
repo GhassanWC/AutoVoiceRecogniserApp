@@ -3,6 +3,18 @@
 Status: 2026-09-08. Phase B is frozen until the acceptance gate below passes
 on TestFlight. The cloud/OpenAI engine is untouched.
 
+> **DECISION GATE OUTCOME (2026-09-08, later the same day):** Test Offline
+> Model still crashed the app on a real iPhone after the linking fix → the
+> gate FAILED. `whisper_cpp_flutter_plus` is removed from the project
+> entirely (pubspec, Podfile workarounds, `-u wf_*` linker pins, CI symbol
+> gate) and the WhisperKit replacement plan below was executed: WhisperKit
+> 1.1.0 via SPM in the Runner project, bridged in `AppDelegate.swift`
+> (`app.livetranslator/whisperkit`), consumed by `WhisperKitSpeechEngine`
+> behind the unchanged `LocalSpeechEngine` abstraction. iOS floor raised to
+> 16.0. Diagnostics: Settings → Developer → **Test WhisperKit**. See
+> `ONDEVICE.md` for the current architecture; the analysis below is kept as
+> the historical record.
+
 ---
 
 ## Failure 1 — "microphone access denied" while iOS Settings shows GRANTED

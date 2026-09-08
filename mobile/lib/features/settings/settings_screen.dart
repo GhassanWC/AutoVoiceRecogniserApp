@@ -4,10 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/app_settings.dart';
-import '../../services/local/local_model_doctor.dart';
+import '../../services/local/whisperkit_doctor.dart';
+import '../../services/local/whisperkit_models.dart';
 import '../../services/permissions/mic_diagnostics.dart';
-import '../../services/local/local_speech_engine.dart';
-import '../../services/local/offline_model_manager.dart';
 import '../../services/storage/history_store.dart';
 import '../../services/storage/settings_store.dart';
 import '../../utils/languages.dart';
@@ -149,16 +148,15 @@ class SettingsScreen extends StatelessWidget {
           if (settings.translationEngine == TranslationEngine.onDevice) ...[
             ListTile(
               leading: const Icon(Icons.memory_outlined),
-              title: const Text('Offline Whisper Model'),
-              subtitle: Text(offlineModelForKey(settings.onDeviceModel).displayName),
+              title: const Text('On-device Whisper Model'),
+              subtitle: Text(whisperKitModelForKey(settings.onDeviceModel).displayName),
               onTap: () => _pickOfflineModel(context, controller),
             ),
-            _OfflineModelsTile(modelKey: settings.onDeviceModel),
             ListTile(
               leading: const Icon(Icons.rule_outlined),
-              title: const Text('Test Offline Model'),
-              subtitle: const Text('Load the selected model without the microphone'),
-              onTap: () => _testOfflineModel(context, settings.onDeviceModel),
+              title: const Text('Test WhisperKit'),
+              subtitle: const Text('Init + load model, then transcribe a short spoken phrase'),
+              onTap: () => _testWhisperKit(context, settings.onDeviceModel),
             ),
           ],
           const SizedBox(height: 24),
@@ -209,9 +207,9 @@ class SettingsScreen extends StatelessWidget {
     );
   }
 
-  /// Loads the selected model in isolation and shows "Model load: PASS" or
-  /// the exact filesystem/native failure — the microphone is never started.
-  Future<void> _testOfflineModel(BuildContext context, String modelKey) async {
+  /// End-to-end WhisperKit proof: init + load/download the selected model
+  /// (timed), capture a short spoken phrase, and show transcript + language.
+  Future<void> _testWhisperKit(BuildContext context, String modelKey) async {
     final navigator = Navigator.of(context);
     unawaited(showDialog<void>(
       context: context,
@@ -221,24 +219,24 @@ class SettingsScreen extends StatelessWidget {
           children: [
             CircularProgressIndicator(),
             SizedBox(width: 16),
-            Expanded(child: Text('Verifying + loading model…\n(SHA-256 of a large file takes a moment)')),
+            Expanded(
+              child: Text('Loading WhisperKit…\nFirst use downloads the model '
+                  '(hundreds of MB — keep the app open, use Wi-Fi).\n\n'
+                  'Then SPEAK A SHORT PHRASE when asked.'),
+            ),
           ],
         ),
       ),
     ));
 
-    final report = await runModelLoadTest(
-      spec: offlineModelForKey(modelKey),
-      manager: sharedOfflineModels,
-      engineFactory: WhisperLocalSpeechEngine.new,
-    );
+    final report = await runWhisperKitTest(modelKey: modelKey);
 
     navigator.pop(); // close the progress dialog
     if (!context.mounted) return;
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text(report.passed ? 'Model load: PASS' : 'Model load: FAILED'),
+        title: Text(report.passed ? 'WhisperKit: PASS' : 'WhisperKit: FAILED'),
         content: SingleChildScrollView(
           child: SelectableText(
             report.details,
@@ -285,9 +283,9 @@ class SettingsScreen extends StatelessWidget {
     showDialog<void>(
       context: context,
       builder: (dialogContext) => SimpleDialog(
-        title: const Text('Offline Whisper Model'),
+        title: const Text('On-device Whisper Model'),
         children: [
-          for (final spec in kOfflineModelCatalog)
+          for (final spec in kWhisperKitModelCatalog)
             ListTile(
               title: Text('${spec.displayName} (${spec.sizeLabel})'),
               subtitle: Text(spec.notes),
@@ -407,99 +405,6 @@ class SettingsScreen extends StatelessWidget {
     );
     if (result != null) {
       await controller.update((s) => s.copyWith(serverUrl: result));
-    }
-  }
-}
-
-/// Download / manage the Offline AI models: shows size before downloading,
-/// progress while downloading, verification, storage used when ready, and a
-/// delete/re-download action. Models are fetched once, never bundled in the
-/// App Store binary.
-class _OfflineModelsTile extends StatefulWidget {
-  const _OfflineModelsTile({required this.modelKey});
-
-  final String modelKey;
-
-  @override
-  State<_OfflineModelsTile> createState() => _OfflineModelsTileState();
-}
-
-class _OfflineModelsTileState extends State<_OfflineModelsTile> {
-  final OfflineModelManager _manager = sharedOfflineModels;
-
-  @override
-  void initState() {
-    super.initState();
-    _manager.addListener(_onChanged);
-    _refresh();
-  }
-
-  @override
-  void didUpdateWidget(covariant _OfflineModelsTile oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.modelKey != widget.modelKey) _refresh();
-  }
-
-  void _refresh() {
-    _manager.isReady(offlineModelForKey(widget.modelKey));
-  }
-
-  void _onChanged() {
-    if (mounted) setState(() {});
-  }
-
-  @override
-  void dispose() {
-    _manager.removeListener(_onChanged);
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final spec = offlineModelForKey(widget.modelKey);
-    switch (_manager.state) {
-      case OfflineModelState.downloading:
-        return ListTile(
-          leading: const Icon(Icons.downloading_outlined),
-          title: Text('Downloading… ${(_manager.progress * 100).toStringAsFixed(0)}%'),
-          subtitle: LinearProgressIndicator(value: _manager.progress),
-        );
-      case OfflineModelState.verifying:
-        return const ListTile(
-          leading: Icon(Icons.verified_outlined),
-          title: Text('Verifying download…'),
-          subtitle: LinearProgressIndicator(),
-        );
-      case OfflineModelState.ready:
-        return ListTile(
-          leading: const Icon(Icons.offline_pin_outlined),
-          title: const Text('Offline AI ready'),
-          subtitle: Text('Storage used: ${formatBytes(_manager.storageUsedBytes)}'),
-          trailing: IconButton(
-            icon: const Icon(Icons.delete_outline),
-            tooltip: 'Delete model (re-download any time)',
-            onPressed: () => _manager.delete(spec),
-          ),
-        );
-      case OfflineModelState.failed:
-        return ListTile(
-          leading: Icon(Icons.error_outline, color: Theme.of(context).colorScheme.error),
-          title: Text(_manager.errorMessage ?? 'Download failed'),
-          trailing: TextButton(
-            onPressed: () => _manager.download(spec),
-            child: const Text('Retry'),
-          ),
-        );
-      case OfflineModelState.notDownloaded:
-        return ListTile(
-          leading: const Icon(Icons.cloud_download_outlined),
-          title: const Text('Download Offline AI'),
-          subtitle: Text('${spec.displayName} — one-time ${spec.sizeLabel} download'),
-          trailing: TextButton(
-            onPressed: () => _manager.download(spec),
-            child: const Text('Download'),
-          ),
-        );
     }
   }
 }
