@@ -19,6 +19,12 @@ workflows:
     scripts:
       - name: Get Flutter packages
         script: |
+          # Deterministic native integration: ALWAYS CocoaPods (dynamic
+          # frameworks via the committed ios/Podfile), never SPM's static
+          # auto-selection — static linkage dropped the whisper FFI bridge
+          # symbols from the Release archive ("Failed to lookup symbol
+          # 'wf_context_create'" on TestFlight).
+          flutter config --no-enable-swift-package-manager
           flutter pub get
 
       - name: Install CocoaPods
@@ -59,6 +65,58 @@ workflows:
             --build-name=1.0.0 \
             --build-number=11 \
             --export-options-plist=/Users/builder/export_options.plist
+
+      - name: Verify whisper FFI symbols in Release archive (build gate)
+        script: |
+          #!/bin/bash
+          # Proof from the ACTUAL Release archive that the wf_* FFI bridge
+          # symbols are present and dlsym-resolvable. Fails the build if
+          # wf_context_create is missing anywhere — a build that would only
+          # fail later at runtime on TestFlight must never ship.
+          set -e
+          ARCHIVE=$(find build/ios/archive -name "*.xcarchive" -type d | head -n 1)
+          if [ -z "$ARCHIVE" ]; then
+            echo "[IOS FFI] ERROR: no .xcarchive found under build/ios/archive"
+            exit 1
+          fi
+          APP="$ARCHIVE/Products/Applications/Runner.app"
+          echo "[IOS FFI] inspecting $APP"
+
+          symbol_in_binary() { # $1=binary $2=symbol
+            nm -gU "$1" 2>/dev/null | grep -q "_$2\$" && return 0
+            # Stripped executables keep exports only in the dyld export trie.
+            dyld_info -exports "$1" 2>/dev/null | grep -q "_$2\$" && return 0
+            return 1
+          }
+
+          BINARIES=("$APP/Runner")
+          for FW in "$APP"/Frameworks/*.framework; do
+            [ -d "$FW" ] || continue
+            NAME=$(basename "$FW" .framework)
+            [ -f "$FW/$NAME" ] && BINARIES+=("$FW/$NAME")
+          done
+
+          GATE_OK=0
+          for SYM in wf_context_create wf_version wf_system_info; do
+            SYM_FOUND=0
+            for BIN in "${BINARIES[@]}"; do
+              if symbol_in_binary "$BIN" "$SYM"; then
+                echo "[IOS FFI] symbol $SYM FOUND in ${BIN#$APP/}"
+                SYM_FOUND=1
+              fi
+            done
+            if [ "$SYM_FOUND" -eq 0 ]; then
+              echo "[IOS FFI] symbol $SYM NOT FOUND in any app binary"
+              [ "$SYM" = "wf_context_create" ] && GATE_OK=1
+            fi
+          done
+
+          if [ "$GATE_OK" -ne 0 ]; then
+            echo "[IOS FFI] BUILD GATE FAILED: wf_context_create is not exported"
+            echo "[IOS FFI] dlsym(RTLD_DEFAULT, wf_context_create) would fail at runtime."
+            exit 1
+          fi
+          echo "[IOS FFI] BUILD GATE PASSED"
 
     artifacts:
       - build/ios/ipa/*.ipa
