@@ -19,11 +19,12 @@ class WhisperKitTestReport {
 
 /// Settings → Developer → Test WhisperKit.
 ///
-/// End-to-end proof of the Phase A chain on THIS device, with the real
-/// engine and the real microphone: initialize WhisperKit, load/download the
-/// selected Core ML model (timed), capture a short spoken phrase through the
-/// same native pipeline Start Listening uses, transcribe it, and report the
-/// transcript plus the detected language code.
+/// This diagnostic answers exactly one question: can WhisperKit load and
+/// transcribe using the model ALREADY STORED INSIDE THE APP? Zero network:
+/// 1. Bundled model found: YES/NO (checks Bundle.main, listing any missing piece)
+/// 2. Model load: PASS (download:false, hard 30 s native timeout)
+/// 3. Speak now… (capture through the same native pipeline Start Listening uses)
+/// 4. Transcript + Language from the spoken phrase.
 Future<WhisperKitTestReport> runWhisperKitTest({
   required String modelKey,
   LocalSpeechEngine? engine,
@@ -31,6 +32,7 @@ Future<WhisperKitTestReport> runWhisperKitTest({
   AudioCaptureService? capture,
   Duration speakFor = const Duration(seconds: 4),
 }) async {
+  const channel = MethodChannel('app.livetranslator/whisperkit');
   final spec = whisperKitModelForKey(modelKey);
   final lines = <String>[];
   void log(String line) {
@@ -43,27 +45,43 @@ Future<WhisperKitTestReport> runWhisperKitTest({
     return WhisperKitTestReport(passed: false, details: lines.join('\n'));
   }
 
-  log('[WHISPERKIT TEST]');
-  log('model=${spec.displayName}');
+  log('[WHISPERKIT TEST — bundled model, zero network]');
   log('variant=${spec.variant}');
 
-  // 1. Init + model load (downloads on first use — keep the app open).
+  // 1. Is the CI-bundled model actually inside this build?
+  try {
+    final info = await channel.invokeMethod<Map<Object?, Object?>>(
+      'bundledModel',
+      {'variant': spec.variant},
+    );
+    final found = info?['found'] == true;
+    log('Bundled model found: ${found ? 'YES' : 'NO'}');
+    if (!found) {
+      final pieces = (info?['pieces'] as Map<Object?, Object?>? ?? {});
+      for (final entry in pieces.entries) {
+        log('  ${entry.value == true ? 'ok     ' : 'MISSING'} ${entry.key}');
+      }
+      return fail('This build was made without the CI model-bundling step — '
+          'nothing is downloaded at runtime, so WhisperKit cannot load.');
+    }
+  } on MissingPluginException {
+    return fail('Bundled model found: NO — this platform has no WhisperKit '
+        'bridge (iOS only).');
+  }
+
+  // 2. Model load, strictly from the bundle (native 30 s hard timeout).
   final testEngine = engine ?? WhisperKitSpeechEngine();
   final loadStarted = DateTime.now();
   try {
     await testEngine.load(spec.variant);
   } on PlatformException catch (error) {
-    log('WhisperKit init: FAIL');
     return fail('Model load: FAIL — ${error.code}: ${error.message}');
   } catch (error) {
-    log('WhisperKit init: FAIL');
     return fail('Model load: FAIL — $error');
   }
-  final loadMs = DateTime.now().difference(loadStarted).inMilliseconds;
-  log('WhisperKit init: PASS');
-  log('Model load: PASS (${loadMs}ms${loadMs > 60000 ? ', includes first-time download' : ''})');
+  log('Model load: PASS (${DateTime.now().difference(loadStarted).inMilliseconds}ms)');
 
-  // 2. Microphone permission (native truth; request only if undetermined).
+  // 3. Microphone permission (native truth; request only if undetermined).
   final service = permissions ?? MicPermissionService();
   var permission = await service.currentStatus();
   if (permission == MicPermissionStatus.denied) {
@@ -74,8 +92,8 @@ Future<WhisperKitTestReport> runWhisperKitTest({
         '(enable it in Settings → Live Translator → Microphone).');
   }
 
-  // 3. Capture a short phrase through the exact pipeline Start Listening uses.
-  log('Speak now (${speakFor.inSeconds}s)…');
+  // 4. Capture a short phrase through the exact pipeline Start Listening uses.
+  log('Speak now… (${speakFor.inSeconds}s)');
   final audio = capture ?? AudioCaptureService();
   final chunks = BytesBuilder(copy: true);
   String? stoppedReason;
@@ -101,7 +119,7 @@ Future<WhisperKitTestReport> runWhisperKitTest({
     return fail('Capture: FAIL — the native pipeline is not delivering PCM.');
   }
 
-  // 4. Transcribe + language detection.
+  // 5. Transcribe + language detection.
   try {
     final started = DateTime.now();
     final transcript =

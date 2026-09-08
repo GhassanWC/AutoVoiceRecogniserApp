@@ -26,32 +26,44 @@ the SAME chat-bubble flow as the cloud engine (same messageId updates)
 > old ggml downloads are auto-deleted once at app start
 > (`legacy_model_cleanup.dart`).
 
-## Model download (App Store binary stays small)
+## Model delivery: BUNDLED in the app, zero runtime downloads
 
-WhisperKit downloads + caches Core ML models itself on first load, from
-huggingface.co/argmaxinc/whisperkit-coreml — no manual download manager and
-no checksums to pin. Catalog in `whisperkit_models.dart` (multilingual only —
-never `.en`; the settings keys are unchanged so stored choices survive):
+WhisperKit's runtime downloader hung indefinitely on real iPhones, so it is
+disabled outright (`download: false`; the bridge refuses to load anything not
+in the bundle). Instead, CI bakes the model into the app
+(`codemagic.yaml` → "Bundle WhisperKit Core ML model" + a verify gate):
 
-| Key | WhisperKit variant | Size | Notes |
-|---|---|---|---|
-| `large-v3-turbo-q5_0` | openai_whisper-large-v3-v20240930_626MB | ~626 MB | best accuracy |
-| `small-q5_1` | openai_whisper-small | ~500 MB | lighter/cooler fallback |
+- `Runner.app/WhisperModels/openai_whisper-small/` — the Core ML model
+  (MelSpectrogram/AudioEncoder/TextDecoder `.mlmodelc`) from
+  huggingface.co/argmaxinc/whisperkit-coreml, fetched at BUILD time;
+- `Runner.app/WhisperModels/tokenizers/models/openai/whisper-small/` — the
+  tokenizer JSONs from huggingface.co/openai/whisper-small, laid out exactly
+  as WhisperKit's `tokenizerFolder` expects (the tokenizer is otherwise a
+  SEPARATE runtime download that would hang the same way).
+
+The Xcode project carries a folder reference to `ios/Runner/WhisperModels`
+(git-ignored — it exists only during CI builds). Native model init has a
+hard 30 s timeout; a failure reports the exact error instead of hanging.
+This diagnostic build ships exactly ONE model — Whisper Small, multilingual —
+and every settings key resolves to it (`whisperkit_models.dart`).
 
 The WhisperKit SPM package (argmaxinc/WhisperKit, pinned 1.1.0) is a Runner
-Xcode project dependency; it raised the iOS floor to 16.0.
+Xcode project dependency; it raised the iOS floor to 16.0. The IPA carries
+the ~500 MB model — accepted for this diagnostic build.
 
 ## Phase A — validate local Whisper on a real iPhone (current state)
 
 Wired end-to-end and unit-tested; **not yet validated on hardware** — that
 is the point of the next TestFlight run:
 
-0. Settings → Developer → **Test WhisperKit**: init + model load (timed,
-   first run downloads on Wi-Fi), then speak a short phrase → transcript +
-   language must appear. Run this before anything else.
-1. Settings → Developer → Translation Engine → On-device (first Start
-   Listening loads — and if needed downloads — the model).
-2. Enable Diagnostics Logging; enable airplane mode after the download.
+0. Settings → Developer → **Test WhisperKit**: `Bundled model found: YES` →
+   `Model load: PASS` (≤30 s) → speak → transcript + language must appear.
+   Airplane mode changes NOTHING — the model is inside the app. This one
+   test answers the build's question: can WhisperKit load and transcribe a
+   model already stored on the iPhone? If it fails here, the on-device
+   experiment stops and we move to the self-hosted API.
+1. Settings → Developer → Translation Engine → On-device.
+2. Enable Diagnostics Logging; airplane mode on, whenever you like.
 3. Speak / play YouTube per language: English, Arabic, Thai, Bengali, Hindi —
    each bubble must show the correct transcript and language flag.
    Arabic → Arabic passes through complete (source == target).

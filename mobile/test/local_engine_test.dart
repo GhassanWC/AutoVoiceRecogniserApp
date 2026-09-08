@@ -94,19 +94,19 @@ void main() {
     });
   });
 
-  group('WhisperKit model catalog', () {
-    test('catalog is multilingual-only and keys survive the ggml migration', () {
-      expect(kWhisperKitModelCatalog, isNotEmpty);
+  group('WhisperKit model catalog (diagnostic build: single bundled model)', () {
+    test('every key resolves to the bundled multilingual small model', () {
+      expect(kWhisperKitModelCatalog, hasLength(1),
+          reason: 'diagnostic build bundles exactly one model in the app');
       for (final spec in kWhisperKitModelCatalog) {
         expect(spec.variant.contains('.en'), isFalse, reason: 'multilingual models only');
         expect(spec.variant, startsWith('openai_whisper-'));
       }
-      // The old ggml settings keys must still resolve so a stored model
-      // choice survives the whisper.cpp → WhisperKit migration.
-      expect(whisperKitModelForKey('large-v3-turbo-q5_0').variant,
-          'openai_whisper-large-v3-v20240930_626MB');
+      // EVERY stored settings key — including the old ggml keys and the
+      // removed turbo key — must resolve to the one bundled model.
       expect(whisperKitModelForKey('small-q5_1').variant, 'openai_whisper-small');
-      expect(whisperKitModelForKey('nonsense').key, kWhisperKitModelCatalog.first.key);
+      expect(whisperKitModelForKey('large-v3-turbo-q5_0').variant, 'openai_whisper-small');
+      expect(whisperKitModelForKey('nonsense').variant, 'openai_whisper-small');
     });
   });
 

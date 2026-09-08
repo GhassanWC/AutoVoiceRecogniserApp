@@ -155,7 +155,8 @@ class SettingsScreen extends StatelessWidget {
             ListTile(
               leading: const Icon(Icons.rule_outlined),
               title: const Text('Test WhisperKit'),
-              subtitle: const Text('Init + load model, then transcribe a short spoken phrase'),
+              subtitle: const Text('Load the BUNDLED model (no downloads), '
+                  'then transcribe a short spoken phrase'),
               onTap: () => _testWhisperKit(context, settings.onDeviceModel),
             ),
           ],
@@ -207,8 +208,9 @@ class SettingsScreen extends StatelessWidget {
     );
   }
 
-  /// End-to-end WhisperKit proof: init + load/download the selected model
-  /// (timed), capture a short spoken phrase, and show transcript + language.
+  /// End-to-end WhisperKit proof, strictly offline: bundled-model check,
+  /// timed load (hard 30 s cap), then a short spoken phrase → transcript +
+  /// language. Nothing is downloaded — the model ships inside this build.
   Future<void> _testWhisperKit(BuildContext context, String modelKey) async {
     final navigator = Navigator.of(context);
     unawaited(showDialog<void>(
@@ -220,8 +222,8 @@ class SettingsScreen extends StatelessWidget {
             CircularProgressIndicator(),
             SizedBox(width: 16),
             Expanded(
-              child: Text('Loading WhisperKit…\nFirst use downloads the model '
-                  '(hundreds of MB — keep the app open, use Wi-Fi).\n\n'
+              child: Text('Loading the bundled model (nothing is downloaded; '
+                  'gives up after 30s)…\n\n'
                   'Then SPEAK A SHORT PHRASE when asked.'),
             ),
           ],

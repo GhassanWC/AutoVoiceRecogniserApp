@@ -227,8 +227,9 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   /// Starts the fully on-device pipeline: existing far-field capture + VAD
   /// (unchanged tuning) → WhisperKit (Core ML) → local translator → same
-  /// chat UI. WhisperKit downloads the model itself on first load; a Swift
-  /// failure surfaces as a catchable PlatformException, never a process kill.
+  /// chat UI. The model is BUNDLED in the app (zero runtime downloads) and
+  /// the native load has a hard 30 s timeout; a Swift failure surfaces as a
+  /// catchable PlatformException, never a process kill or an endless hang.
   Future<void> _startLocalEngine() async {
     final spec = whisperKitModelForKey(settings.settings.onDeviceModel);
     final engine = _localEngine ??= WhisperKitSpeechEngine();
@@ -250,8 +251,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       );
       _failStart('Could not load the on-device model — '
           '${error.runtimeType}: $error. '
-          'Run Settings → Developer → Test WhisperKit for full diagnostics '
-          '(first use needs a one-time ${spec.sizeLabel} download on Wi-Fi).');
+          'Run Settings → Developer → Test WhisperKit for full diagnostics.');
       return;
     }
 

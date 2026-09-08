@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 
 import 'local_language_detect.dart';
@@ -44,8 +46,11 @@ class WhisperKitSpeechEngine implements LocalSpeechEngine {
   @override
   bool get isLoaded => _loaded;
 
-  /// Loads (and on first use downloads) the WhisperKit model [model]
-  /// (a variant name from the catalog, e.g. "openai_whisper-small").
+  /// Loads the CI-BUNDLED WhisperKit model [model] (a variant name from the
+  /// catalog, e.g. "openai_whisper-small"). Strictly local: the native side
+  /// initializes with download:false from the app bundle and enforces a hard
+  /// 30 s timeout; the Dart timeout below is only a backstop so a
+  /// never-replying channel can't hang the UI either.
   @override
   Future<void> load(String model) async {
     if (_loaded) return;
@@ -53,11 +58,15 @@ class WhisperKitSpeechEngine implements LocalSpeechEngine {
       await _channel.invokeMethod<Map<Object?, Object?>>(
         'load',
         {'variant': model},
-      );
+      ).timeout(const Duration(seconds: 40));
       _loaded = true;
     } on MissingPluginException {
       throw StateError(
           'On-device recognition is only available on iOS in this build.');
+    } on TimeoutException {
+      throw StateError(
+          'WhisperKit did not answer within 40s (native 30s timeout also '
+          'missing) — model initialization is wedged.');
     }
   }
 

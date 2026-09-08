@@ -150,21 +150,32 @@ import WhisperKit
 
 /// WhisperKit (Core ML, Swift-native) behind one MethodChannel:
 ///
-///   Flutter → load(variant) / transcribe(pcm16) / unload → WhisperKit
+///   Flutter → bundledModel / load(variant) / transcribe(pcm16) / unload
 ///           ← {text, language} per utterance
 ///
 /// The Flutter side keeps ALL capture/VAD behavior; this bridge only ever
 /// receives finished 16 kHz mono PCM16 utterances and returns the transcript
-/// with the language Whisper detected. Models download from
-/// huggingface.co/argmaxinc/whisperkit-coreml on first load and are cached
-/// by WhisperKit locally.
+/// with the language Whisper detected.
+///
+/// ZERO NETWORK AT RUNTIME: the Core ML model AND its tokenizer are baked
+/// into the app bundle by CI (ios/Runner/WhisperModels, see codemagic.yaml).
+/// WhisperKit's own downloader is never used — it hung indefinitely on real
+/// iPhones. If the bundled folder is missing, load fails immediately with a
+/// clear error instead of ever touching the network.
 final class WhisperKitBridge {
   private var pipe: WhisperKit?
   private var variant: String?
   private var loading = false
 
+  /// Hard cap on model initialization (includes Core ML compilation).
+  private static let loadTimeoutSeconds: UInt64 = 30
+
+  private struct LoadTimeout: Error {}
+
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
+    case "bundledModel":
+      bundledModel(call, result: result)
     case "load":
       load(call, result: result)
     case "transcribe":
@@ -180,6 +191,44 @@ final class WhisperKitBridge {
     }
   }
 
+  /// Bundle.main locations for a variant's model + tokenizer folders.
+  private static func bundledPaths(variant: String)
+    -> (model: String, tokenizer: String)?
+  {
+    guard let resources = Bundle.main.resourcePath else { return nil }
+    let root = "\(resources)/WhisperModels"
+    return (model: "\(root)/\(variant)", tokenizer: "\(root)/tokenizers")
+  }
+
+  /// Reports whether the CI-bundled model is actually inside this build,
+  /// listing exactly which required pieces exist — the Test WhisperKit
+  /// "Bundled model found:" line comes from here.
+  private func bundledModel(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let requested = (call.arguments as? [String: Any])?["variant"] as? String,
+      let paths = WhisperKitBridge.bundledPaths(variant: requested)
+    else {
+      result(FlutterError(code: "bad_args", message: "variant is required", details: nil))
+      return
+    }
+    let fm = FileManager.default
+    var pieces: [String: Bool] = [:]
+    for name in ["MelSpectrogram.mlmodelc", "AudioEncoder.mlmodelc", "TextDecoder.mlmodelc"] {
+      pieces["model/\(name)"] = fm.fileExists(atPath: "\(paths.model)/\(name)")
+    }
+    // Diagnostic build ships exactly one model, so the tokenizer repo path
+    // is fixed: openai_whisper-small tokenizes with openai/whisper-small.
+    let tokenizerDir = "\(paths.tokenizer)/models/openai/whisper-small"
+    for name in ["tokenizer.json", "tokenizer_config.json", "config.json"] {
+      pieces["tokenizer/\(name)"] = fm.fileExists(atPath: "\(tokenizerDir)/\(name)")
+    }
+    result([
+      "found": pieces.values.allSatisfy { $0 },
+      "modelPath": paths.model,
+      "tokenizerPath": paths.tokenizer,
+      "pieces": pieces,
+    ])
+  }
+
   private func load(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     guard let requested = (call.arguments as? [String: Any])?["variant"] as? String else {
       result(FlutterError(code: "bad_args", message: "variant is required", details: nil))
@@ -193,17 +242,43 @@ final class WhisperKitBridge {
       result(FlutterError(code: "busy", message: "a model load is already in progress", details: nil))
       return
     }
+    guard let paths = WhisperKitBridge.bundledPaths(variant: requested),
+      FileManager.default.fileExists(atPath: "\(paths.model)/TextDecoder.mlmodelc")
+    else {
+      result(FlutterError(
+        code: "bundled_model_missing",
+        message: "The bundled Core ML model for '\(requested)' is not inside this build "
+          + "(expected in <app bundle>/WhisperModels/\(requested)). This build never "
+          + "downloads models at runtime — rebuild with the CI bundling step.",
+        details: nil))
+      return
+    }
     loading = true
     pipe = nil
     variant = nil
     let started = Date()
     Task { [weak self] in
       do {
-        // download:true fetches the Core ML model on first use (Wi-Fi sized:
-        // hundreds of MB); later loads come from WhisperKit's local cache.
+        // Strictly local: model + tokenizer come from the app bundle,
+        // download:false. Hard 30 s timeout so a wedged load can never hang
+        // the UI "Loading WhisperKit" forever again.
         let config = WhisperKitConfig(
-          model: requested, prewarm: true, load: true, download: true)
-        let loaded = try await WhisperKit(config)
+          model: requested,
+          modelFolder: paths.model,
+          tokenizerFolder: URL(fileURLWithPath: paths.tokenizer),
+          prewarm: true,
+          load: true,
+          download: false)
+        let loaded = try await withThrowingTaskGroup(of: WhisperKit.self) { group in
+          group.addTask { try await WhisperKit(config) }
+          group.addTask {
+            try await Task.sleep(nanoseconds: WhisperKitBridge.loadTimeoutSeconds * 1_000_000_000)
+            throw LoadTimeout()
+          }
+          let first = try await group.next()!
+          group.cancelAll()
+          return first
+        }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
         await MainActor.run {
           guard let self else { return }
@@ -211,6 +286,17 @@ final class WhisperKitBridge {
           self.variant = requested
           self.loading = false
           result(["initMs": ms, "alreadyLoaded": false, "variant": requested])
+        }
+      } catch is LoadTimeout {
+        await MainActor.run {
+          self?.loading = false
+          result(FlutterError(
+            code: "whisperkit_load_timeout",
+            message: "Model initialization exceeded \(WhisperKitBridge.loadTimeoutSeconds)s "
+              + "with the model already on disk (no network involved). First launch "
+              + "compiles the Core ML model — retry once; if it times out again, "
+              + "WhisperKit cannot load on this device.",
+            details: nil))
         }
       } catch {
         await MainActor.run {
