@@ -89,10 +89,51 @@ import UIKit
         result(nil)
       case "isRunning":
         result(self.audioCapture.isRunning)
+      case "micStatus":
+        // The OS-level truth (TCC database), read directly — never a plugin's
+        // opinion of it. "granted" here MUST allow Start Listening.
+        result(AppDelegate.micPermissionString())
+      case "micRequest":
+        // iOS shows the dialog only while the state is undetermined; a settled
+        // state resolves immediately. This is the ONLY permission-request path
+        // on iOS — never request through a second library on top of it.
+        AVAudioSession.sharedInstance().requestRecordPermission { granted in
+          DispatchQueue.main.async { result(granted) }
+        }
+      case "micDiagnostics":
+        result(self.micDiagnostics())
       default:
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  /// AVAudioSession.recordPermission mirrors AVAudioApplication on iOS 17+;
+  /// it stays the one source of truth here so status and request always come
+  /// from the same API family.
+  fileprivate static func micPermissionString() -> String {
+    switch AVAudioSession.sharedInstance().recordPermission {
+    case .granted: return "granted"
+    case .denied: return "denied"
+    case .undetermined: return "undetermined"
+    @unknown default: return "unknown"
+    }
+  }
+
+  private func micDiagnostics() -> [String: Any] {
+    let session = AVAudioSession.sharedInstance()
+    let usage =
+      Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String
+    return [
+      "nativeRecordPermission": AppDelegate.micPermissionString(),
+      "usageDescriptionPresent": (usage?.isEmpty == false),
+      "audioSessionCategory": session.category.rawValue,
+      "audioSessionMode": session.mode.rawValue,
+      // AVAudioSession has no public "is active" getter; our capture engine
+      // owning an active session is the state that matters to this app.
+      "audioSessionActive": audioCapture.isRunning,
+      "inputAvailable": session.isInputAvailable,
+    ]
   }
 }
 

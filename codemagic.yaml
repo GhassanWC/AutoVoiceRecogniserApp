@@ -63,7 +63,7 @@ workflows:
         script: |
           flutter build ipa --release \
             --build-name=1.0.0 \
-            --build-number=12 \
+            --build-number=13 \
             --export-options-plist=/Users/builder/export_options.plist
 
       - name: Verify whisper FFI symbols in Release archive (build gate)

@@ -46,5 +46,17 @@ end
 post_install do |installer|
   installer.pods_project.targets.each do |target|
     flutter_additional_ios_build_settings(target)
+    # permission_handler_apple compiles each permission OUT unless its macro
+    # is defined (PermissionHandlerEnums.h defaults PERMISSION_MICROPHONE to
+    # 0). Without this a build reports microphone "denied" forever — even
+    # while iOS Settings shows the permission granted. The app now reads the
+    # OS state natively on iOS, but the plugin must still tell the truth
+    # wherever it is consulted.
+    if target.name == 'permission_handler_apple'
+      target.build_configurations.each do |config|
+        config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= ['$(inherited)']
+        config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] << 'PERMISSION_MICROPHONE=1'
+      end
+    end
   end
 end

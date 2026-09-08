@@ -253,13 +253,19 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
     final engine = _localEngine ??= WhisperLocalSpeechEngine();
     try {
+      // Sentinel around every native FFI call: if the process dies in there
+      // (SIGABRT/SIGSEGV/jetsam), the next run reports the crash evidence.
+      await markNativeLoadAttempt(
+          manager: offlineModels, spec: spec, phase: 'start_listening_native_load');
       developer.log(
         '[WHISPER LOAD] version=${WhisperLocalSpeechEngine.nativeVersion} '
         'systemInfo=${WhisperLocalSpeechEngine.nativeSystemInfo}',
         name: 'whisper',
       );
       await engine.load(precheck.modelPath);
+      await clearNativeLoadAttempt(manager: offlineModels, spec: spec);
     } catch (error, stack) {
+      await clearNativeLoadAttempt(manager: offlineModels, spec: spec);
       // The ACTUAL native failure, never just a generic message.
       developer.log(
         '[WHISPER LOAD ERROR] type=${error.runtimeType} message=$error '

@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:developer' as developer;
 import 'dart:io';
 
@@ -118,6 +119,77 @@ Future<PreloadCheckResult> whisperPreloadChecks({
   return PreloadCheckResult(ok: ok, lines: lines, modelPath: modelPath);
 }
 
+// ── Native-crash evidence ────────────────────────────────────────────────────
+// A native SIGABRT/SIGSEGV (or a jetsam memory kill) inside the whisper loader
+// takes the whole process down before any Dart catch runs. So a sentinel file
+// is written IMMEDIATELY before each native FFI call and deleted right after:
+// if the sentinel still exists on the next run, the previous attempt provably
+// died inside native code, and the phase says which call was in flight.
+
+const String kLoadSentinelFileName = 'whisper_load_attempt.json';
+
+Future<File> _sentinelFile(OfflineModelManager manager, OfflineModelSpec spec) async {
+  final modelPath = await manager.pathFor(spec);
+  return File(
+      '${File(modelPath).parent.path}${Platform.pathSeparator}$kLoadSentinelFileName');
+}
+
+/// Marks that a native whisper call is about to run ([phase] names it).
+Future<void> markNativeLoadAttempt({
+  required OfflineModelManager manager,
+  required OfflineModelSpec spec,
+  required String phase,
+}) async {
+  final file = await _sentinelFile(manager, spec);
+  await file.writeAsString(jsonEncode({
+    'phase': phase,
+    'model': spec.key,
+    'startedAt': DateTime.now().toIso8601String(),
+  }), flush: true);
+}
+
+/// Clears the sentinel — the native call returned (success or caught error).
+Future<void> clearNativeLoadAttempt({
+  required OfflineModelManager manager,
+  required OfflineModelSpec spec,
+}) async {
+  final file = await _sentinelFile(manager, spec);
+  if (await file.exists()) await file.delete();
+}
+
+/// If a previous attempt died natively, returns the evidence lines (and
+/// clears the sentinel so the report doesn't repeat forever); null otherwise.
+Future<List<String>?> takeNativeCrashEvidence({
+  required OfflineModelManager manager,
+  required OfflineModelSpec spec,
+}) async {
+  final file = await _sentinelFile(manager, spec);
+  if (!await file.exists()) return null;
+  String phase = 'unknown', model = 'unknown', startedAt = 'unknown';
+  try {
+    final data = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    phase = '${data['phase'] ?? phase}';
+    model = '${data['model'] ?? model}';
+    startedAt = '${data['startedAt'] ?? startedAt}';
+  } catch (_) {
+    // Corrupt sentinel still proves a crash happened; report it as unknown.
+  }
+  await file.delete().catchError((_) => file);
+  return [
+    '[WHISPER NATIVE CRASH EVIDENCE]',
+    'A previous model-load attempt DID NOT COMPLETE: the process died inside',
+    'native code (SIGABRT/SIGSEGV or an out-of-memory kill) — no Dart',
+    'exception can report this, which is why the app just vanished.',
+    'crashedPhase=$phase',
+    'crashedModel=$model',
+    'crashedAt=$startedAt',
+    'Get the native stack: iPhone Settings → Privacy & Security → Analytics &',
+    'Improvements → Analytics Data → newest "Runner" / "live_translator" item,',
+    'or App Store Connect → TestFlight → Crashes. The crashing function/library',
+    'in that report is the ground truth.',
+  ];
+}
+
 /// Loads the selected offline model WITHOUT touching the microphone and
 /// reports either "Model load: PASS" or the exact filesystem/native failure.
 /// Used by the Settings "Test Offline Model" button and by the live
@@ -130,12 +202,19 @@ Future<ModelLoadReport> runModelLoadTest({
   String Function()? nativeVersion,
   String Function()? nativeSystemInfo,
 }) async {
-  final precheck = await whisperPreloadChecks(spec: spec, manager: manager);
-  final lines = [...precheck.lines];
+  final lines = <String>[];
   void log(String line) {
     lines.add(line);
     developer.log(line, name: 'whisper');
   }
+
+  // Evidence of a previous attempt that killed the process natively — shown
+  // FIRST, because it explains why no Dart error was ever seen.
+  final crashEvidence = await takeNativeCrashEvidence(manager: manager, spec: spec);
+  crashEvidence?.forEach(log);
+
+  final precheck = await whisperPreloadChecks(spec: spec, manager: manager);
+  precheck.lines.forEach(lines.add);
 
   final filesystemOk = precheck.ok;
   final modelPath = precheck.modelPath;
@@ -143,9 +222,13 @@ Future<ModelLoadReport> runModelLoadTest({
   // Native library identification — if even these throw, the bundled
   // whisper.cpp binary itself is the problem, not the model file.
   try {
+    await markNativeLoadAttempt(
+        manager: manager, spec: spec, phase: 'native_library_probe');
     log('WhisperEngine.version=${nativeVersion?.call() ?? WhisperLocalSpeechEngine.nativeVersion}');
     log('WhisperEngine.systemInfo=${nativeSystemInfo?.call() ?? WhisperLocalSpeechEngine.nativeSystemInfo}');
+    await clearNativeLoadAttempt(manager: manager, spec: spec);
   } catch (error, stack) {
+    await clearNativeLoadAttempt(manager: manager, spec: spec);
     log('[WHISPER LOAD ERROR]');
     log('type=${error.runtimeType} (native library unavailable)');
     log('message=$error');
@@ -160,11 +243,15 @@ Future<ModelLoadReport> runModelLoadTest({
   final engine = engineFactory();
   try {
     final started = DateTime.now();
+    await markNativeLoadAttempt(
+        manager: manager, spec: spec, phase: 'native_model_load');
     await engine.load(modelPath);
+    await clearNativeLoadAttempt(manager: manager, spec: spec);
     final ms = DateTime.now().difference(started).inMilliseconds;
     log('Model load: PASS (${ms}ms, ${spec.displayName})');
     return ModelLoadReport(passed: true, details: lines.join('\n'));
   } catch (error, stack) {
+    await clearNativeLoadAttempt(manager: manager, spec: spec);
     log('[WHISPER LOAD ERROR]');
     log('type=${error.runtimeType}');
     log('message=$error');

@@ -224,6 +224,42 @@ void main() {
       expect(passing.details, contains('Model load: PASS'));
       await dir.delete(recursive: true);
     });
+
+    test('a surviving sentinel reports the previous NATIVE crash, then clears', () async {
+      final bytes = [...kGgmlMagicBytes, ...List<int>.generate(64, (i) => i)];
+      final (spec, manager, dir) = await writeModel(bytes);
+
+      // Simulate a run that died inside the native loader: the sentinel was
+      // written but the process never came back to delete it.
+      await markNativeLoadAttempt(
+          manager: manager, spec: spec, phase: 'native_model_load');
+
+      final report = await runModelLoadTest(
+        spec: spec,
+        manager: manager,
+        engineFactory: () => FakeLocalSpeechEngine([]),
+        nativeVersion: () => 'whisper.cpp v-test',
+        nativeSystemInfo: () => 'NEON=1',
+      );
+      expect(report.details, contains('[WHISPER NATIVE CRASH EVIDENCE]'));
+      expect(report.details, contains('crashedPhase=native_model_load'));
+      expect(report.details, contains('crashedModel=${spec.key}'));
+      // A clean completed run leaves no sentinel behind…
+      expect(
+        await takeNativeCrashEvidence(manager: manager, spec: spec),
+        isNull,
+      );
+      // …and the evidence is one-shot: it must not repeat on the next test.
+      final second = await runModelLoadTest(
+        spec: spec,
+        manager: manager,
+        engineFactory: () => FakeLocalSpeechEngine([]),
+        nativeVersion: () => 'whisper.cpp v-test',
+        nativeSystemInfo: () => 'NEON=1',
+      );
+      expect(second.details, isNot(contains('[WHISPER NATIVE CRASH EVIDENCE]')));
+      await dir.delete(recursive: true);
+    });
   });
 
   group('LocalPipeline (Phase A)', () {

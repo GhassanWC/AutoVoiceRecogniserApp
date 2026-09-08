@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../../models/app_settings.dart';
 import '../../services/local/local_model_doctor.dart';
+import '../../services/permissions/mic_diagnostics.dart';
 import '../../services/local/local_speech_engine.dart';
 import '../../services/local/offline_model_manager.dart';
 import '../../services/storage/history_store.dart';
@@ -131,6 +132,13 @@ class SettingsScreen extends StatelessWidget {
             onChanged: (value) => controller.update((s) => s.copyWith(developerDiagnostics: value)),
           ),
           ListTile(
+            leading: const Icon(Icons.mic_none_rounded),
+            title: const Text('Test Microphone Permission'),
+            subtitle: const Text(
+                'Native iOS permission state + 2-second capture — no Whisper involved'),
+            onTap: () => _testMicPermission(context),
+          ),
+          ListTile(
             leading: const Icon(Icons.psychology_outlined),
             title: const Text('Translation Engine'),
             subtitle: Text(settings.translationEngine == TranslationEngine.onDevice
@@ -154,6 +162,48 @@ class SettingsScreen extends StatelessWidget {
             ),
           ],
           const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  /// Proves the microphone path with zero Whisper involvement: the native
+  /// [MIC PERMISSION] block, then 2 seconds of real PCM → "Audio capture: PASS".
+  Future<void> _testMicPermission(BuildContext context) async {
+    final navigator = Navigator.of(context);
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(width: 16),
+            Expanded(child: Text('Checking permission + capturing 2 seconds of audio…')),
+          ],
+        ),
+      ),
+    ));
+
+    final report = await runMicPermissionTest();
+
+    navigator.pop(); // close the progress dialog
+    if (!context.mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(report.passed ? 'Microphone: PASS' : 'Microphone: FAILED'),
+        content: SingleChildScrollView(
+          child: SelectableText(
+            report.details,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Close'),
+          ),
         ],
       ),
     );
