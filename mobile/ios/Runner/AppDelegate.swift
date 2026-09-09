@@ -495,7 +495,7 @@ final class NativeSpeechBridge {
           let requested = Locale(identifier: ProductLanguages.recognitionLocale(for: code))
           let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested)
             ?? requested
-          let transcriber = SpeechTranscriber(locale: locale, preset: .offlineTranscription)
+          let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
           if let request = try await AssetInventory.assetInstallationRequest(
             supporting: [transcriber])
           {
@@ -591,7 +591,7 @@ final class NativeSpeechBridge {
   {
     let requested = Locale(identifier: ProductLanguages.recognitionLocale(for: languageCode))
     let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested) ?? requested
-    let transcriber = SpeechTranscriber(locale: locale, preset: .offlineTranscription)
+    let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
     let analyzer = SpeechAnalyzer(modules: [transcriber])
 
     var input = buffer
