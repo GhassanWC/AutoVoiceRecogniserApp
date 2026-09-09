@@ -4,10 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/app_settings.dart';
-import '../../services/local/whisperkit_doctor.dart';
-import '../../services/local/whisperkit_models.dart';
+import '../../services/native/live_translation_support.dart';
 import '../../services/permissions/mic_diagnostics.dart';
 import '../../services/storage/history_store.dart';
+import '../live_translation/widgets/unsupported_dialog.dart';
 import '../../services/storage/settings_store.dart';
 import '../../utils/languages.dart';
 import 'privacy_policy_screen.dart';
@@ -141,25 +141,12 @@ class SettingsScreen extends StatelessWidget {
             leading: const Icon(Icons.psychology_outlined),
             title: const Text('Translation Engine'),
             subtitle: Text(settings.translationEngine == TranslationEngine.onDevice
-                ? 'On-device (experimental) — audio never leaves this iPhone'
-                : 'OpenAI (cloud)'),
+                ? 'Native on-device — the phone\'s own speech + translation; '
+                    'audio never leaves the device'
+                : 'Cloud (legacy/testing)'),
             onTap: () => _pickEngine(context, controller),
           ),
-          if (settings.translationEngine == TranslationEngine.onDevice) ...[
-            ListTile(
-              leading: const Icon(Icons.memory_outlined),
-              title: const Text('On-device Whisper Model'),
-              subtitle: Text(whisperKitModelForKey(settings.onDeviceModel).displayName),
-              onTap: () => _pickOfflineModel(context, controller),
-            ),
-            ListTile(
-              leading: const Icon(Icons.rule_outlined),
-              title: const Text('Test WhisperKit'),
-              subtitle: const Text('Load the BUNDLED model (no downloads), '
-                  'then transcribe a short spoken phrase'),
-              onTap: () => _testWhisperKit(context, settings.onDeviceModel),
-            ),
-          ],
+          _SupportStatusTile(targetLanguage: settings.targetLanguage),
           const SizedBox(height: 24),
         ],
       ),
@@ -208,52 +195,6 @@ class SettingsScreen extends StatelessWidget {
     );
   }
 
-  /// End-to-end WhisperKit proof, strictly offline: bundled-model check,
-  /// timed load (hard 30 s cap), then a short spoken phrase → transcript +
-  /// language. Nothing is downloaded — the model ships inside this build.
-  Future<void> _testWhisperKit(BuildContext context, String modelKey) async {
-    final navigator = Navigator.of(context);
-    unawaited(showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => const AlertDialog(
-        content: Row(
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(width: 16),
-            Expanded(
-              child: Text('Loading the bundled model (nothing is downloaded; '
-                  'gives up after 30s)…\n\n'
-                  'Then SPEAK A SHORT PHRASE when asked.'),
-            ),
-          ],
-        ),
-      ),
-    ));
-
-    final report = await runWhisperKitTest(modelKey: modelKey);
-
-    navigator.pop(); // close the progress dialog
-    if (!context.mounted) return;
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text(report.passed ? 'WhisperKit: PASS' : 'WhisperKit: FAILED'),
-        content: SingleChildScrollView(
-          child: SelectableText(
-            report.details,
-            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
-    );
-  }
 
   void _pickEngine(BuildContext context, SettingsController controller) {
     showDialog<void>(
@@ -265,37 +206,14 @@ class SettingsScreen extends StatelessWidget {
             ListTile(
               title: Text(engine.label),
               subtitle: Text(engine == TranslationEngine.onDevice
-                  ? 'Experimental. 100% offline: local Whisper + local translation. '
-                      'No OpenAI, no backend, no API keys.'
-                  : 'Cloud pipeline (current production).'),
+                  ? 'Production goal. The phone\'s own on-device speech '
+                      'recognition + translation. No cloud, no API keys.'
+                  : 'Kept temporarily for comparison/testing.'),
               trailing: controller.settings.translationEngine == engine
                   ? const Icon(Icons.check_rounded)
                   : null,
               onTap: () {
                 controller.update((s) => s.copyWith(translationEngine: engine));
-                Navigator.pop(dialogContext);
-              },
-            ),
-        ],
-      ),
-    );
-  }
-
-  void _pickOfflineModel(BuildContext context, SettingsController controller) {
-    showDialog<void>(
-      context: context,
-      builder: (dialogContext) => SimpleDialog(
-        title: const Text('On-device Whisper Model'),
-        children: [
-          for (final spec in kWhisperKitModelCatalog)
-            ListTile(
-              title: Text('${spec.displayName} (${spec.sizeLabel})'),
-              subtitle: Text(spec.notes),
-              trailing: controller.settings.onDeviceModel == spec.key
-                  ? const Icon(Icons.check_rounded)
-                  : null,
-              onTap: () {
-                controller.update((s) => s.copyWith(onDeviceModel: spec.key));
                 Navigator.pop(dialogContext);
               },
             ),
@@ -408,6 +326,86 @@ class SettingsScreen extends StatelessWidget {
     if (result != null) {
       await controller.update((s) => s.copyWith(serverUrl: result));
     }
+  }
+}
+
+/// "On-device Live Translation — Status: Supported ✓ / Not supported".
+/// The status comes from the shared capability probe (real OS answers, not
+/// version guessing); tapping shows the reason, with Check Again to re-probe.
+class _SupportStatusTile extends StatelessWidget {
+  const _SupportStatusTile({required this.targetLanguage});
+
+  final String targetLanguage;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: sharedLiveTranslationSupport,
+      builder: (context, _) {
+        final service = sharedLiveTranslationSupport;
+        final support = service.current;
+        if (support == null && !service.probing) {
+          // First visit before the startup probe finished — kick one off.
+          WidgetsBinding.instance.addPostFrameCallback(
+              (_) => service.ensure(targetLanguage: targetLanguage));
+        }
+        final String status;
+        if (support == null || service.probing) {
+          status = 'Checking…';
+        } else if (support.supported) {
+          status = 'Status: Supported ✓';
+        } else {
+          status = 'Status: Not supported';
+        }
+        return ListTile(
+          leading: Icon(
+            support?.supported == true
+                ? Icons.verified_outlined
+                : Icons.privacy_tip_outlined,
+            color: support == null
+                ? null
+                : support.supported
+                    ? Colors.green
+                    : Theme.of(context).colorScheme.error,
+          ),
+          title: const Text('On-device Live Translation'),
+          subtitle: Text(status),
+          onTap: () async {
+            final current =
+                await service.ensure(targetLanguage: targetLanguage);
+            if (!context.mounted) return;
+            if (current.supported) {
+              await showDialog<void>(
+                context: context,
+                builder: (dialogContext) => AlertDialog(
+                  title: const Text('Supported ✓'),
+                  content: Text(
+                    '${current.reason}\n\n'
+                    'OS: ${current.osVersion}\n'
+                    'Speech recognition: ${current.speechSupported ? 'yes' : 'no'}\n'
+                    'Language auto-detection: ${current.languageDetectionSupported ? 'yes' : 'no'}\n'
+                    'On-device translation: ${current.translationSupported ? 'yes' : 'no'}\n'
+                    'Languages on this device: ${current.availableLanguages.join(', ')}',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('Close'),
+                    ),
+                  ],
+                ),
+              );
+            } else {
+              await showLiveTranslationUnsupportedDialog(
+                context,
+                support: current,
+                targetLanguage: targetLanguage,
+              );
+            }
+          },
+        );
+      },
+    );
   }
 }
 

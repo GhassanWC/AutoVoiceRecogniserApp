@@ -9,8 +9,8 @@ enum TranslationEngine { openai, onDevice }
 
 extension TranslationEngineLabel on TranslationEngine {
   String get label => switch (this) {
-        TranslationEngine.openai => 'OpenAI',
-        TranslationEngine.onDevice => 'On-device',
+        TranslationEngine.openai => 'Cloud (legacy/testing)',
+        TranslationEngine.onDevice => 'Native on-device',
       };
 }
 

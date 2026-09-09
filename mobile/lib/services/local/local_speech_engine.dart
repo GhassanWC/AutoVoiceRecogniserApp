@@ -9,14 +9,16 @@ class LocalTranscript {
   const LocalTranscript({required this.text, required this.language});
   final String text;
 
-  /// ISO 639-1 code Whisper detected (backed up by script analysis), or "und".
+  /// ISO 639-1 code the platform detected (backed up by script analysis),
+  /// or "und" for silence/non-speech.
   final String language;
 }
 
 /// Abstract so the pipeline and tests never touch the native bridge directly.
 abstract class LocalSpeechEngine {
-  /// [model] is the engine's model identifier — for WhisperKit, the Core ML
-  /// variant name (downloaded + cached natively on first load).
+  /// [model] is engine-specific configuration — for the native platform
+  /// engine it is the TARGET language code (the detection set derives from
+  /// the product languages + target on the native side).
   Future<void> load(String model);
   bool get isLoaded;
 
@@ -27,65 +29,60 @@ abstract class LocalSpeechEngine {
   Future<void> dispose();
 }
 
-/// WhisperKit (Swift-native, Core ML, MIT) through the
-/// `app.livetranslator/whisperkit` MethodChannel in AppDelegate.swift.
+/// The phone's OWN speech recognition (production on-device path):
+/// on iOS, per-utterance parallel on-device SFSpeechRecognizer across the
+/// product language set, scored natively for language auto-detection
+/// (Apple's recognizers are locale-fixed, so detection is built from
+/// parallel recognition — the capability probe gates devices honestly).
 ///
-/// This replaced the whisper.cpp FFI plugin after its native model loader
-/// crashed the process on real iPhones (uncaught C++ exceptions across the
-/// FFI boundary → SIGABRT). A Swift bridge fails as a catchable
-/// PlatformException instead — the app can never be killed by a load again.
-///
-/// This is the ONLY file that touches the bridge API, so any change to the
-/// native side is contained here.
-class WhisperKitSpeechEngine implements LocalSpeechEngine {
+/// Utterances still come from the app's UNCHANGED environmental capture +
+/// VAD; this engine never opens the microphone itself. This is the ONLY
+/// file that touches the bridge API.
+class NativeSpeechEngine implements LocalSpeechEngine {
   static const MethodChannel _channel =
-      MethodChannel('app.livetranslator/whisperkit');
+      MethodChannel('app.livetranslator/nativestt');
 
   bool _loaded = false;
 
   @override
   bool get isLoaded => _loaded;
 
-  /// Loads the CI-BUNDLED WhisperKit model [model] (a variant name from the
-  /// catalog, e.g. "openai_whisper-small"). Strictly local: the native side
-  /// initializes with download:false from the app bundle and enforces a hard
-  /// 30 s timeout; the Dart timeout below is only a backstop so a
-  /// never-replying channel can't hang the UI either.
+  /// [model] = target language code. Requests speech-recognition
+  /// authorization (first run shows the OS dialog) and pins the detection
+  /// set to what this device supports on-device.
   @override
   Future<void> load(String model) async {
     if (_loaded) return;
     try {
       await _channel.invokeMethod<Map<Object?, Object?>>(
-        'load',
-        {'variant': model},
-      ).timeout(const Duration(seconds: 40));
+        'prepare',
+        {'targetLanguage': model},
+      ).timeout(const Duration(seconds: 30));
       _loaded = true;
     } on MissingPluginException {
       throw StateError(
-          'On-device recognition is only available on iOS in this build.');
+          'Native on-device recognition is not available on this platform yet.');
     } on TimeoutException {
-      throw StateError(
-          'WhisperKit did not answer within 40s (native 30s timeout also '
-          'missing) — model initialization is wedged.');
+      throw StateError('Speech recognition setup did not answer within 30s.');
     }
   }
 
   @override
   Future<LocalTranscript> transcribe(Uint8List pcm16, int sampleRate) async {
     if (!_loaded) {
-      throw StateError('WhisperKit model not loaded');
+      throw StateError('Native speech engine not prepared');
     }
     final reply = await _channel.invokeMethod<Map<Object?, Object?>>(
-      'transcribe',
+      'recognize',
       {'pcm16': pcm16, 'sampleRate': sampleRate},
-    );
+    ).timeout(const Duration(seconds: 25));
     final text = (reply?['text'] as String? ?? '').trim();
 
-    // WhisperKit reports the detected language; script analysis backs it up
-    // (and can only ever refine unique-script text, e.g. Urdu vs Arabic).
+    // The native side reports the detected language; script analysis backs
+    // it up (and can only ever refine unique-script text, e.g. Urdu vs Arabic).
     String language = 'und';
     final reported = (reply?['language'] as String? ?? '').toLowerCase();
-    if (reported.length >= 2 && reported != 'auto') {
+    if (reported.length >= 2 && reported != 'auto' && reported != 'und') {
       language = reported.substring(0, 2);
     }
     final byScript = detectLanguageByScript(text);
@@ -97,10 +94,5 @@ class WhisperKitSpeechEngine implements LocalSpeechEngine {
   @override
   Future<void> dispose() async {
     _loaded = false;
-    try {
-      await _channel.invokeMethod<void>('unload');
-    } on MissingPluginException {
-      // Non-iOS platform — nothing was loaded natively.
-    }
   }
 }

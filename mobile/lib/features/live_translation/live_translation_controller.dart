@@ -14,8 +14,9 @@ import '../../services/audio/vad_segmenter.dart';
 import '../../services/auth/api_client.dart';
 import '../../services/local/local_pipeline.dart';
 import '../../services/local/local_speech_engine.dart';
-import '../../services/local/local_translation_engine.dart';
-import '../../services/local/whisperkit_models.dart';
+import '../../services/native/live_translation_support.dart';
+import '../../services/native/native_translator.dart';
+import '../../utils/languages.dart';
 import '../../services/mock/mock_conversation_service.dart';
 import '../../services/permissions/mic_permission_service.dart';
 import '../../services/storage/history_store.dart';
@@ -225,39 +226,43 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     notifyListeners();
   }
 
-  /// Starts the fully on-device pipeline: existing far-field capture + VAD
-  /// (unchanged tuning) → WhisperKit (Core ML) → local translator → same
-  /// chat UI. The model is BUNDLED in the app (zero runtime downloads) and
-  /// the native load has a hard 30 s timeout; a Swift failure surfaces as a
-  /// catchable PlatformException, never a process kill or an endless hang.
+  /// Starts the native on-device pipeline: existing far-field capture + VAD
+  /// (unchanged tuning) → the platform's own on-device speech recognition
+  /// (source language auto-detected per utterance) → the platform's own
+  /// on-device translation → same chat UI. Guarded by the capability probe:
+  /// an unsupported device gets a clear failure, never a broken session.
   Future<void> _startLocalEngine() async {
-    final spec = whisperKitModelForKey(settings.settings.onDeviceModel);
-    final engine = _localEngine ??= WhisperKitSpeechEngine();
-    try {
-      developer.log('[WHISPERKIT LOAD] variant=${spec.variant}', name: 'whisperkit');
-      final started = DateTime.now();
-      await engine.load(spec.variant);
-      developer.log(
-        '[WHISPERKIT LOAD] PASS '
-        '(${DateTime.now().difference(started).inMilliseconds}ms)',
-        name: 'whisperkit',
-      );
-    } catch (error, stack) {
-      // The ACTUAL native failure, never just a generic message.
-      developer.log(
-        '[WHISPERKIT LOAD ERROR] type=${error.runtimeType} message=$error '
-        'stack=${stack.toString().split('\n').take(10).join(' | ')}',
-        name: 'whisperkit',
-      );
-      _failStart('Could not load the on-device model — '
-          '${error.runtimeType}: $error. '
-          'Run Settings → Developer → Test WhisperKit for full diagnostics.');
+    final target = settings.settings.targetLanguage;
+
+    // 1. Capability gate — never start a session the device cannot finish.
+    final support =
+        await sharedLiveTranslationSupport.ensure(targetLanguage: target);
+    if (!support.supported) {
+      _failStart(support.reason);
       return;
     }
 
+    // 2. Speech setup (authorization + pin the on-device detection set).
+    final engine = _localEngine ??= NativeSpeechEngine();
+    try {
+      await engine.load(target);
+    } catch (error) {
+      developer.log('[NATIVE STT] setup failed: $error', name: 'local');
+      _failStart('Could not start on-device speech recognition — $error');
+      return;
+    }
+
+    // 3. Language pack for the target: the platform's own download flow.
+    //    A pending download is normal, not an error.
+    final targetName = languageForCode(target)?.name ?? target;
+    activityLabel = 'Preparing $targetName translation…';
+    notifyListeners();
+    await NativeOnDeviceTranslator.prepare(targetLanguage: target);
+    activityLabel = null;
+
     final pipeline = LocalPipeline(
       engine: engine,
-      translator: const PassthroughLocalTranslator(),
+      translator: NativeOnDeviceTranslator(),
       targetLanguage: settings.settings.targetLanguage,
       onMessageCreated: (messageId) {
         _ensureMessage(messageId);

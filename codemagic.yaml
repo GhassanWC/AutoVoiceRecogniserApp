@@ -20,70 +20,11 @@ workflows:
       - name: Get Flutter packages
         script: |
           # Flutter plugins integrate via CocoaPods (the committed
-          # ios/Podfile). WhisperKit is separate: an SPM package pinned in
-          # the Runner Xcode project itself, resolved by xcodebuild.
+          # ios/Podfile). The on-device engine uses only OS frameworks
+          # (Speech, Translation, NaturalLanguage) — no third-party ML
+          # packages and no model downloads in this build.
           flutter config --no-enable-swift-package-manager
           flutter pub get
-
-      - name: Bundle WhisperKit Core ML model + tokenizer (ZERO runtime downloads)
-        script: |
-          #!/bin/bash
-          # The app must NEVER download models at runtime (the runtime
-          # downloader hung indefinitely on real iPhones). This step bakes the
-          # exact openai_whisper-small Core ML model AND its tokenizer into
-          # the Runner bundle; the Swift bridge loads them via Bundle.main
-          # with download:false. tokenizers/ mirrors the HubApi layout
-          # WhisperKit expects: <tokenizerFolder>/models/openai/whisper-small.
-          set -e
-          DEST="ios/Runner/WhisperModels"
-          rm -rf "$DEST"
-          mkdir -p "$DEST"
-          python3 -m pip install --quiet --upgrade huggingface_hub \
-            || python3 -m pip install --quiet --upgrade --break-system-packages huggingface_hub
-          python3 - <<'EOF'
-          from huggingface_hub import snapshot_download
-          snapshot_download(
-              repo_id="argmaxinc/whisperkit-coreml",
-              allow_patterns=["openai_whisper-small/*"],
-              local_dir="ios/Runner/WhisperModels",
-          )
-          snapshot_download(
-              repo_id="openai/whisper-small",
-              allow_patterns=["*.json", "*.txt"],
-              local_dir="ios/Runner/WhisperModels/tokenizers/models/openai/whisper-small",
-          )
-          EOF
-          # Strip huggingface_hub bookkeeping so only real assets are bundled.
-          find "$DEST" -name ".cache" -type d -prune -exec rm -rf {} \;
-          find "$DEST" -name ".gitattributes" -delete
-
-      - name: Verify bundled model files (build gate)
-        script: |
-          #!/bin/bash
-          # A build whose bundle is missing any required model/tokenizer file
-          # would only fail later on the phone — fail it here instead.
-          set -e
-          DEST="ios/Runner/WhisperModels"
-          fail=0
-          for d in MelSpectrogram.mlmodelc AudioEncoder.mlmodelc TextDecoder.mlmodelc; do
-            if [ -d "$DEST/openai_whisper-small/$d" ]; then
-              echo "[MODEL GATE] OK  openai_whisper-small/$d"
-            else
-              echo "[MODEL GATE] MISSING openai_whisper-small/$d"; fail=1
-            fi
-          done
-          for f in tokenizer.json tokenizer_config.json config.json; do
-            if [ -f "$DEST/tokenizers/models/openai/whisper-small/$f" ]; then
-              echo "[MODEL GATE] OK  tokenizers/.../$f"
-            else
-              echo "[MODEL GATE] MISSING tokenizers/models/openai/whisper-small/$f"; fail=1
-            fi
-          done
-          echo "[MODEL GATE] bundle contents:"
-          find "$DEST" -maxdepth 3 | sort
-          echo "[MODEL GATE] total size: $(du -sh "$DEST" | cut -f1)"
-          [ "$fail" -eq 0 ] || { echo "[MODEL GATE] FAILED"; exit 1; }
-          echo "[MODEL GATE] PASSED"
 
       - name: Install CocoaPods
         script: |
@@ -121,7 +62,7 @@ workflows:
         script: |
           flutter build ipa --release \
             --build-name=1.0.0 \
-            --build-number=15 \
+            --build-number=16 \
             --export-options-plist=/Users/builder/export_options.plist
 
     artifacts:

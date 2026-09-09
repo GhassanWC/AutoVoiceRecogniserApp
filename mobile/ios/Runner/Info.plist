@@ -28,6 +28,8 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Live Translator uses the microphone only while Live Translation is active, so it can hear speech around you and translate it into your language.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Live Translator recognizes nearby speech entirely on this device to show live translations. Audio is processed on-device and never uploaded.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

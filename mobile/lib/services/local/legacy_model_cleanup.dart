@@ -7,7 +7,7 @@ import 'package:path_provider/path_provider.dart';
 /// up to ~574 MB of dead weight under Application Support/offline_models
 /// with no remaining in-app way to delete it. Safe to remove: the directory
 /// only ever held re-downloadable model weights (and the load-attempt
-/// sentinel), never user data. WhisperKit keeps its own separate cache.
+/// sentinel), never user data.
 Future<void> deleteLegacyGgmlModels() async {
   if (kIsWeb) return;
   try {

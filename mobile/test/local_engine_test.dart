@@ -5,7 +5,6 @@ import 'package:live_translator/services/local/local_language_detect.dart';
 import 'package:live_translator/services/local/local_pipeline.dart';
 import 'package:live_translator/services/local/local_speech_engine.dart';
 import 'package:live_translator/services/local/local_translation_engine.dart';
-import 'package:live_translator/services/local/whisperkit_models.dart';
 
 class FakeLocalSpeechEngine implements LocalSpeechEngine {
   FakeLocalSpeechEngine(this.responses);
@@ -91,22 +90,6 @@ void main() {
     test('Latin script and noise return null (Whisper verdict is used instead)', () {
       expect(detectLanguageByScript('Hello everybody'), isNull);
       expect(detectLanguageByScript('12345'), isNull);
-    });
-  });
-
-  group('WhisperKit model catalog (diagnostic build: single bundled model)', () {
-    test('every key resolves to the bundled multilingual small model', () {
-      expect(kWhisperKitModelCatalog, hasLength(1),
-          reason: 'diagnostic build bundles exactly one model in the app');
-      for (final spec in kWhisperKitModelCatalog) {
-        expect(spec.variant.contains('.en'), isFalse, reason: 'multilingual models only');
-        expect(spec.variant, startsWith('openai_whisper-'));
-      }
-      // EVERY stored settings key — including the old ggml keys and the
-      // removed turbo key — must resolve to the one bundled model.
-      expect(whisperKitModelForKey('small-q5_1').variant, 'openai_whisper-small');
-      expect(whisperKitModelForKey('large-v3-turbo-q5_0').variant, 'openai_whisper-small');
-      expect(whisperKitModelForKey('nonsense').variant, 'openai_whisper-small');
     });
   });
 

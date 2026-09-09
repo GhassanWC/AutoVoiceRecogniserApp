@@ -1,102 +1,94 @@
-# On-device AI engine (experimental)
+# On-device engine — NATIVE platform speech + translation (production path)
 
-A/B experiment alongside the production OpenAI pipeline. Selected in
-**Settings → Developer → Translation Engine**. With **On-device** selected:
-no OpenAI calls, no backend speech API, no cloud translation, no API keys —
-raw audio never leaves the iPhone.
+Selected in **Settings → Developer → Translation Engine**:
+
+- **Native on-device** (production goal): the phone's OWN speech recognition
+  and translation. No WhisperKit, no whisper.cpp, no OpenAI, no self-hosted
+  server, no paid cloud API. Audio never leaves the device.
+- **Cloud (legacy/testing)**: the previous OpenAI pipeline, kept temporarily
+  for comparison. Untouched.
 
 ```text
-iPhone environmental microphone (UNCHANGED far-field capture + adaptive VAD)
-    ↓ per utterance, PCM16 in RAM only
-    ↓ MethodChannel app.livetranslator/whisperkit (Swift bridge in AppDelegate)
-WhisperKit (Swift-native, Core ML, MIT — multilingual variants only,
-            language auto-detected per utterance + script-analysis backup)
-    ↓ transcript + ISO 639-1 code  →  "Speaker · Thai 🇹🇭" etc.
-local translator (Phase A: passthrough; Phase B: M2M100)
-    ↓
-the SAME chat-bubble flow as the cloud engine (same messageId updates)
+iOS
+  environmental microphone + Dart VAD (UNCHANGED far-field capture)
+      ↓ per-utterance PCM16 @ 16 kHz
+  SFSpeechRecognizer, ON-DEVICE, one per product language IN PARALLEL
+      → winner by recognizer confidence × NLLanguageRecognizer score
+      (Apple's speech APIs are locale-fixed — SpeechTranscriber included —
+       so source auto-detection is built from parallel per-locale
+       recognition over the product set: en, ar, hi, th, bn [+ target])
+      ↓ {text, detected language}
+  Apple Translation framework (iOS 18+, on-device; packs download through
+  Apple's own prepareTranslation flow — a 1×1 hidden SwiftUI host drives
+  TranslationSession, since the framework is SwiftUI-bound below iOS 26)
+      ↓
+  existing chat bubbles (language name + flag, RTL Arabic, unchanged)
+
+Android (pipeline arrives in an upcoming build; capability probe already real)
+  on-device SpeechRecognizer (API 31+; audio language detection API 34+)
+      ↓ {text, detected language}
+  ML Kit on-device translation
+      ↓ existing chat bubbles
 ```
 
-> **History**: Phase A originally used whisper.cpp via the
-> `whisper_cpp_flutter_plus` FFI plugin. Its native model loader crashed the
-> whole process on real iPhones (uncaught C++ exceptions across the FFI
-> boundary → SIGABRT — see `IOS-LOCAL-STT-TRIAGE.md`), so the decision gate
-> replaced it with WhisperKit. There is NO Dart FFI in the speech path
-> anymore; a Swift failure surfaces as a catchable PlatformException. The
-> old ggml downloads are auto-deleted once at app start
-> (`legacy_model_cleanup.dart`).
+The user still selects ONLY "Translate to: <language>". Source languages are
+auto-detected per utterance — never configured.
 
-## Model delivery: BUNDLED in the app, zero runtime downloads
+## Capability check (never version-guessing, never a crash)
 
-WhisperKit's runtime downloader hung indefinitely on real iPhones, so it is
-disabled outright (`download: false`; the bridge refuses to load anything not
-in the bundle). Instead, CI bakes the model into the app
-(`codemagic.yaml` → "Bundle WhisperKit Core ML model" + a verify gate):
+`LiveTranslationSupportService` (`services/native/live_translation_support.dart`,
+channel `app.livetranslator/capabilities`) asks the OS APIs on THIS device:
 
-- `Runner.app/WhisperModels/openai_whisper-small/` — the Core ML model
-  (MelSpectrogram/AudioEncoder/TextDecoder `.mlmodelc`) from
-  huggingface.co/argmaxinc/whisperkit-coreml, fetched at BUILD time;
-- `Runner.app/WhisperModels/tokenizers/models/openai/whisper-small/` — the
-  tokenizer JSONs from huggingface.co/openai/whisper-small, laid out exactly
-  as WhisperKit's `tokenizerFolder` expects (the tokenizer is otherwise a
-  SEPARATE runtime download that would hang the same way).
+- OS version; on-device speech per product language
+  (`supportsOnDeviceRecognition` per locale on iOS;
+  `isOnDeviceRecognitionAvailable` + SDK level on Android);
+- automatic language detection (iOS: ≥2 on-device product languages for the
+  parallel-recognition scheme; Android: API 34 language detection);
+- on-device translation (iOS 18 `LanguageAvailability.status(from:to:)` per
+  pair — "downloadable" is a pending pack, NOT an error).
 
-The Xcode project carries a folder reference to `ios/Runner/WhisperModels`
-(git-ignored — it exists only during CI builds). Native model init has a
-hard 30 s timeout; a failure reports the exact error instead of hanging.
-This diagnostic build ships exactly ONE model — Whisper Small, multilingual —
-and every settings key resolves to it (`whisperkit_models.dart`).
+Probed at app startup and again before Start Listening; "Check Again"
+re-probes. Every failure path degrades to an honest `supported=false` result.
 
-The WhisperKit SPM package (argmaxinc/WhisperKit, pinned 1.1.0) is a Runner
-Xcode project dependency; it raised the iOS floor to 16.0. The IPA carries
-the ~500 MB model — accepted for this diagnostic build.
+**Gating**: with the native engine selected on an unsupported device, Start
+Listening is disabled ("Live Translation unavailable") and tapping it — or
+the Settings row **On-device Live Translation → Status** — shows the modal:
 
-## Phase A — validate local Whisper on a real iPhone (current state)
+- OS too old → "**Update required** — Live Translation requires a newer
+  version of iOS/Android. Your current version is {version}." (never "your
+  phone is unsupported" when an update could fix it);
+- speech OK but detection/translation missing → "**Live Translation is not
+  fully available**…";
+- otherwise → "**⚠️ Live Translation unavailable** — Your device doesn't
+  support the on-device features required for Live Translation. Update your
+  phone's software and try again."  Buttons: Check Again / OK.
 
-Wired end-to-end and unit-tested; **not yet validated on hardware** — that
-is the point of the next TestFlight run:
+A platform that cannot auto-detect arbitrary sources is reported unsupported
+for the full experience — the product is never silently reduced to a
+two-language translator.
 
-0. Settings → Developer → **Test WhisperKit**: `Bundled model found: YES` →
-   `Model load: PASS` (≤30 s) → speak → transcript + language must appear.
-   Airplane mode changes NOTHING — the model is inside the app. This one
-   test answers the build's question: can WhisperKit load and transcribe a
-   model already stored on the iPhone? If it fails here, the on-device
-   experiment stops and we move to the self-hosted API.
-1. Settings → Developer → Translation Engine → On-device.
-2. Enable Diagnostics Logging; airplane mode on, whenever you like.
-3. Speak / play YouTube per language: English, Arabic, Thai, Bengali, Hindi —
-   each bubble must show the correct transcript and language flag.
-   Arabic → Arabic passes through complete (source == target).
-   Other languages show the source transcript until Phase B.
-4. Far-field: close speaker, 2 m, 4 m, TV at 3–4 m — the capture/VAD path is
-   byte-identical to the cloud engine, so any regression is a bug.
-5. Continuous runs: 5 / 15 / 30 minutes. Every utterance logs a `[LOCAL]`
-   line with: audioMs, finalTranscriptMs, translateMs, speechEndToResultMs,
-   thermal state (nominal/fair/serious/critical), battery %, app RAM MB
-   (ProcessInfo/task_vm_info via the devicestats channel). Compare the first
-   and last minutes for thermal throttling; note battery start/end.
-6. If Turbo throttles (serious/critical, rising latency), retest with
-   `small-q5_1`.
+## Language packs
 
-## Phase B — local translation (planned, interface already in place)
+Apple downloads translation packs through its own UI (`prepareTranslation`),
+triggered at session start ("Preparing Arabic translation…" while it runs).
+A not-yet-downloaded pack is never surfaced as an error.
 
-`LocalTranslator` (`local_translation_engine.dart`) is the slot. Plan:
+## History
 
-- **Model**: facebook/m2m100_418M (MIT, ~100 languages, any→any) — one
-  multilingual model, not dozens of pairs. Never ship the 1.94 GB FP32
-  weights: INT8 quantization of the linear layers targets ~450–550 MB, added
-  to the same download catalog with checksum + SentencePiece tokenizer
-  (~2.4 MB).
-- **Runtime**: export both a Core ML program (encoder + KV-cached decoder)
-  and ONNX Runtime Mobile (ort, XNNPACK/CoreML EP); benchmark tokens/sec,
-  RAM and thermal on the target iPhone; ship the winner.
-- **Decoding**: greedy/beam-1 first (latency over polish), M2M100
-  target-language forced-BOS convention; source language comes from Whisper.
-- Source == target returns the text unchanged (already the Phase A behavior).
+whisper.cpp (`whisper_cpp_flutter_plus`) crashed natively on real iPhones
+(SIGABRT through the FFI boundary); WhisperKit's runtime model downloader
+hung indefinitely, and its CI-bundled-model build was superseded by this
+native direction before validation. Both are fully removed — no Dart FFI, no
+third-party ML runtime, no bundled models, no model CI steps. See
+`IOS-LOCAL-STT-TRIAGE.md` for the forensic record. The one-shot legacy ggml
+cleanup (`legacy_model_cleanup.dart`) still reclaims old downloads.
 
-## Acceptance target (airplane mode after download)
+## Acceptance (real device, native engine)
 
-Thai audio → Thai 🇹🇭 → Arabic; Bengali → Bengali 🇧🇩 → Arabic; English →
-English 🇬🇧 → Arabic; السلام عليكم → Arabic 🇴🇲 → unchanged. Phase A proves
-everything up to and including the language flag; Phase B completes the
-Arabic output for cross-language pairs.
+Supported device: Start Listening → English/Thai/Bengali/Hindi → Arabic and
+Arabic → Arabic, with no manual source selection. (Languages the device
+lacks on-device recognition for are listed by the probe under
+`missingLanguages` — expect Bengali/Thai to be missing on some devices; the
+status dialog shows exactly what this hardware can hear.)
+Unsupported device: Start disabled → clear modal → no crash, no endless
+loading, no mysterious failure.

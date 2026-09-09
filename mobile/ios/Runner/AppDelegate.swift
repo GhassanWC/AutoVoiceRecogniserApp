@@ -1,7 +1,10 @@
 import AVFoundation
 import Flutter
+import NaturalLanguage
+import Speech
+import SwiftUI
+import Translation
 import UIKit
-import WhisperKit
 
 /// Native microphone capture for Live Translator.
 ///
@@ -13,7 +16,7 @@ import WhisperKit
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private let audioCapture = AudioCaptureManager()
-  private let whisperKitBridge = WhisperKitBridge()
+  private let nativeSpeech = NativeSpeechBridge()
 
   override func application(
     _ application: UIApplication,
@@ -35,13 +38,31 @@ import WhisperKit
       name: "app.livetranslator/audio_events", binaryMessenger: messenger)
     events.setStreamHandler(audioCapture)
 
-    // On-device speech recognition (Phase A): WhisperKit behind one small
-    // MethodChannel. Replaces the whisper.cpp FFI plugin, whose native
-    // loader could abort the whole process.
-    let whisperKit = FlutterMethodChannel(
-      name: "app.livetranslator/whisperkit", binaryMessenger: messenger)
-    whisperKit.setMethodCallHandler { [weak self] call, result in
-      self?.whisperKitBridge.handle(call, result: result)
+    // Native on-device Live Translation (production path): Apple speech
+    // recognition + Apple Translation, all OS frameworks, zero third-party ML.
+    let capabilities = FlutterMethodChannel(
+      name: "app.livetranslator/capabilities", binaryMessenger: messenger)
+    capabilities.setMethodCallHandler { call, result in
+      guard call.method == "probe" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+      let target = (call.arguments as? [String: Any])?["targetLanguage"] as? String ?? "ar"
+      CapabilitiesProbe.probe(targetLanguage: target) { payload in
+        DispatchQueue.main.async { result(payload) }
+      }
+    }
+
+    let nativeStt = FlutterMethodChannel(
+      name: "app.livetranslator/nativestt", binaryMessenger: messenger)
+    nativeStt.setMethodCallHandler { [weak self] call, result in
+      self?.nativeSpeech.handle(call, result: result)
+    }
+
+    let translate = FlutterMethodChannel(
+      name: "app.livetranslator/translate", binaryMessenger: messenger)
+    translate.setMethodCallHandler { call, result in
+      TranslationBridge.handle(call, result: result)
     }
 
     // Thermal/battery/memory snapshots for on-device AI instrumentation.
@@ -148,209 +169,477 @@ import WhisperKit
   }
 }
 
-/// WhisperKit (Core ML, Swift-native) behind one MethodChannel:
-///
-///   Flutter → bundledModel / load(variant) / transcribe(pcm16) / unload
-///           ← {text, language} per utterance
-///
-/// The Flutter side keeps ALL capture/VAD behavior; this bridge only ever
-/// receives finished 16 kHz mono PCM16 utterances and returns the transcript
-/// with the language Whisper detected.
-///
-/// ZERO NETWORK AT RUNTIME: the Core ML model AND its tokenizer are baked
-/// into the app bundle by CI (ios/Runner/WhisperModels, see codemagic.yaml).
-/// WhisperKit's own downloader is never used — it hung indefinitely on real
-/// iPhones. If the bundled folder is missing, load fails immediately with a
-/// clear error instead of ever touching the network.
-final class WhisperKitBridge {
-  private var pipe: WhisperKit?
-  private var variant: String?
-  private var loading = false
+// ─────────────────────────────────────────────────────────────────────────────
+// Native on-device Live Translation (production path)
+//
+//   existing environmental microphone + Dart VAD (unchanged)
+//     ↓ per-utterance PCM16 @ 16 kHz
+//   NativeSpeechBridge: SFSpeechRecognizer on-device, run in PARALLEL for the
+//     product's language set → best transcript picked by recognizer
+//     confidence × NLLanguageRecognizer score  (Apple offers no audio-level
+//     language ID — SpeechTranscriber/SFSpeechRecognizer are locale-fixed —
+//     so auto-detection is built from per-locale recognizers, and
+//     CapabilitiesProbe reports honestly which locales this device has)
+//     ↓ {text, language}
+//   TranslationBridge: Apple Translation framework (iOS 18+), on-device
+//     ↓ target-language text
+//   existing chat bubbles
+// ─────────────────────────────────────────────────────────────────────────────
 
-  /// Hard cap on model initialization (includes Core ML compilation).
-  private static let loadTimeoutSeconds: UInt64 = 30
+/// The product's auto-detected language set. The user only ever picks the
+/// TARGET language; sources are detected per utterance from this set.
+enum ProductLanguages {
+  static let core = ["en", "ar", "hi", "th", "bn"]
 
-  private struct LoadTimeout: Error {}
+  static func recognitionLocale(for code: String) -> String {
+    switch code {
+    case "en": return "en-US"
+    case "ar": return "ar-SA"
+    case "hi": return "hi-IN"
+    case "th": return "th-TH"
+    case "bn": return "bn-IN"
+    default: return code
+    }
+  }
+
+  static func candidates(target: String) -> [String] {
+    core.contains(target) ? core : core + [target]
+  }
+}
+
+/// Answers, from the actual OS APIs on THIS device (never from a version
+/// number alone): can the full Live Translator experience run here?
+enum CapabilitiesProbe {
+  static func probe(targetLanguage: String, completion: @escaping ([String: Any]) -> Void) {
+    let osVersion = "iOS \(UIDevice.current.systemVersion)"
+
+    // Speech: which product languages have ON-DEVICE recognition on this
+    // hardware/OS (assets may differ per device — never assume from version).
+    var speechByLanguage: [String: Bool] = [:]
+    for code in ProductLanguages.candidates(target: targetLanguage) {
+      let locale = Locale(identifier: ProductLanguages.recognitionLocale(for: code))
+      let recognizer = SFSpeechRecognizer(locale: locale)
+      speechByLanguage[code] = recognizer?.supportsOnDeviceRecognition ?? false
+    }
+    let availableLanguages = speechByLanguage.filter { $0.value }.map { $0.key }.sorted()
+    let missingLanguages = speechByLanguage.filter { !$0.value }.map { $0.key }.sorted()
+    let speechSupported = !availableLanguages.isEmpty
+    // Our detection = parallel per-locale recognition, meaningful from 2
+    // languages up. Fewer → the product would silently degrade; report it.
+    let languageDetectionSupported = availableLanguages.count >= 2
+
+    guard #available(iOS 18.0, *) else {
+      completion([
+        "supported": false,
+        "updateRequired": true,
+        "reason": "Live Translation requires iOS 18 or newer for on-device "
+          + "translation. Your current version is \(osVersion).",
+        "osVersion": osVersion,
+        "speechSupported": speechSupported,
+        "languageDetectionSupported": languageDetectionSupported,
+        "translationSupported": false,
+        "availableLanguages": availableLanguages,
+        "missingLanguages": missingLanguages,
+        "translationPairs": [String: String](),
+      ])
+      return
+    }
+
+    // Translation: ask the framework per pair (installed / supported /
+    // unsupported). "supported" means downloadable on demand — that is NOT
+    // an error, just a pending language pack.
+    Task {
+      let availability = LanguageAvailability()
+      let targetLang = Locale.Language(identifier: targetLanguage)
+      var pairs: [String: String] = [:]
+      var translatableSources = 0
+      var sourcesChecked = 0
+      for code in availableLanguages where code != targetLanguage {
+        sourcesChecked += 1
+        let status = await availability.status(
+          from: Locale.Language(identifier: code), to: targetLang)
+        let label: String
+        switch status {
+        case .installed: label = "installed"
+        case .supported: label = "downloadable"
+        case .unsupported: label = "unsupported"
+        @unknown default: label = "unknown"
+        }
+        pairs[code] = label
+        if label == "installed" || label == "downloadable" { translatableSources += 1 }
+      }
+      // Same-language passthrough (ar→ar) needs no translation model.
+      let translationSupported = sourcesChecked == 0 || translatableSources > 0
+
+      let supported = speechSupported && languageDetectionSupported && translationSupported
+      var reason = "Supported"
+      if !speechSupported {
+        reason = "This device has no on-device speech recognition for the "
+          + "Live Translator languages."
+      } else if !languageDetectionSupported {
+        reason = "Automatic language detection needs at least two on-device "
+          + "speech languages; this device only has: "
+          + "\(availableLanguages.joined(separator: ", "))."
+      } else if !translationSupported {
+        reason = "On-device translation to '\(targetLanguage)' is not "
+          + "available for this device's languages."
+      } else if !missingLanguages.isEmpty {
+        reason = "Supported. Not yet recognizable on this device: "
+          + "\(missingLanguages.joined(separator: ", "))."
+      }
+      completion([
+        "supported": supported,
+        "updateRequired": false,
+        "reason": reason,
+        "osVersion": osVersion,
+        "speechSupported": speechSupported,
+        "languageDetectionSupported": languageDetectionSupported,
+        "translationSupported": translationSupported,
+        "availableLanguages": availableLanguages,
+        "missingLanguages": missingLanguages,
+        "translationPairs": pairs,
+      ])
+    }
+  }
+}
+
+/// Per-utterance on-device recognition with language auto-detection:
+/// the SAME 16 kHz PCM16 utterance (from the unchanged environmental
+/// capture + VAD) runs through one on-device SFSpeechRecognizer per
+/// available product language in parallel; the winner is chosen by average
+/// segment confidence blended with NLLanguageRecognizer's score of the
+/// hypothesis text.
+final class NativeSpeechBridge {
+  private var detectionLanguages: [String] = []
 
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
-    case "bundledModel":
-      bundledModel(call, result: result)
-    case "load":
-      load(call, result: result)
-    case "transcribe":
-      transcribe(call, result: result)
-    case "unload":
-      pipe = nil
-      variant = nil
-      result(nil)
-    case "isLoaded":
-      result(pipe == nil ? nil : variant)
+    case "prepare":
+      prepare(call, result: result)
+    case "recognize":
+      recognize(call, result: result)
     default:
       result(FlutterMethodNotImplemented)
     }
   }
 
-  /// Bundle.main locations for a variant's model + tokenizer folders.
-  private static func bundledPaths(variant: String)
-    -> (model: String, tokenizer: String)?
-  {
-    guard let resources = Bundle.main.resourcePath else { return nil }
-    let root = "\(resources)/WhisperModels"
-    return (model: "\(root)/\(variant)", tokenizer: "\(root)/tokenizers")
-  }
-
-  /// Reports whether the CI-bundled model is actually inside this build,
-  /// listing exactly which required pieces exist — the Test WhisperKit
-  /// "Bundled model found:" line comes from here.
-  private func bundledModel(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    guard let requested = (call.arguments as? [String: Any])?["variant"] as? String,
-      let paths = WhisperKitBridge.bundledPaths(variant: requested)
-    else {
-      result(FlutterError(code: "bad_args", message: "variant is required", details: nil))
-      return
-    }
-    let fm = FileManager.default
-    var pieces: [String: Bool] = [:]
-    for name in ["MelSpectrogram.mlmodelc", "AudioEncoder.mlmodelc", "TextDecoder.mlmodelc"] {
-      pieces["model/\(name)"] = fm.fileExists(atPath: "\(paths.model)/\(name)")
-    }
-    // Diagnostic build ships exactly one model, so the tokenizer repo path
-    // is fixed: openai_whisper-small tokenizes with openai/whisper-small.
-    let tokenizerDir = "\(paths.tokenizer)/models/openai/whisper-small"
-    for name in ["tokenizer.json", "tokenizer_config.json", "config.json"] {
-      pieces["tokenizer/\(name)"] = fm.fileExists(atPath: "\(tokenizerDir)/\(name)")
-    }
-    result([
-      "found": pieces.values.allSatisfy { $0 },
-      "modelPath": paths.model,
-      "tokenizerPath": paths.tokenizer,
-      "pieces": pieces,
-    ])
-  }
-
-  private func load(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    guard let requested = (call.arguments as? [String: Any])?["variant"] as? String else {
-      result(FlutterError(code: "bad_args", message: "variant is required", details: nil))
-      return
-    }
-    if pipe != nil, variant == requested {
-      result(["initMs": 0, "alreadyLoaded": true, "variant": requested])
-      return
-    }
-    if loading {
-      result(FlutterError(code: "busy", message: "a model load is already in progress", details: nil))
-      return
-    }
-    guard let paths = WhisperKitBridge.bundledPaths(variant: requested),
-      FileManager.default.fileExists(atPath: "\(paths.model)/TextDecoder.mlmodelc")
-    else {
-      result(FlutterError(
-        code: "bundled_model_missing",
-        message: "The bundled Core ML model for '\(requested)' is not inside this build "
-          + "(expected in <app bundle>/WhisperModels/\(requested)). This build never "
-          + "downloads models at runtime — rebuild with the CI bundling step.",
-        details: nil))
-      return
-    }
-    loading = true
-    pipe = nil
-    variant = nil
-    let started = Date()
-    Task { [weak self] in
-      do {
-        // Strictly local: model + tokenizer come from the app bundle,
-        // download:false. Hard 30 s timeout so a wedged load can never hang
-        // the UI "Loading WhisperKit" forever again.
-        let config = WhisperKitConfig(
-          model: requested,
-          modelFolder: paths.model,
-          tokenizerFolder: URL(fileURLWithPath: paths.tokenizer),
-          prewarm: true,
-          load: true,
-          download: false)
-        let loaded = try await withThrowingTaskGroup(of: WhisperKit.self) { group in
-          group.addTask { try await WhisperKit(config) }
-          group.addTask {
-            try await Task.sleep(nanoseconds: WhisperKitBridge.loadTimeoutSeconds * 1_000_000_000)
-            throw LoadTimeout()
-          }
-          let first = try await group.next()!
-          group.cancelAll()
-          return first
-        }
-        let ms = Int(Date().timeIntervalSince(started) * 1000)
-        await MainActor.run {
-          guard let self else { return }
-          self.pipe = loaded
-          self.variant = requested
-          self.loading = false
-          result(["initMs": ms, "alreadyLoaded": false, "variant": requested])
-        }
-      } catch is LoadTimeout {
-        await MainActor.run {
-          self?.loading = false
+  /// Requests speech-recognition authorization (first run shows the OS
+  /// dialog) and fixes the detection set to the languages this device can
+  /// recognize on-device right now.
+  private func prepare(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let target = (call.arguments as? [String: Any])?["targetLanguage"] as? String ?? "ar"
+    SFSpeechRecognizer.requestAuthorization { [weak self] status in
+      DispatchQueue.main.async {
+        guard status == .authorized else {
           result(FlutterError(
-            code: "whisperkit_load_timeout",
-            message: "Model initialization exceeded \(WhisperKitBridge.loadTimeoutSeconds)s "
-              + "with the model already on disk (no network involved). First launch "
-              + "compiles the Core ML model — retry once; if it times out again, "
-              + "WhisperKit cannot load on this device.",
+            code: "speech_permission_denied",
+            message: "Speech recognition permission is \(status.rawValue) — "
+              + "enable it in Settings → Live Translator.",
             details: nil))
+          return
         }
-      } catch {
-        await MainActor.run {
-          self?.loading = false
-          result(FlutterError(
-            code: "whisperkit_load_failed", message: "\(error)", details: nil))
+        var available: [String] = []
+        for code in ProductLanguages.candidates(target: target) {
+          let locale = Locale(identifier: ProductLanguages.recognitionLocale(for: code))
+          if SFSpeechRecognizer(locale: locale)?.supportsOnDeviceRecognition == true {
+            available.append(code)
+          }
         }
+        self?.detectionLanguages = available
+        result(["languages": available])
       }
     }
   }
 
-  private func transcribe(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    guard let pipe else {
-      result(FlutterError(code: "not_loaded", message: "load a model first", details: nil))
-      return
-    }
-    guard let data = ((call.arguments as? [String: Any])?["pcm16"]
-      as? FlutterStandardTypedData)?.data, !data.isEmpty else {
+  private func recognize(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any],
+      let pcm = (args["pcm16"] as? FlutterStandardTypedData)?.data, !pcm.isEmpty
+    else {
       result(FlutterError(code: "bad_args", message: "pcm16 audio is required", details: nil))
       return
     }
-    // PCM16LE mono 16 kHz → normalized Float samples, as WhisperKit expects.
-    let count = data.count / 2
-    var samples = [Float](repeating: 0, count: count)
+    let sampleRate = args["sampleRate"] as? Int ?? 16000
+    let languages = detectionLanguages
+    guard !languages.isEmpty else {
+      result(FlutterError(
+        code: "not_prepared", message: "call prepare before recognize", details: nil))
+      return
+    }
+    guard let buffer = Self.floatBuffer(fromPCM16: pcm, sampleRate: Double(sampleRate)) else {
+      result(FlutterError(code: "bad_audio", message: "could not build audio buffer", details: nil))
+      return
+    }
+
+    // One on-device recognition task per candidate language, in parallel.
+    let group = DispatchGroup()
+    let lock = NSLock()
+    var hypotheses: [(language: String, text: String, confidence: Double)] = []
+    var tasks: [SFSpeechRecognitionTask] = []
+
+    for code in languages {
+      let locale = Locale(identifier: ProductLanguages.recognitionLocale(for: code))
+      guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable
+      else { continue }
+      let request = SFSpeechAudioBufferRecognitionRequest()
+      request.requiresOnDeviceRecognition = true
+      request.shouldReportPartialResults = false
+      request.append(buffer)
+      request.endAudio()
+      group.enter()
+      var finished = false
+      let task = recognizer.recognitionTask(with: request) { recognition, error in
+        if finished { return }
+        if let recognition, recognition.isFinal {
+          finished = true
+          let text = recognition.bestTranscription.formattedString
+          let segments = recognition.bestTranscription.segments
+          let confidence = segments.isEmpty
+            ? 0.0
+            : segments.reduce(0.0) { $0 + Double($1.confidence) } / Double(segments.count)
+          lock.lock()
+          hypotheses.append((code, text, confidence))
+          lock.unlock()
+          group.leave()
+        } else if error != nil {
+          finished = true
+          group.leave()
+        }
+      }
+      tasks.append(task)
+    }
+
+    DispatchQueue.global(qos: .userInitiated).async {
+      // Hard cap so one wedged recognizer can never hang the session.
+      let outcome = group.wait(timeout: .now() + 15)
+      tasks.forEach { $0.cancel() }
+      lock.lock()
+      let collected = hypotheses
+      lock.unlock()
+
+      // Blend recognizer confidence with NLLanguageRecognizer's opinion of
+      // the hypothesis text — a wrong-language recognizer produces low-
+      // confidence gibberish that also scores near zero on its language.
+      var best: (language: String, text: String, score: Double)? = nil
+      for hypothesis in collected {
+        let text = hypothesis.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { continue }
+        let nl = NLLanguageRecognizer()
+        nl.processString(text)
+        let nlProb = nl.languageHypotheses(withMaximum: 8)[
+          NLLanguage(rawValue: hypothesis.language)] ?? 0
+        let score = hypothesis.confidence * 0.6 + nlProb * 0.4
+        if best == nil || score > best!.score {
+          best = (hypothesis.language, text, score)
+        }
+      }
+      DispatchQueue.main.async {
+        if let best {
+          result(["text": best.text, "language": best.language])
+        } else if outcome == .timedOut && collected.isEmpty {
+          result(FlutterError(
+            code: "recognition_timeout",
+            message: "on-device recognition produced no result within 15s",
+            details: nil))
+        } else {
+          // Silence / non-speech: an empty utterance, not an error.
+          result(["text": "", "language": "und"])
+        }
+      }
+    }
+  }
+
+  private static func floatBuffer(fromPCM16 data: Data, sampleRate: Double)
+    -> AVAudioPCMBuffer?
+  {
+    let frames = data.count / 2
+    guard frames > 0,
+      let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1,
+        interleaved: false),
+      let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))
+    else { return nil }
+    buffer.frameLength = AVAudioFrameCount(frames)
+    guard let channel = buffer.floatChannelData?[0] else { return nil }
     data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
       let int16 = raw.bindMemory(to: Int16.self)
-      for i in 0..<count {
-        samples[i] = Float(Int16(littleEndian: int16[i])) / 32768.0
+      for i in 0..<frames {
+        channel[i] = Float(Int16(littleEndian: int16[i])) / 32768.0
       }
     }
-    Task {
+    return buffer
+  }
+}
+
+/// Apple Translation framework behind a MethodChannel.
+///
+/// The framework only hands out TranslationSession through SwiftUI's
+/// .translationTask, so a 1×1 invisible SwiftUI host lives in the key
+/// window and executes queued jobs (translate / prepare-download). Language
+/// packs download through the OS's own prepareTranslation flow — never a
+/// custom downloader.
+enum TranslationBridge {
+  static func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard #available(iOS 18.0, *) else {
+      result(FlutterError(
+        code: "translation_requires_ios18",
+        message: "On-device translation requires iOS 18 or newer.",
+        details: nil))
+      return
+    }
+    let args = call.arguments as? [String: Any]
+    let source = args?["from"] as? String
+    guard let target = args?["to"] as? String else {
+      result(FlutterError(code: "bad_args", message: "'to' language is required", details: nil))
+      return
+    }
+    switch call.method {
+    case "translate":
+      guard let text = args?["text"] as? String, !text.isEmpty else {
+        result(FlutterError(code: "bad_args", message: "text is required", details: nil))
+        return
+      }
+      TranslationHost.shared.submit(.init(kind: .translate(text), source: source, target: target)) {
+        outcome in
+        switch outcome {
+        case .success(let translated): result(["text": translated])
+        case .failure(let error):
+          result(FlutterError(code: "translate_failed", message: "\(error)", details: nil))
+        }
+      }
+    case "prepare":
+      TranslationHost.shared.submit(.init(kind: .prepare, source: source, target: target)) {
+        outcome in
+        switch outcome {
+        case .success: result(nil)
+        case .failure(let error):
+          result(FlutterError(code: "prepare_failed", message: "\(error)", details: nil))
+        }
+      }
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+}
+
+@available(iOS 18.0, *)
+final class TranslationHost {
+  static let shared = TranslationHost()
+
+  struct Job {
+    enum Kind {
+      case translate(String)
+      case prepare
+    }
+
+    let kind: Kind
+    let source: String?
+    let target: String
+    var completion: ((Result<String, Error>) -> Void)?
+
+    init(kind: Kind, source: String?, target: String) {
+      self.kind = kind
+      self.source = source
+      self.target = target
+    }
+  }
+
+  let model = TranslationHostModel()
+  private var hosting: UIHostingController<TranslationHostView>?
+
+  func submit(_ job: Job, completion: @escaping (Result<String, Error>) -> Void) {
+    DispatchQueue.main.async {
+      self.attachIfNeeded()
+      var queued = job
+      queued.completion = completion
+      self.model.enqueue(queued)
+    }
+  }
+
+  private func attachIfNeeded() {
+    guard hosting == nil else { return }
+    guard
+      let window = UIApplication.shared.connectedScenes
+        .compactMap({ $0 as? UIWindowScene })
+        .flatMap({ $0.windows })
+        .first(where: { $0.isKeyWindow }) ?? UIApplication.shared.connectedScenes
+        .compactMap({ ($0 as? UIWindowScene)?.windows.first }).first
+    else { return }
+    let controller = UIHostingController(rootView: TranslationHostView(model: model))
+    controller.view.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+    controller.view.alpha = 0.01
+    controller.view.isUserInteractionEnabled = false
+    controller.view.backgroundColor = .clear
+    window.addSubview(controller.view)
+    hosting = controller
+  }
+}
+
+/// Serial job queue: each (source→target) batch gets one translationTask
+/// session; re-triggering uses Configuration.invalidate() as Apple intends.
+@available(iOS 18.0, *)
+final class TranslationHostModel: ObservableObject {
+  @Published var configuration: TranslationSession.Configuration?
+
+  private var queue: [TranslationHost.Job] = []
+  private var draining = false
+
+  func enqueue(_ job: TranslationHost.Job) {
+    queue.append(job)
+    kick()
+  }
+
+  private func kick() {
+    guard !draining, let next = queue.first else { return }
+    draining = true
+    let source = next.source.map { Locale.Language(identifier: $0) }
+    let target = Locale.Language(identifier: next.target)
+    if configuration?.source == source && configuration?.target == target {
+      configuration?.invalidate()  // same pair: bump the session
+    } else {
+      configuration = TranslationSession.Configuration(source: source, target: target)
+    }
+  }
+
+  /// Runs inside .translationTask with a live session for the current pair.
+  @MainActor
+  func run(session: TranslationSession) async {
+    while let job = nextJob(matching: session) {
       do {
-        // Language is auto-detected PER UTTERANCE — never configured; the
-        // room may switch between languages freely (product rule).
-        let options = DecodingOptions(
-          task: .transcribe,
-          language: nil,
-          usePrefillPrompt: true,
-          detectLanguage: true,
-          skipSpecialTokens: true)
-        let results = try await pipe.transcribe(audioArray: samples, decodeOptions: options)
-        let text = results.map(\.text).joined(separator: " ")
-          .trimmingCharacters(in: .whitespacesAndNewlines)
-        let language = results.first?.language ?? "und"
-        await MainActor.run {
-          result(["text": text, "language": language])
+        switch job.kind {
+        case .prepare:
+          try await session.prepareTranslation()
+          job.completion?(.success(""))
+        case .translate(let text):
+          let response = try await session.translate(text)
+          job.completion?(.success(response.targetText))
         }
       } catch {
-        await MainActor.run {
-          result(FlutterError(
-            code: "whisperkit_transcribe_failed", message: "\(error)", details: nil))
-        }
+        job.completion?(.failure(error))
       }
     }
+    draining = false
+    kick()  // jobs for a different pair may be waiting
+  }
+
+  @MainActor
+  private func nextJob(matching session: TranslationSession) -> TranslationHost.Job? {
+    guard let job = queue.first else { return nil }
+    let source = job.source.map { Locale.Language(identifier: $0) }
+    let target = Locale.Language(identifier: job.target)
+    guard configuration?.source == source, configuration?.target == target else { return nil }
+    return queue.removeFirst()
+  }
+}
+
+@available(iOS 18.0, *)
+struct TranslationHostView: View {
+  @ObservedObject var model: TranslationHostModel
+
+  var body: some View {
+    Color.clear
+      .translationTask(model.configuration) { session in
+        await model.run(session: session)
+      }
   }
 }
 

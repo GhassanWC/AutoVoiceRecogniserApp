@@ -3,6 +3,14 @@
 Status: 2026-09-08. Phase B is frozen until the acceptance gate below passes
 on TestFlight. The cloud/OpenAI engine is untouched.
 
+> **FINAL DIRECTION (2026-09-09):** WhisperKit is also out — its runtime
+> model downloader hung indefinitely on real iPhones, and the direction
+> changed before the bundled-model diagnostic shipped. The production local
+> path is now the PLATFORM'S OWN on-device speech + translation (Apple
+> Speech/Translation on iOS, SpeechRecognizer/ML Kit on Android) behind a
+> device capability probe. See `ONDEVICE.md`. Everything below is the
+> historical record of the whisper.cpp/WhisperKit investigation.
+
 > **DECISION GATE OUTCOME (2026-09-08, later the same day):** Test Offline
 > Model still crashed the app on a real iPhone after the linking fix → the
 > gate FAILED. `whisper_cpp_flutter_plus` is removed from the project

@@ -1,7 +1,8 @@
 # Committed deliberately (previously auto-generated at build time) so the
-# permission_handler macro below survives every pod install. iOS 16 is the
-# floor because on-device speech uses the WhisperKit SPM package (added to
-# the Runner Xcode project), which requires it.
+# permission_handler macro below survives every pod install. The on-device
+# Live Translation path uses only OS frameworks (Speech, Translation,
+# NaturalLanguage); Apple Translation needs iOS 18 at RUNTIME — checked by
+# the capability probe, never assumed from this build floor.
 platform :ios, '16.0'
 
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
