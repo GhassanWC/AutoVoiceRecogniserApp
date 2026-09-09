@@ -242,6 +242,35 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       return;
     }
 
+    // 1b. Supported-but-not-downloaded speech models: fetch them through
+    //     the OS (AssetInventory) with live progress — a pending pack is a
+    //     download, never an error.
+    if (support.pendingDownloads.isNotEmpty) {
+      try {
+        activityLabel = 'Preparing Live Translation…';
+        notifyListeners();
+        await NativeSpeechAssets.install(
+          targetLanguage: target,
+          onProgress: (progress) {
+            final code = progress.language;
+            final name =
+                code == null ? null : (languageForCode(code)?.name ?? code);
+            activityLabel = name == null
+                ? 'Preparing Live Translation…'
+                : 'Downloading $name speech… '
+                    '${(progress.fraction * 100).toStringAsFixed(0)}%';
+            notifyListeners();
+          },
+        );
+      } catch (error) {
+        _failStart('Could not download speech languages — $error');
+        return;
+      }
+      activityLabel = null;
+      // Installed set changed — re-run the capability check (required).
+      await sharedLiveTranslationSupport.refresh(targetLanguage: target);
+    }
+
     // 2. Speech setup (authorization + pin the on-device detection set).
     final engine = _localEngine ??= NativeSpeechEngine();
     try {

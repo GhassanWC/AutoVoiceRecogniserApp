@@ -24,6 +24,41 @@ void main() {
       expect(support.partiallySupported, isFalse);
     });
 
+    test('supported-but-not-installed models are pending downloads, NOT unsupported', () {
+      final support = LiveTranslationSupport.fromMap({
+        'supported': true,
+        'updateRequired': false,
+        'reason': 'Supported. Language packs to download: ar, bn, hi, th.',
+        'osVersion': 'iOS 26.0',
+        'speechSupported': true,
+        'languageDetectionSupported': true,
+        'translationSupported': true,
+        'availableLanguages': ['ar', 'bn', 'en', 'hi', 'th'],
+        'readyLanguages': ['en'],
+        'pendingDownloads': ['ar', 'bn', 'hi', 'th'],
+        'missingLanguages': <String>[],
+        'languageStatus': {
+          'en': 'ready',
+          'ar': 'downloadRequired',
+          'hi': 'downloadRequired',
+          'th': 'downloadRequired',
+          'bn': 'downloadRequired',
+        },
+        'speechDiagnostics': [
+          'supportedLocales=ar-SA bn-IN en-US hi-IN th-TH',
+          'installedLocales=en-US',
+        ],
+      });
+      // The iPhone 16 Pro Max case: only English installed, but Apple
+      // SUPPORTS the rest → the device is supported with downloads pending.
+      expect(support.supported, isTrue);
+      expect(support.readyLanguages, ['en']);
+      expect(support.pendingDownloads, ['ar', 'bn', 'hi', 'th']);
+      expect(support.languageStatus['ar'], 'downloadRequired');
+      expect(support.partiallySupported, isFalse);
+      expect(support.speechDiagnostics.first, contains('supportedLocales='));
+    });
+
     test('speech-only devices are PARTIALLY supported, never silently degraded', () {
       final support = LiveTranslationSupport.fromMap({
         'supported': false,

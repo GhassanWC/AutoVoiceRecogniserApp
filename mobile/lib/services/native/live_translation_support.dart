@@ -22,8 +22,12 @@ class LiveTranslationSupport {
     required this.translationSupported,
     required this.updateRequired,
     this.availableLanguages = const [],
+    this.readyLanguages = const [],
+    this.pendingDownloads = const [],
     this.missingLanguages = const [],
+    this.languageStatus = const {},
     this.translationPairs = const {},
+    this.speechDiagnostics = const [],
   });
 
   final bool supported;
@@ -39,9 +43,26 @@ class LiveTranslationSupport {
   /// required", never that the phone is permanently unsupported.
   final bool updateRequired;
 
-  /// Product languages this device can recognize on-device right now.
+  /// Product languages Apple/Google SUPPORT on this device (installed or
+  /// downloadable). A not-yet-downloaded model is NEVER "unsupported".
   final List<String> availableLanguages;
+
+  /// Subset of [availableLanguages] whose speech model is installed now.
+  final List<String> readyLanguages;
+
+  /// Supported languages whose speech model still needs downloading
+  /// (Settings offers "Prepare Live Translation" for these).
+  final List<String> pendingDownloads;
+
+  /// Languages Apple/Google do not offer on this device at all.
   final List<String> missingLanguages;
+
+  /// language code → "ready" | "downloadRequired" | "unsupported".
+  final Map<String, String> languageStatus;
+
+  /// Raw probe evidence (supportedLocales= / installedLocales= /
+  /// reservedLocales= / maximumReservedLocales= on iOS 26).
+  final List<String> speechDiagnostics;
 
   /// source language → translation-pack status ("installed" / "downloadable"
   /// / "unsupported"). "downloadable" is NOT an error — just a pending pack.
@@ -78,14 +99,28 @@ class LiveTranslationSupport {
         availableLanguages: [
           for (final code in map['availableLanguages'] as List<Object?>? ?? []) '$code'
         ],
+        readyLanguages: [
+          for (final code in map['readyLanguages'] as List<Object?>? ?? []) '$code'
+        ],
+        pendingDownloads: [
+          for (final code in map['pendingDownloads'] as List<Object?>? ?? []) '$code'
+        ],
         missingLanguages: [
           for (final code in map['missingLanguages'] as List<Object?>? ?? []) '$code'
         ],
+        languageStatus: {
+          for (final entry
+              in (map['languageStatus'] as Map<Object?, Object?>? ?? {}).entries)
+            '${entry.key}': '${entry.value}'
+        },
         translationPairs: {
           for (final entry
               in (map['translationPairs'] as Map<Object?, Object?>? ?? {}).entries)
             '${entry.key}': '${entry.value}'
         },
+        speechDiagnostics: [
+          for (final line in map['speechDiagnostics'] as List<Object?>? ?? []) '$line'
+        ],
       );
 }
 
@@ -134,9 +169,14 @@ class LiveTranslationSupportService extends ChangeNotifier {
     developer.log(
       '[SUPPORT] supported=${support.supported} os=${support.osVersion} '
       'speech=${support.speechSupported} detect=${support.languageDetectionSupported} '
-      'translate=${support.translationSupported} reason=${support.reason}',
+      'translate=${support.translationSupported} '
+      'ready=${support.readyLanguages} pending=${support.pendingDownloads} '
+      'reason=${support.reason}',
       name: 'support',
     );
+    for (final line in support.speechDiagnostics) {
+      developer.log('[SUPPORT] $line', name: 'support');
+    }
     current = support;
     probing = false;
     notifyListeners();
@@ -147,3 +187,65 @@ class LiveTranslationSupportService extends ChangeNotifier {
 /// One instance shared by the whole app.
 final LiveTranslationSupportService sharedLiveTranslationSupport =
     LiveTranslationSupportService();
+
+/// Progress snapshot for a running speech-asset installation.
+class SpeechAssetInstallProgress {
+  const SpeechAssetInstallProgress({
+    required this.running,
+    required this.language,
+    required this.fraction,
+    required this.completed,
+    required this.total,
+  });
+
+  final bool running;
+  final String? language;
+  final double fraction;
+  final int completed;
+  final int total;
+}
+
+/// Downloads the supported-but-not-installed speech models through the
+/// PLATFORM's own mechanism (AssetInventory.assetInstallationRequest →
+/// downloadAndInstall on iOS 26). Used by Settings' "Prepare Live
+/// Translation" and by session start when packs are pending.
+class NativeSpeechAssets {
+  static const MethodChannel _channel =
+      MethodChannel('app.livetranslator/nativestt');
+
+  /// Runs the installation, reporting polled progress. Throws on a real
+  /// installation failure; a platform without downloadable speech assets
+  /// (pre-iOS 26, Android for now) returns immediately.
+  static Future<void> install({
+    required String targetLanguage,
+    void Function(SpeechAssetInstallProgress progress)? onProgress,
+  }) async {
+    final install = _channel.invokeMethod<void>(
+      'installAssets',
+      {'targetLanguage': targetLanguage},
+    ).timeout(const Duration(minutes: 20));
+
+    var done = false;
+    unawaited(install.whenComplete(() => done = true));
+    while (!done) {
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      if (onProgress == null || done) continue;
+      try {
+        final map =
+            await _channel.invokeMethod<Map<Object?, Object?>>('installProgress');
+        if (map != null) {
+          onProgress(SpeechAssetInstallProgress(
+            running: map['running'] == true,
+            language: map['language'] as String?,
+            fraction: (map['fraction'] as num?)?.toDouble() ?? 0,
+            completed: (map['completed'] as num?)?.toInt() ?? 0,
+            total: (map['total'] as num?)?.toInt() ?? 0,
+          ));
+        }
+      } catch (_) {
+        // Progress polling is best-effort; the install future is the truth.
+      }
+    }
+    await install; // rethrows a real installation failure
+  }
+}

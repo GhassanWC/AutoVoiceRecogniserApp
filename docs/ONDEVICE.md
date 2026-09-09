@@ -37,15 +37,32 @@ auto-detected per utterance — never configured.
 ## Capability check (never version-guessing, never a crash)
 
 `LiveTranslationSupportService` (`services/native/live_translation_support.dart`,
-channel `app.livetranslator/capabilities`) asks the OS APIs on THIS device:
+channel `app.livetranslator/capabilities`) asks the OS APIs on THIS device,
+keeping **SUPPORTED and INSTALLED strictly apart** — a supported-but-not-
+downloaded model is `downloadRequired`, never "unsupported":
 
-- OS version; on-device speech per product language
-  (`supportsOnDeviceRecognition` per locale on iOS;
-  `isOnDeviceRecognitionAvailable` + SDK level on Android);
-- automatic language detection (iOS: ≥2 on-device product languages for the
+- iOS 26+: `SpeechTranscriber.supportedLocales` is the CAPABILITY list;
+  `SpeechTranscriber.installedLocales` only says what is downloaded.
+  `SFSpeechRecognizer.supportsOnDeviceRecognition` is NOT used as the
+  capability test there (it reflects installed dictation assets only — the
+  bug that made an iPhone 16 Pro Max report just "en"). Diagnostics print
+  `supportedLocales= / installedLocales= / reservedLocales= /
+  maximumReservedLocales=`. Pre-26 falls back to `SFSpeechRecognizer`
+  (no supported/installed split exists there).
+- Missing supported models install through Apple's own
+  `AssetInventory.assetInstallationRequest(supporting:).downloadAndInstall()`
+  — Settings → status dialog → **Prepare Live Translation** (per-language
+  progress), and automatically at session start; the capability check
+  re-runs after installation. Recognition on iOS 26 uses
+  SpeechAnalyzer/SpeechTranscriber (the stack those assets power).
+- automatic language detection (≥2 SUPPORTED product languages for the
   parallel-recognition scheme; Android: API 34 language detection);
 - on-device translation (iOS 18 `LanguageAvailability.status(from:to:)` per
   pair — "downloadable" is a pending pack, NOT an error).
+
+The status dialog lists each product language as `Ready ✓`,
+`Download required`, or `Unsupported` (only when absent from
+`supportedLocales`).
 
 Probed at app startup and again before Start Listening; "Check Again"
 re-probes. Every failure path degrades to an honest `supported=false` result.

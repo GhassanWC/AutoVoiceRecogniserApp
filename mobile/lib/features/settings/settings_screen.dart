@@ -375,26 +375,7 @@ class _SupportStatusTile extends StatelessWidget {
                 await service.ensure(targetLanguage: targetLanguage);
             if (!context.mounted) return;
             if (current.supported) {
-              await showDialog<void>(
-                context: context,
-                builder: (dialogContext) => AlertDialog(
-                  title: const Text('Supported ✓'),
-                  content: Text(
-                    '${current.reason}\n\n'
-                    'OS: ${current.osVersion}\n'
-                    'Speech recognition: ${current.speechSupported ? 'yes' : 'no'}\n'
-                    'Language auto-detection: ${current.languageDetectionSupported ? 'yes' : 'no'}\n'
-                    'On-device translation: ${current.translationSupported ? 'yes' : 'no'}\n'
-                    'Languages on this device: ${current.availableLanguages.join(', ')}',
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(dialogContext),
-                      child: const Text('Close'),
-                    ),
-                  ],
-                ),
-              );
+              await _showStatusDialog(context, current);
             } else {
               await showLiveTranslationUnsupportedDialog(
                 context,
@@ -406,6 +387,122 @@ class _SupportStatusTile extends StatelessWidget {
         );
       },
     );
+  }
+
+  String _languageName(String code) => languageForCode(code)?.name ?? code;
+
+  /// Per-language status ("Ready ✓" / "Download required" / "Unsupported"),
+  /// the raw probe diagnostics, and — when models are pending — the
+  /// "Prepare Live Translation" action that downloads them via the OS.
+  Future<void> _showStatusDialog(
+      BuildContext context, LiveTranslationSupport support) async {
+    final codes = support.languageStatus.keys.toList()
+      ..sort((a, b) => _languageName(a).compareTo(_languageName(b)));
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('On-device Live Translation'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final code in codes)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(_languageName(code)),
+                      Text(switch (support.languageStatus[code]) {
+                        'ready' => 'Ready ✓',
+                        'downloadRequired' => 'Download required',
+                        _ => 'Unsupported',
+                      }),
+                    ],
+                  ),
+                ),
+              const SizedBox(height: 10),
+              Text('OS: ${support.osVersion}\n${support.reason}',
+                  style: Theme.of(dialogContext).textTheme.bodySmall),
+              if (support.speechDiagnostics.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                SelectableText(
+                  support.speechDiagnostics.join('\n'),
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 10),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          if (support.pendingDownloads.isNotEmpty)
+            FilledButton(
+              onPressed: () {
+                Navigator.pop(dialogContext);
+                _prepareLiveTranslation(context);
+              },
+              child: const Text('Prepare Live Translation'),
+            ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Downloads the pending speech models through Apple's AssetInventory,
+  /// with live progress, then RE-RUNS the capability check and shows the
+  /// refreshed per-language status.
+  Future<void> _prepareLiveTranslation(BuildContext context) async {
+    final progress = ValueNotifier<SpeechAssetInstallProgress?>(null);
+    var dismissed = false;
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        content: ValueListenableBuilder<SpeechAssetInstallProgress?>(
+          valueListenable: progress,
+          builder: (dialogContext, value, _) {
+            final language = value?.language;
+            final label = language == null
+                ? 'Preparing Live Translation…'
+                : 'Preparing ${_languageName(language)}… '
+                    '${((value?.fraction ?? 0) * 100).toStringAsFixed(0)}%'
+                    '${(value?.total ?? 0) > 1 ? '  (${(value?.completed ?? 0) + 1}/${value?.total})' : ''}';
+            return Row(
+              children: [
+                const CircularProgressIndicator(),
+                const SizedBox(width: 16),
+                Expanded(child: Text(label)),
+              ],
+            );
+          },
+        ),
+      ),
+    ).whenComplete(() => dismissed = true));
+
+    String? failure;
+    try {
+      await NativeSpeechAssets.install(
+        targetLanguage: targetLanguage,
+        onProgress: (value) => progress.value = value,
+      );
+    } catch (error) {
+      failure = '$error';
+    }
+    // Installation changes the device's installed set — re-probe (required).
+    final refreshed = await sharedLiveTranslationSupport.refresh(
+        targetLanguage: targetLanguage);
+    if (!context.mounted) return;
+    if (!dismissed) Navigator.of(context, rootNavigator: true).pop();
+    if (failure != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Language download failed: $failure')));
+    }
+    await _showStatusDialog(context, refreshed);
   }
 }
 
