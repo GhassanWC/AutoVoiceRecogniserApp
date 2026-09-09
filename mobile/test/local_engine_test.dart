@@ -18,7 +18,7 @@ class FakeLocalSpeechEngine implements LocalSpeechEngine {
   bool get isLoaded => loaded;
 
   @override
-  Future<void> load(String modelPath) async {
+  Future<void> load(List<String> languages) async {
     loaded = true;
   }
 

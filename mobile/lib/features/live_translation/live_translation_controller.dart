@@ -86,6 +86,10 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   /// 0..1 microphone level for the waveform animation.
   double micLevel = 0;
 
+  /// Languages the CURRENT native session is listening for (session UI:
+  /// "Listening for: English • Thai"). Empty when idle or on other engines.
+  List<String> activeLanguages = [];
+
   /// Persistent problem shown as a banner (null = none).
   String? errorBanner;
 
@@ -227,30 +231,51 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   }
 
   /// Starts the native on-device pipeline: existing far-field capture + VAD
-  /// (unchanged tuning) → the platform's own on-device speech recognition
-  /// (source language auto-detected per utterance) → the platform's own
-  /// on-device translation → same chat UI. Guarded by the capability probe:
-  /// an unsupported device gets a clear failure, never a broken session.
+  /// (unchanged tuning) → the platform's own on-device speech recognition,
+  /// auto-detecting per utterance AMONG THE USER'S SELECTED "Listen for"
+  /// LANGUAGES → the platform's own on-device translation → same chat UI.
+  ///
+  /// Blocking rules (never a broken session, never panic over downloads):
+  ///  - nothing selected → clear message;
+  ///  - a selected language genuinely unsupported here → clear message;
+  ///  - the device lacks the native architecture → capability reason;
+  ///  - pending packs → download with progress, then start automatically.
+  /// ONE selected language is fully valid.
   Future<void> _startLocalEngine() async {
     final target = settings.settings.targetLanguage;
+    final selected = settings.settings.listenLanguages;
 
-    // 1. Capability gate — never start a session the device cannot finish.
-    final support =
-        await sharedLiveTranslationSupport.ensure(targetLanguage: target);
+    if (selected.isEmpty) {
+      _failStart('Select at least one language to listen for '
+          '(Listen for → Add language).');
+      return;
+    }
+
+    // 1. Capability gate, probed for THIS selection.
+    final support = await sharedLiveTranslationSupport.refresh(
+        targetLanguage: target, sourceLanguages: selected);
     if (!support.supported) {
       _failStart(support.reason);
       return;
     }
+    if (support.missingLanguages.isNotEmpty) {
+      final names = support.missingLanguages
+          .map((code) => languageForCode(code)?.name ?? code)
+          .join(', ');
+      _failStart('$names is not available on this device. '
+          'Remove it from your listening languages to start.');
+      return;
+    }
 
-    // 1b. Supported-but-not-downloaded speech models: fetch them through
-    //     the OS (AssetInventory) with live progress — a pending pack is a
-    //     download, never an error.
+    // 2. Selected-but-not-downloaded speech models: fetch exactly those
+    //    through the OS (AssetInventory) with live progress, then start
+    //    automatically — a pending pack is a download, never an error.
     if (support.pendingDownloads.isNotEmpty) {
       try {
         activityLabel = 'Preparing Live Translation…';
         notifyListeners();
         await NativeSpeechAssets.install(
-          targetLanguage: target,
+          languages: support.pendingDownloads,
           onProgress: (progress) {
             final code = progress.language;
             final name =
@@ -263,23 +288,30 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
           },
         );
       } catch (error) {
-        _failStart('Could not download speech languages — $error');
+        developer.log('[NATIVE STT] asset install failed: $error', name: 'local');
+        final names = support.pendingDownloads
+            .map((code) => languageForCode(code)?.name ?? code)
+            .join(', ');
+        _failStart("$names couldn't be prepared. "
+            'Check your internet connection and try again.');
         return;
       }
       activityLabel = null;
       // Installed set changed — re-run the capability check (required).
-      await sharedLiveTranslationSupport.refresh(targetLanguage: target);
+      await sharedLiveTranslationSupport.refresh(
+          targetLanguage: target, sourceLanguages: selected);
     }
 
-    // 2. Speech setup (authorization + pin the on-device detection set).
+    // 3. Speech setup: recognizers for the SELECTED languages only.
     final engine = _localEngine ??= NativeSpeechEngine();
     try {
-      await engine.load(target);
+      await engine.load(selected);
     } catch (error) {
       developer.log('[NATIVE STT] setup failed: $error', name: 'local');
       _failStart('Could not start on-device speech recognition — $error');
       return;
     }
+    activeLanguages = List.of(selected);
 
     // 3. Language pack for the target: the platform's own download flow.
     //    A pending download is normal, not an error.
@@ -355,6 +387,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   Future<void> stopListening() async {
     if (state == ListeningState.idle) return;
+    activeLanguages = [];
     final startedAt = _sessionStartedAt;
 
     if (_usingMock) {
@@ -423,6 +456,8 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   void _failStart(String message) {
     state = ListeningState.idle;
     errorBanner = message;
+    activeLanguages = [];
+    activityLabel = null;
     notifyListeners();
   }
 

@@ -31,8 +31,25 @@ Android (pipeline arrives in an upcoming build; capability probe already real)
       ↓ existing chat bubbles
 ```
 
-The user still selects ONLY "Translate to: <language>". Source languages are
-auto-detected per utterance — never configured.
+**Language model (the product promise):** "Choose the languages around you
+once, then Live Translator automatically understands which one is being
+spoken." The user picks ONE target ("Translate to: Arabic") and ONE OR MORE
+"Listen for" languages (`AppSettings.listenLanguages`, first-run default:
+English only — never a silently-downloaded world list). Every utterance is
+auto-detected among exactly the selected languages; one selected language is
+fully valid and runs a single recognizer (fastest path). Five concepts stay
+strictly separate: supportedLocales (device capability), installedLocales
+(downloaded), reservedLocales (app's asset slots, capped by the LIVE
+`AssetInventory.maximumReservedLocales` — never hardcoded), the user's
+selection, and the target. UI: the main screen shows Translate to + Listen
+for chips (+ Add language → picker fed by supportedLocales, unsupported
+entries disabled); Settings → Listening Languages manages Download/Remove
+(slot release via `AssetInventory.release(reservedLocale:)`, always
+user-chosen). Start Listening downloads any selected pending packs with
+per-language progress and then starts automatically. A device is
+"unsupported" ONLY when the native architecture is missing — never because
+packs aren't downloaded and never because fewer than two languages are
+installed.
 
 ## Capability check (never version-guessing, never a crash)
 

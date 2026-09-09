@@ -47,8 +47,10 @@ import UIKit
         result(FlutterMethodNotImplemented)
         return
       }
-      let target = (call.arguments as? [String: Any])?["targetLanguage"] as? String ?? "ar"
-      CapabilitiesProbe.probe(targetLanguage: target) { payload in
+      let args = call.arguments as? [String: Any]
+      let target = args?["targetLanguage"] as? String ?? "ar"
+      let sources = (args?["sourceLanguages"] as? [String]) ?? ["en"]
+      CapabilitiesProbe.probe(targetLanguage: target, sourceLanguages: sources) { payload in
         DispatchQueue.main.async { result(payload) }
       }
     }
@@ -187,11 +189,10 @@ import UIKit
 //   existing chat bubbles
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The product's auto-detected language set. The user only ever picks the
-/// TARGET language; sources are detected per utterance from this set.
+/// Locale hints for building a recognizer from a bare ISO 639-1 code (used
+/// pre-iOS 26 and as a fallback; on iOS 26 the locale is resolved from
+/// SpeechTranscriber.supportedLocales itself).
 enum ProductLanguages {
-  static let core = ["en", "ar", "hi", "th", "bn"]
-
   static func recognitionLocale(for code: String) -> String {
     switch code {
     case "en": return "en-US"
@@ -199,203 +200,232 @@ enum ProductLanguages {
     case "hi": return "hi-IN"
     case "th": return "th-TH"
     case "bn": return "bn-IN"
+    case "es": return "es-ES"
+    case "fr": return "fr-FR"
+    case "de": return "de-DE"
+    case "zh": return "zh-CN"
+    case "ja": return "ja-JP"
+    case "ko": return "ko-KR"
+    case "pt": return "pt-BR"
+    case "ru": return "ru-RU"
+    case "it": return "it-IT"
+    case "id": return "id-ID"
+    case "tr": return "tr-TR"
+    case "nl": return "nl-NL"
+    case "vi": return "vi-VN"
+    case "ur": return "ur-PK"
+    case "ta": return "ta-IN"
     default: return code
     }
   }
-
-  static func candidates(target: String) -> [String] {
-    core.contains(target) ? core : core + [target]
-  }
 }
 
-/// Per-language speech capability, with SUPPORTED and INSTALLED kept apart:
-/// a supported-but-not-downloaded language is "downloadRequired" — a pending
-/// pack, never "unsupported".
-struct SpeechCapability {
-  /// language code → "ready" | "downloadRequired" | "unsupported"
-  var statusByLanguage: [String: String] = [:]
+/// The device's raw speech inventory, with the four concepts the product
+/// model keeps strictly apart: SUPPORTED (Apple offers it here), INSTALLED
+/// (asset already on disk), RESERVED (slot held for this app), plus the
+/// reservation capacity. User SELECTION lives in Flutter, never here.
+struct SpeechInventory {
+  var supportedCodes: Set<String> = []
+  var installedCodes: Set<String> = []
+  var reservedLocaleIDs: [String] = []
+  var maximumReservedLocales: Int = 0
   var diagnostics: [String] = []
+  var modern = false
 
-  var usable: [String] {
-    statusByLanguage.filter { $0.value != "unsupported" }.map { $0.key }.sorted()
-  }
-
-  var ready: [String] {
-    statusByLanguage.filter { $0.value == "ready" }.map { $0.key }.sorted()
-  }
-
-  var pendingDownloads: [String] {
-    statusByLanguage.filter { $0.value == "downloadRequired" }.map { $0.key }.sorted()
-  }
-
-  var unsupported: [String] {
-    statusByLanguage.filter { $0.value == "unsupported" }.map { $0.key }.sorted()
+  /// "ready" | "downloadRequired" | "unsupported" for one language code.
+  func status(for code: String) -> String {
+    if installedCodes.contains(code) { return "ready" }
+    if supportedCodes.contains(code) {
+      // Pre-iOS 26 there is no app-triggered download API, so a supported-
+      // but-not-installed model cannot be fetched — report it honestly.
+      return modern ? "downloadRequired" : "unsupported"
+    }
+    return "unsupported"
   }
 }
 
-/// Answers, from the actual OS APIs on THIS device (never from a version
-/// number alone): can the full Live Translator experience run here?
 enum CapabilitiesProbe {
-  static func probe(targetLanguage: String, completion: @escaping ([String: Any]) -> Void) {
-    Task {
-      let speech = await speechCapability(targetLanguage: targetLanguage)
-      await finish(targetLanguage: targetLanguage, speech: speech, completion: completion)
-    }
-  }
-
-  static func speechCapability(targetLanguage: String) async -> SpeechCapability {
+  static func speechInventory() async -> SpeechInventory {
     if #available(iOS 26.0, *) {
-      return await modernSpeechCapability(targetLanguage: targetLanguage)
+      return await modernInventory()
     }
-    return legacySpeechCapability(targetLanguage: targetLanguage)
+    return legacyInventory()
   }
 
   /// iOS 26+: SpeechTranscriber.supportedLocales is the CAPABILITY list;
-  /// installedLocales only says which models are already downloaded.
-  /// SFSpeechRecognizer.supportsOnDeviceRecognition is NOT the capability
+  /// installedLocales only says which models are downloaded. The old
+  /// SFSpeechRecognizer.supportsOnDeviceRecognition is NOT a capability
   /// test here — it only reflects already-installed dictation assets.
   @available(iOS 26.0, *)
-  static func modernSpeechCapability(targetLanguage: String) async -> SpeechCapability {
-    var capability = SpeechCapability()
+  static func modernInventory() async -> SpeechInventory {
+    var inventory = SpeechInventory()
+    inventory.modern = true
     let supportedLocales = await SpeechTranscriber.supportedLocales
     let installedLocales = await SpeechTranscriber.installedLocales
     let reservedLocales = await AssetInventory.reservedLocales
-    let maximumReserved = AssetInventory.maximumReservedLocales
-
-    func languageCodes(_ locales: [Locale]) -> Set<String> {
-      Set(locales.compactMap { $0.language.languageCode?.identifier })
-    }
-    let supportedCodes = languageCodes(supportedLocales)
-    let installedCodes = languageCodes(installedLocales)
-
-    for code in ProductLanguages.candidates(target: targetLanguage) {
-      if installedCodes.contains(code) {
-        capability.statusByLanguage[code] = "ready"
-      } else if supportedCodes.contains(code) {
-        capability.statusByLanguage[code] = "downloadRequired"
-      } else {
-        capability.statusByLanguage[code] = "unsupported"
-      }
-    }
-    capability.diagnostics = [
+    inventory.supportedCodes =
+      Set(supportedLocales.compactMap { $0.language.languageCode?.identifier })
+    inventory.installedCodes =
+      Set(installedLocales.compactMap { $0.language.languageCode?.identifier })
+    inventory.reservedLocaleIDs = reservedLocales.map(\.identifier).sorted()
+    inventory.maximumReservedLocales = AssetInventory.maximumReservedLocales
+    inventory.diagnostics = [
       "speechStack=SpeechAnalyzer (iOS 26)",
       "supportedLocales=\(supportedLocales.map(\.identifier).sorted().joined(separator: " "))",
       "installedLocales=\(installedLocales.map(\.identifier).sorted().joined(separator: " "))",
-      "reservedLocales=\(reservedLocales.map(\.identifier).sorted().joined(separator: " "))",
-      "maximumReservedLocales=\(maximumReserved)",
+      "reservedLocales=\(inventory.reservedLocaleIDs.joined(separator: " "))",
+      "maximumReservedLocales=\(inventory.maximumReservedLocales)",
     ]
-    return capability
+    return inventory
   }
 
-  /// Pre-iOS 26 fallback: SFSpeechRecognizer exposes no supported-vs-
-  /// installed split, so on-device availability is the only signal.
-  static func legacySpeechCapability(targetLanguage: String) -> SpeechCapability {
-    var capability = SpeechCapability()
-    for code in ProductLanguages.candidates(target: targetLanguage) {
-      let locale = Locale(identifier: ProductLanguages.recognitionLocale(for: code))
-      let onDevice = SFSpeechRecognizer(locale: locale)?.supportsOnDeviceRecognition ?? false
-      capability.statusByLanguage[code] = onDevice ? "ready" : "unsupported"
+  /// Pre-iOS 26: SFSpeechRecognizer has no supported/installed split and no
+  /// download API — a language is usable only if on-device recognition for
+  /// it is available right now.
+  static func legacyInventory() -> SpeechInventory {
+    var inventory = SpeechInventory()
+    var codes: Set<String> = []
+    for locale in SFSpeechRecognizer.supportedLocales() {
+      guard let code = locale.language.languageCode?.identifier,
+        !codes.contains(code),
+        SFSpeechRecognizer(locale: locale)?.supportsOnDeviceRecognition == true
+      else { continue }
+      codes.insert(code)
     }
-    capability.diagnostics = [
-      "speechStack=SFSpeechRecognizer (pre-iOS 26; supported==installed here)"
+    inventory.supportedCodes = codes
+    inventory.installedCodes = codes
+    inventory.diagnostics = [
+      "speechStack=SFSpeechRecognizer (pre-iOS 26; supported==installed, no download API)"
     ]
-    return capability
+    return inventory
   }
 
-  private static func finish(
-    targetLanguage: String, speech: SpeechCapability,
+  /// Resolves a language code to the concrete recognition Locale (iOS 26:
+  /// straight from supportedLocales; otherwise the static hint table).
+  @available(iOS 26.0, *)
+  static func resolveModernLocale(for code: String) async -> Locale? {
+    let hinted = Locale(identifier: ProductLanguages.recognitionLocale(for: code))
+    if let match = await SpeechTranscriber.supportedLocale(equivalentTo: hinted) {
+      return match
+    }
+    return await SpeechTranscriber.supportedLocales
+      .first { $0.language.languageCode?.identifier == code }
+  }
+
+  /// The full capability report. `supported` describes whether the DEVICE
+  /// supports the native architecture — it is NEVER false merely because a
+  /// selected language pack is not downloaded yet, and ONE usable language
+  /// is enough (single-language sessions are valid).
+  static func probe(
+    targetLanguage: String, sourceLanguages: [String],
     completion: @escaping ([String: Any]) -> Void
-  ) async {
-    let osVersion = "iOS \(UIDevice.current.systemVersion)"
-    // A language counts toward the product if Apple SUPPORTS it on this
-    // device — an uninstalled model is a pending download, not a gap.
-    let usableLanguages = speech.usable
-    let speechSupported = !usableLanguages.isEmpty
-    let languageDetectionSupported = usableLanguages.count >= 2
+  ) {
+    Task {
+      let osVersion = "iOS \(UIDevice.current.systemVersion)"
+      let inventory = await speechInventory()
 
-    var base: [String: Any] = [
-      "osVersion": osVersion,
-      "speechSupported": speechSupported,
-      "languageDetectionSupported": languageDetectionSupported,
-      "availableLanguages": usableLanguages,
-      "readyLanguages": speech.ready,
-      "pendingDownloads": speech.pendingDownloads,
-      "missingLanguages": speech.unsupported,
-      "languageStatus": speech.statusByLanguage,
-      "speechDiagnostics": speech.diagnostics,
-    ]
-
-    guard #available(iOS 18.0, *) else {
-      base["supported"] = false
-      base["updateRequired"] = true
-      base["reason"] = "Live Translation requires iOS 18 or newer for "
-        + "on-device translation. Your current version is \(osVersion)."
-      base["translationSupported"] = false
-      base["translationPairs"] = [String: String]()
-      completion(base)
-      return
-    }
-
-    // Translation: ask the framework per pair (installed / supported /
-    // unsupported). "supported" means downloadable on demand — that is NOT
-    // an error, just a pending language pack.
-    let availability = LanguageAvailability()
-    let targetLang = Locale.Language(identifier: targetLanguage)
-    var pairs: [String: String] = [:]
-    var translatableSources = 0
-    var sourcesChecked = 0
-    for code in usableLanguages where code != targetLanguage {
-      sourcesChecked += 1
-      let status = await availability.status(
-        from: Locale.Language(identifier: code), to: targetLang)
-      let label: String
-      switch status {
-      case .installed: label = "installed"
-      case .supported: label = "downloadable"
-      case .unsupported: label = "unsupported"
-      @unknown default: label = "unknown"
+      // Per-language status for the user's SELECTION (+ the target, so the
+      // UI can show ar→ar readiness too).
+      var languageStatus: [String: String] = [:]
+      for code in Set(sourceLanguages + [targetLanguage]) {
+        languageStatus[code] = inventory.status(for: code)
       }
-      pairs[code] = label
-      if label == "installed" || label == "downloadable" { translatableSources += 1 }
-    }
-    // Same-language passthrough (ar→ar) needs no translation model.
-    let translationSupported = sourcesChecked == 0 || translatableSources > 0
+      let selectedReady = sourceLanguages.filter { languageStatus[$0] == "ready" }.sorted()
+      let selectedPending =
+        sourceLanguages.filter { languageStatus[$0] == "downloadRequired" }.sorted()
+      let selectedUnsupported =
+        sourceLanguages.filter { languageStatus[$0] == "unsupported" }.sorted()
+      let usableSelected = (selectedReady + selectedPending).sorted()
 
-    let supported = speechSupported && languageDetectionSupported && translationSupported
-    var reason = "Supported"
-    if !speechSupported {
-      reason = "This device has no on-device speech recognition for the "
-        + "Live Translator languages."
-    } else if !languageDetectionSupported {
-      reason = "Automatic language detection needs at least two on-device "
-        + "speech languages; this device only has: "
-        + "\(usableLanguages.joined(separator: ", "))."
-    } else if !translationSupported {
-      reason = "On-device translation to '\(targetLanguage)' is not "
-        + "available for this device's languages."
-    } else if !speech.pendingDownloads.isEmpty {
-      reason = "Supported. Language packs to download: "
-        + "\(speech.pendingDownloads.joined(separator: ", "))."
-    } else if !speech.unsupported.isEmpty {
-      reason = "Supported. Not offered by Apple on this device: "
-        + "\(speech.unsupported.joined(separator: ", "))."
+      // Device-level support: the speech stack offers at least one language.
+      let speechSupported = !inventory.supportedCodes.isEmpty
+      // Detection runs among the user's selected languages; one selected
+      // language needs no competition at all — always fine.
+      let languageDetectionSupported = speechSupported
+
+      var base: [String: Any] = [
+        "osVersion": osVersion,
+        "speechSupported": speechSupported,
+        "languageDetectionSupported": languageDetectionSupported,
+        "supportedLanguages": inventory.supportedCodes.sorted(),
+        "installedLanguages": inventory.installedCodes.sorted(),
+        "reservedLocales": inventory.reservedLocaleIDs,
+        "maximumReservedLocales": inventory.maximumReservedLocales,
+        "availableLanguages": usableSelected,
+        "readyLanguages": selectedReady,
+        "pendingDownloads": selectedPending,
+        "missingLanguages": selectedUnsupported,
+        "languageStatus": languageStatus,
+        "speechDiagnostics": inventory.diagnostics,
+      ]
+
+      guard #available(iOS 18.0, *) else {
+        base["supported"] = false
+        base["updateRequired"] = true
+        base["reason"] = "Live Translation requires iOS 18 or newer for "
+          + "on-device translation. Your current version is \(osVersion)."
+        base["translationSupported"] = false
+        base["translationPairs"] = [String: String]()
+        completion(base)
+        return
+      }
+
+      // Translation: ask the framework per selected pair. "downloadable"
+      // is a pending pack, NOT an error.
+      let availability = LanguageAvailability()
+      let targetLang = Locale.Language(identifier: targetLanguage)
+      var pairs: [String: String] = [:]
+      var translatableSources = 0
+      var sourcesChecked = 0
+      for code in usableSelected where code != targetLanguage {
+        sourcesChecked += 1
+        let status = await availability.status(
+          from: Locale.Language(identifier: code), to: targetLang)
+        let label: String
+        switch status {
+        case .installed: label = "installed"
+        case .supported: label = "downloadable"
+        case .unsupported: label = "unsupported"
+        @unknown default: label = "unknown"
+        }
+        pairs[code] = label
+        if label == "installed" || label == "downloadable" { translatableSources += 1 }
+      }
+      // Same-language passthrough (ar→ar) needs no translation model.
+      let translationSupported = sourcesChecked == 0 || translatableSources > 0
+
+      let supported = speechSupported && translationSupported
+      var reason = "Supported"
+      if !speechSupported {
+        reason = "This device has no on-device speech recognition."
+      } else if !translationSupported {
+        reason = "On-device translation to '\(targetLanguage)' is not "
+          + "available for the selected languages."
+      } else if !selectedPending.isEmpty {
+        reason = "Supported. Language packs to download: "
+          + "\(selectedPending.joined(separator: ", "))."
+      } else if !selectedUnsupported.isEmpty {
+        reason = "Supported. Not available on this device: "
+          + "\(selectedUnsupported.joined(separator: ", "))."
+      }
+      base["supported"] = supported
+      base["updateRequired"] = false
+      base["reason"] = reason
+      base["translationSupported"] = translationSupported
+      base["translationPairs"] = pairs
+      completion(base)
     }
-    base["supported"] = supported
-    base["updateRequired"] = false
-    base["reason"] = reason
-    base["translationSupported"] = translationSupported
-    base["translationPairs"] = pairs
-    completion(base)
   }
 }
 
-/// Per-utterance on-device recognition with language auto-detection:
-/// the SAME 16 kHz PCM16 utterance (from the unchanged environmental
-/// capture + VAD) runs through one on-device recognizer per available
-/// product language in parallel — SpeechAnalyzer/SpeechTranscriber on
-/// iOS 26, SFSpeechRecognizer before that — and the winner is chosen by
-/// NLLanguageRecognizer score (blended with recognizer confidence where the
-/// API provides one).
+/// Per-utterance on-device recognition with language auto-detection AMONG
+/// THE USER'S SELECTED "Listen for" LANGUAGES ONLY: the SAME 16 kHz PCM16
+/// utterance (from the unchanged environmental capture + VAD) runs through
+/// one on-device recognizer per selected language in parallel —
+/// SpeechAnalyzer/SpeechTranscriber on iOS 26, SFSpeechRecognizer before
+/// that — and the winner is chosen by NLLanguageRecognizer score (blended
+/// with recognizer confidence where the API provides one). A single
+/// selected language skips the competition entirely.
 ///
 /// Language model downloads go through Apple's own
 /// AssetInventory.assetInstallationRequest(supporting:).downloadAndInstall()
@@ -428,22 +458,33 @@ final class NativeSpeechBridge {
       ])
     case "recognize":
       recognize(call, result: result)
+    case "releaseLanguage":
+      releaseLanguage(call, result: result)
     default:
       result(FlutterMethodNotImplemented)
     }
   }
 
-  /// Pins the detection set to the languages whose speech models are
-  /// INSTALLED right now (downloads are installAssets' job, not prepare's).
-  /// Pre-iOS 26 this also requests the Speech authorization; the iOS 26
-  /// SpeechAnalyzer stack is fully on-device and needs no authorization.
+  /// Pins the detection set to the USER-SELECTED languages whose speech
+  /// models are installed right now (downloads are installAssets' job, not
+  /// prepare's). Recognizers only ever run for these — never for every
+  /// language installed on the phone. Pre-iOS 26 this also requests the
+  /// Speech authorization; the iOS 26 SpeechAnalyzer stack is fully
+  /// on-device and needs no authorization.
   private func prepare(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    let target = (call.arguments as? [String: Any])?["targetLanguage"] as? String ?? "ar"
+    let selected = ((call.arguments as? [String: Any])?["languages"] as? [String]) ?? []
+    guard !selected.isEmpty else {
+      result(FlutterError(
+        code: "no_languages", message: "select at least one listening language", details: nil))
+      return
+    }
     if #available(iOS 26.0, *) {
       Task { @MainActor in
-        let capability = await CapabilitiesProbe.modernSpeechCapability(targetLanguage: target)
-        self.detectionLanguages = capability.ready
-        result(["languages": capability.ready, "pendingDownloads": capability.pendingDownloads])
+        let inventory = await CapabilitiesProbe.modernInventory()
+        let usable = selected.filter { inventory.installedCodes.contains($0) }
+        let notReady = selected.filter { !inventory.installedCodes.contains($0) }
+        self.detectionLanguages = usable
+        result(["languages": usable, "notReady": notReady])
       }
       return
     }
@@ -457,16 +498,19 @@ final class NativeSpeechBridge {
             details: nil))
           return
         }
-        let capability = CapabilitiesProbe.legacySpeechCapability(targetLanguage: target)
-        self?.detectionLanguages = capability.ready
-        result(["languages": capability.ready, "pendingDownloads": [String]()])
+        let inventory = CapabilitiesProbe.legacyInventory()
+        let usable = selected.filter { inventory.installedCodes.contains($0) }
+        let notReady = selected.filter { !inventory.installedCodes.contains($0) }
+        self?.detectionLanguages = usable
+        result(["languages": usable, "notReady": notReady])
       }
     }
   }
 
-  /// Downloads + installs every supported-but-not-installed product language
+  /// Downloads + installs the given supported-but-not-installed languages
   /// through Apple's AssetInventory (iOS 26+). Sequential, one language at a
-  /// time, so the polled progress can name what is downloading.
+  /// time, so the polled progress can name what is downloading. Only ever
+  /// touches the languages Dart asked for — the user's selection.
   private func installAssets(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     guard #available(iOS 26.0, *) else {
       // Pre-iOS 26 there is no app-triggered speech-asset download API.
@@ -478,23 +522,25 @@ final class NativeSpeechBridge {
         code: "busy", message: "an asset installation is already running", details: nil))
       return
     }
-    let target = (call.arguments as? [String: Any])?["targetLanguage"] as? String ?? "ar"
+    let requestedLanguages =
+      ((call.arguments as? [String: Any])?["languages"] as? [String]) ?? []
     installRunning = true
     installError = nil
     installFraction = 0
     installCompleted = 0
     Task { @MainActor in
-      let capability = await CapabilitiesProbe.modernSpeechCapability(targetLanguage: target)
-      let pending = capability.pendingDownloads
+      let inventory = await CapabilitiesProbe.modernInventory()
+      let pending = requestedLanguages.filter {
+        inventory.supportedCodes.contains($0) && !inventory.installedCodes.contains($0)
+      }
       self.installTotal = pending.count
       var failures: [String] = []
       for code in pending {
         self.installLanguage = code
         self.installFraction = 0
         do {
-          let requested = Locale(identifier: ProductLanguages.recognitionLocale(for: code))
-          let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested)
-            ?? requested
+          let locale = await CapabilitiesProbe.resolveModernLocale(for: code)
+            ?? Locale(identifier: ProductLanguages.recognitionLocale(for: code))
           let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
           if let request = try await AssetInventory.assetInstallationRequest(
             supporting: [transcriber])
@@ -526,6 +572,27 @@ final class NativeSpeechBridge {
           message: failures.joined(separator: "; "),
           details: nil))
       }
+    }
+  }
+
+  /// Frees this app's asset-slot reservation for one language (Settings →
+  /// Languages → Remove). Only ever releases a reservation matching the
+  /// requested language — never another feature's, never silently.
+  private func releaseLanguage(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard #available(iOS 26.0, *) else {
+      result(nil)
+      return
+    }
+    guard let code = (call.arguments as? [String: Any])?["language"] as? String else {
+      result(FlutterError(code: "bad_args", message: "language is required", details: nil))
+      return
+    }
+    Task { @MainActor in
+      let reserved = await AssetInventory.reservedLocales
+      for locale in reserved where locale.language.languageCode?.identifier == code {
+        await AssetInventory.release(reservedLocale: locale)
+      }
+      result(nil)
     }
   }
 
@@ -565,6 +632,17 @@ final class NativeSpeechBridge {
   private static func recognizeModern(buffer: AVAudioPCMBuffer, languages: [String])
     async -> (text: String, language: String)?
   {
+    // ONE selected language: the fastest possible path — a single
+    // transcriber, no competition, no scoring.
+    if languages.count == 1, let only = languages.first {
+      do {
+        let text = try await transcribeOnce(buffer: buffer, languageCode: only)
+        return text.isEmpty ? nil : (text, only)
+      } catch {
+        NSLog("[NATIVE STT] \(only) transcriber failed: \(error)")
+        return nil
+      }
+    }
     var hypotheses: [(language: String, text: String)] = []
     await withTaskGroup(of: (String, String)?.self) { group in
       for code in languages {
@@ -589,8 +667,8 @@ final class NativeSpeechBridge {
   private static func transcribeOnce(buffer: AVAudioPCMBuffer, languageCode: String)
     async throws -> String
   {
-    let requested = Locale(identifier: ProductLanguages.recognitionLocale(for: languageCode))
-    let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested) ?? requested
+    let locale = await CapabilitiesProbe.resolveModernLocale(for: languageCode)
+      ?? Locale(identifier: ProductLanguages.recognitionLocale(for: languageCode))
     let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
     let analyzer = SpeechAnalyzer(modules: [transcriber])
 

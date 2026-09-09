@@ -16,6 +16,7 @@ Future<void> showLiveTranslationUnsupportedDialog(
   BuildContext context, {
   required LiveTranslationSupport support,
   required String targetLanguage,
+  List<String> sourceLanguages = const ['en'],
 }) async {
   final String title;
   final String body;
@@ -45,7 +46,7 @@ Future<void> showLiveTranslationUnsupportedDialog(
             final navigator = Navigator.of(dialogContext);
             final messenger = ScaffoldMessenger.of(context);
             final refreshed = await sharedLiveTranslationSupport.refresh(
-                targetLanguage: targetLanguage);
+                targetLanguage: targetLanguage, sourceLanguages: sourceLanguages);
             navigator.pop();
             messenger.showSnackBar(SnackBar(
               content: Text(refreshed.supported

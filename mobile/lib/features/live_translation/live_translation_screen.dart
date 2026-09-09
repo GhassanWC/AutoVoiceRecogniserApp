@@ -10,6 +10,7 @@ import '../../utils/languages.dart';
 import '../history/history_screen.dart';
 import '../settings/settings_screen.dart';
 import 'live_translation_controller.dart';
+import 'widgets/listen_language_bar.dart';
 import 'widgets/listening_indicator.dart';
 import 'widgets/message_bubble.dart';
 import 'widgets/unsupported_dialog.dart';
@@ -48,7 +49,10 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final settings = context.read<SettingsController>().settings;
-      sharedLiveTranslationSupport.ensure(targetLanguage: settings.targetLanguage);
+      sharedLiveTranslationSupport.ensure(
+        targetLanguage: settings.targetLanguage,
+        sourceLanguages: settings.listenLanguages,
+      );
     });
   }
 
@@ -88,13 +92,16 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
       if (settings.translationEngine == TranslationEngine.onDevice &&
           !settings.mockMode) {
         final support = await sharedLiveTranslationSupport.ensure(
-            targetLanguage: settings.targetLanguage);
+          targetLanguage: settings.targetLanguage,
+          sourceLanguages: settings.listenLanguages,
+        );
         if (!support.supported) {
           if (mounted) {
             await showLiveTranslationUnsupportedDialog(
               context,
               support: support,
               targetLanguage: settings.targetLanguage,
+              sourceLanguages: settings.listenLanguages,
             );
           }
           return;
@@ -280,6 +287,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
                 ],
               ),
             ),
+            const ListenLanguageBar(),
             ListenableBuilder(
               listenable: sharedLiveTranslationSupport,
               builder: (context, _) {
@@ -300,6 +308,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
                             context,
                             support: support,
                             targetLanguage: settings.targetLanguage,
+                            sourceLanguages: settings.listenLanguages,
                           ),
                 );
               },

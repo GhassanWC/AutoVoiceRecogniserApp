@@ -59,6 +59,56 @@ void main() {
       expect(support.speechDiagnostics.first, contains('supportedLocales='));
     });
 
+    test('ONE installed language is fully valid — never "unsupported"', () {
+      // Test A/H shape: fresh iPhone, only English installed and selected.
+      final support = LiveTranslationSupport.fromMap({
+        'supported': true,
+        'updateRequired': false,
+        'reason': 'Supported',
+        'osVersion': 'iOS 26.0',
+        'speechSupported': true,
+        'languageDetectionSupported': true,
+        'translationSupported': true,
+        'supportedLanguages': ['ar', 'en', 'es', 'hi', 'th'],
+        'installedLanguages': ['en'],
+        'reservedLocales': <String>[],
+        'maximumReservedLocales': 5,
+        'availableLanguages': ['en'],
+        'readyLanguages': ['en'],
+        'pendingDownloads': <String>[],
+        'missingLanguages': <String>[],
+        'languageStatus': {'en': 'ready'},
+      });
+      expect(support.supported, isTrue,
+          reason: 'one installed+selected language must be startable');
+      expect(support.maximumReservedLocales, 5);
+      // statusFor derives from the raw inventories for ANY picker language:
+      expect(support.statusFor('en'), 'ready');
+      expect(support.statusFor('th'), 'downloadRequired');
+      expect(support.statusFor('xx'), 'unsupported');
+    });
+
+    test('selected pending downloads never flip the device to unsupported', () {
+      // Test B/H shape: English installed, Thai selected but not installed.
+      final support = LiveTranslationSupport.fromMap({
+        'supported': true,
+        'updateRequired': false,
+        'reason': 'Supported. Language packs to download: th.',
+        'osVersion': 'iOS 26.0',
+        'speechSupported': true,
+        'languageDetectionSupported': true,
+        'translationSupported': true,
+        'supportedLanguages': ['en', 'th'],
+        'installedLanguages': ['en'],
+        'readyLanguages': ['en'],
+        'pendingDownloads': ['th'],
+        'languageStatus': {'en': 'ready', 'th': 'downloadRequired'},
+      });
+      expect(support.supported, isTrue);
+      expect(support.pendingDownloads, ['th']);
+      expect(support.partiallySupported, isFalse);
+    });
+
     test('speech-only devices are PARTIALLY supported, never silently degraded', () {
       final support = LiveTranslationSupport.fromMap({
         'supported': false,

@@ -16,10 +16,11 @@ class LocalTranscript {
 
 /// Abstract so the pipeline and tests never touch the native bridge directly.
 abstract class LocalSpeechEngine {
-  /// [model] is engine-specific configuration — for the native platform
-  /// engine it is the TARGET language code (the detection set derives from
-  /// the product languages + target on the native side).
-  Future<void> load(String model);
+  /// [languages] are the SOURCE languages the user selected to listen for.
+  /// One language is valid (single-recognizer fast path); with several, each
+  /// utterance is auto-detected among exactly these — never among every
+  /// language installed on the phone.
+  Future<void> load(List<String> languages);
   bool get isLoaded;
 
   /// Transcribes one PCM16LE mono 16 kHz utterance. Language is auto-detected
@@ -47,16 +48,17 @@ class NativeSpeechEngine implements LocalSpeechEngine {
   @override
   bool get isLoaded => _loaded;
 
-  /// [model] = target language code. Requests speech-recognition
-  /// authorization (first run shows the OS dialog) and pins the detection
-  /// set to what this device supports on-device.
+  /// Pins the native detection set to the user's selected [languages]
+  /// (those already installed; downloads are NativeSpeechAssets' job).
+  /// Pre-iOS 26 this also triggers the speech authorization dialog.
   @override
-  Future<void> load(String model) async {
-    if (_loaded) return;
+  Future<void> load(List<String> languages) async {
+    // Always re-prepare: the user's selection may have changed since the
+    // last session, and prepare is a cheap inventory check natively.
     try {
       await _channel.invokeMethod<Map<Object?, Object?>>(
         'prepare',
-        {'targetLanguage': model},
+        {'languages': languages},
       ).timeout(const Duration(seconds: 30));
       _loaded = true;
     } on MissingPluginException {

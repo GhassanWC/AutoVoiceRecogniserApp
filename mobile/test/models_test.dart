@@ -18,9 +18,11 @@ void main() {
       onboardingComplete: true,
       serverUrl: 'http://192.168.1.5:8080',
       mockMode: true,
+      listenLanguages: ['en', 'th', 'hi'],
     );
     final restored = AppSettings.fromJson(settings.toJson());
     expect(restored.toJson(), settings.toJson());
+    expect(restored.listenLanguages, ['en', 'th', 'hi']);
   });
 
   test('privacy defaults: history off, nothing speaks automatically', () {
@@ -28,6 +30,14 @@ void main() {
     expect(settings.saveHistory, isFalse);
     expect(settings.autoSpeak, isFalse);
     expect(settings.mockMode, isFalse);
+  });
+
+  test('first-run listening default is English ONLY — never a world list', () {
+    const settings = AppSettings();
+    expect(settings.listenLanguages, ['en']);
+    // Settings written before listenLanguages existed get the same default.
+    final legacy = AppSettings.fromJson(const {'targetLanguage': 'ar'});
+    expect(legacy.listenLanguages, ['en']);
   });
 
   test('ConversationSession JSON round-trip preserves messages', () {

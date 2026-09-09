@@ -4,14 +4,16 @@ import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-/// The answer to "can THIS device run the full Live Translator experience
-/// with the platform's own on-device speech + translation?" — built from the
-/// actual OS capability APIs, never from an OS-version number alone.
+/// The answer to "does THIS device support the native Live Translation
+/// architecture?" — built from the actual OS capability APIs, never from an
+/// OS-version number alone.
 ///
-/// The full experience means: the user picks ONLY the target language;
-/// sources are auto-detected per utterance. A device that could merely do a
-/// fixed-pair translator is reported as NOT supported rather than silently
-/// shrinking the product.
+/// The product model keeps five concepts strictly apart and so does this
+/// class: SUPPORTED languages (the platform offers them here), INSTALLED
+/// (asset already downloaded), RESERVED (asset slot held), the user's
+/// SELECTED listening languages, and the TARGET language. [supported] is
+/// about the DEVICE — it is NEVER false merely because a selected language
+/// pack has not been downloaded yet, and ONE usable language is enough.
 class LiveTranslationSupport {
   const LiveTranslationSupport({
     required this.supported,
@@ -21,6 +23,10 @@ class LiveTranslationSupport {
     required this.languageDetectionSupported,
     required this.translationSupported,
     required this.updateRequired,
+    this.supportedLanguages = const [],
+    this.installedLanguages = const [],
+    this.reservedLocales = const [],
+    this.maximumReservedLocales = 0,
     this.availableLanguages = const [],
     this.readyLanguages = const [],
     this.pendingDownloads = const [],
@@ -43,18 +49,32 @@ class LiveTranslationSupport {
   /// required", never that the phone is permanently unsupported.
   final bool updateRequired;
 
-  /// Product languages Apple/Google SUPPORT on this device (installed or
-  /// downloadable). A not-yet-downloaded model is NEVER "unsupported".
+  /// ALL language codes the platform's speech stack supports on this device
+  /// (SpeechTranscriber.supportedLocales on iOS 26) — the source of truth
+  /// for the language picker. Never a hardcoded pretend-list.
+  final List<String> supportedLanguages;
+
+  /// Language codes whose speech asset is already downloaded.
+  final List<String> installedLanguages;
+
+  /// Locale identifiers currently holding an asset-reservation slot.
+  final List<String> reservedLocales;
+
+  /// How many speech languages this phone can keep reserved at once
+  /// (AssetInventory.maximumReservedLocales — never hardcoded).
+  final int maximumReservedLocales;
+
+  /// SELECTED languages that are usable (installed or downloadable).
+  /// A not-yet-downloaded model is NEVER "unsupported".
   final List<String> availableLanguages;
 
-  /// Subset of [availableLanguages] whose speech model is installed now.
+  /// Selected languages whose speech model is installed now.
   final List<String> readyLanguages;
 
-  /// Supported languages whose speech model still needs downloading
-  /// (Settings offers "Prepare Live Translation" for these).
+  /// Selected languages whose speech model still needs downloading.
   final List<String> pendingDownloads;
 
-  /// Languages Apple/Google do not offer on this device at all.
+  /// Selected languages the platform does not offer on this device.
   final List<String> missingLanguages;
 
   /// language code → "ready" | "downloadRequired" | "unsupported".
@@ -96,6 +116,17 @@ class LiveTranslationSupport {
         languageDetectionSupported: map['languageDetectionSupported'] == true,
         translationSupported: map['translationSupported'] == true,
         updateRequired: map['updateRequired'] == true,
+        supportedLanguages: [
+          for (final code in map['supportedLanguages'] as List<Object?>? ?? []) '$code'
+        ],
+        installedLanguages: [
+          for (final code in map['installedLanguages'] as List<Object?>? ?? []) '$code'
+        ],
+        reservedLocales: [
+          for (final id in map['reservedLocales'] as List<Object?>? ?? []) '$id'
+        ],
+        maximumReservedLocales:
+            (map['maximumReservedLocales'] as num?)?.toInt() ?? 0,
         availableLanguages: [
           for (final code in map['availableLanguages'] as List<Object?>? ?? []) '$code'
         ],
@@ -122,6 +153,17 @@ class LiveTranslationSupport {
           for (final line in map['speechDiagnostics'] as List<Object?>? ?? []) '$line'
         ],
       );
+
+  /// "ready" | "downloadRequired" | "unsupported" for any language code,
+  /// derived from the raw inventories (works for picker languages the probe
+  /// wasn't explicitly asked about).
+  String statusFor(String code) {
+    final known = languageStatus[code];
+    if (known != null) return known;
+    if (installedLanguages.contains(code)) return 'ready';
+    if (supportedLanguages.contains(code)) return 'downloadRequired';
+    return 'unsupported';
+  }
 }
 
 /// App-wide probe cache: Settings' status row, the Start Listening gate and
@@ -136,18 +178,26 @@ class LiveTranslationSupportService extends ChangeNotifier {
   bool probing = false;
 
   /// Returns the cached result, probing first if none exists yet.
-  Future<LiveTranslationSupport> ensure({required String targetLanguage}) async {
-    return current ?? await refresh(targetLanguage: targetLanguage);
+  Future<LiveTranslationSupport> ensure({
+    required String targetLanguage,
+    List<String> sourceLanguages = const ['en'],
+  }) async {
+    return current ??
+        await refresh(
+            targetLanguage: targetLanguage, sourceLanguages: sourceLanguages);
   }
 
-  Future<LiveTranslationSupport> refresh({required String targetLanguage}) async {
+  Future<LiveTranslationSupport> refresh({
+    required String targetLanguage,
+    List<String> sourceLanguages = const ['en'],
+  }) async {
     probing = true;
     notifyListeners();
     LiveTranslationSupport support;
     try {
       final map = await _channel.invokeMethod<Map<Object?, Object?>>(
         'probe',
-        {'targetLanguage': targetLanguage},
+        {'targetLanguage': targetLanguage, 'sourceLanguages': sourceLanguages},
       ).timeout(const Duration(seconds: 15));
       support = map == null
           ? LiveTranslationSupport.unsupportedPlatform()
@@ -213,16 +263,17 @@ class NativeSpeechAssets {
   static const MethodChannel _channel =
       MethodChannel('app.livetranslator/nativestt');
 
-  /// Runs the installation, reporting polled progress. Throws on a real
-  /// installation failure; a platform without downloadable speech assets
-  /// (pre-iOS 26, Android for now) returns immediately.
+  /// Installs the speech models for exactly [languages] (the user's selected
+  /// pending ones — never a global list), reporting polled progress. Throws
+  /// on a real installation failure; a platform without downloadable speech
+  /// assets (pre-iOS 26, Android for now) returns immediately.
   static Future<void> install({
-    required String targetLanguage,
+    required List<String> languages,
     void Function(SpeechAssetInstallProgress progress)? onProgress,
   }) async {
     final install = _channel.invokeMethod<void>(
       'installAssets',
-      {'targetLanguage': targetLanguage},
+      {'languages': languages},
     ).timeout(const Duration(minutes: 20));
 
     var done = false;
@@ -247,5 +298,18 @@ class NativeSpeechAssets {
       }
     }
     await install; // rethrows a real installation failure
+  }
+
+  /// Releases this app's asset-slot reservation for [language] (Settings →
+  /// Languages → Remove). Only ever a user-chosen language — never silent.
+  static Future<void> release({required String language}) async {
+    try {
+      await _channel.invokeMethod<void>(
+        'releaseLanguage',
+        {'language': language},
+      ).timeout(const Duration(seconds: 20));
+    } on MissingPluginException {
+      // Platform without reservations (Android for now) — nothing to free.
+    }
   }
 }

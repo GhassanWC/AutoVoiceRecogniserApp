@@ -46,6 +46,7 @@ class AppSettings {
     this.developerDiagnostics = false,
     this.translationEngine = TranslationEngine.openai,
     this.onDeviceModel = 'large-v3-turbo-q5_0',
+    this.listenLanguages = const ['en'],
   });
 
   final String targetLanguage;
@@ -75,6 +76,14 @@ class AppSettings {
   /// Which offline Whisper model to use (key into the offline model catalog).
   final String onDeviceModel;
 
+  /// Native on-device engine: the SOURCE languages the user wants Live
+  /// Translator to LISTEN FOR ("Listen for: English, Thai…"). The user picks
+  /// these once; each utterance is auto-detected among them. One language is
+  /// perfectly valid (fast single-recognizer path); the first-run default is
+  /// English only — never a silently-downloaded world list. Platform-neutral
+  /// so Android reuses the same state later.
+  final List<String> listenLanguages;
+
   AppSettings copyWith({
     String? targetLanguage,
     bool? showOriginalText,
@@ -90,6 +99,7 @@ class AppSettings {
     bool? developerDiagnostics,
     TranslationEngine? translationEngine,
     String? onDeviceModel,
+    List<String>? listenLanguages,
   }) {
     return AppSettings(
       targetLanguage: targetLanguage ?? this.targetLanguage,
@@ -106,6 +116,7 @@ class AppSettings {
       developerDiagnostics: developerDiagnostics ?? this.developerDiagnostics,
       translationEngine: translationEngine ?? this.translationEngine,
       onDeviceModel: onDeviceModel ?? this.onDeviceModel,
+      listenLanguages: listenLanguages ?? this.listenLanguages,
     );
   }
 
@@ -124,6 +135,7 @@ class AppSettings {
         'developerDiagnostics': developerDiagnostics,
         'translationEngine': translationEngine.name,
         'onDeviceModel': onDeviceModel,
+        'listenLanguages': listenLanguages,
       };
 
   factory AppSettings.fromJson(Map<String, dynamic> json) => AppSettings(
@@ -142,5 +154,9 @@ class AppSettings {
         translationEngine: TranslationEngine.values.asNameMap()[json['translationEngine']] ??
             TranslationEngine.openai,
         onDeviceModel: json['onDeviceModel'] as String? ?? 'large-v3-turbo-q5_0',
+        listenLanguages: [
+          for (final code in json['listenLanguages'] as List<dynamic>? ?? ['en'])
+            '$code'
+        ],
       );
 }

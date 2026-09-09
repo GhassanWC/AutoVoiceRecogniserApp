@@ -7,7 +7,9 @@ import '../../models/app_settings.dart';
 import '../../services/native/live_translation_support.dart';
 import '../../services/permissions/mic_diagnostics.dart';
 import '../../services/storage/history_store.dart';
+import '../live_translation/widgets/language_picker_sheet.dart';
 import '../live_translation/widgets/unsupported_dialog.dart';
+import 'languages_screen.dart';
 import '../../services/storage/settings_store.dart';
 import '../../utils/languages.dart';
 import 'privacy_policy_screen.dart';
@@ -146,7 +148,22 @@ class SettingsScreen extends StatelessWidget {
                 : 'Cloud (legacy/testing)'),
             onTap: () => _pickEngine(context, controller),
           ),
-          _SupportStatusTile(targetLanguage: settings.targetLanguage),
+          ListTile(
+            leading: const Icon(Icons.hearing_rounded),
+            title: const Text('Listening Languages'),
+            subtitle: Text(settings.listenLanguages.isEmpty
+                ? 'None selected — add languages to listen for'
+                : settings.listenLanguages.map(listenLanguageName).join(', ')),
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute<void>(builder: (_) => const LanguagesScreen()),
+            ),
+          ),
+          _SupportStatusTile(
+            targetLanguage: settings.targetLanguage,
+            listenLanguages: settings.listenLanguages,
+          ),
           const SizedBox(height: 24),
         ],
       ),
@@ -333,9 +350,13 @@ class SettingsScreen extends StatelessWidget {
 /// The status comes from the shared capability probe (real OS answers, not
 /// version guessing); tapping shows the reason, with Check Again to re-probe.
 class _SupportStatusTile extends StatelessWidget {
-  const _SupportStatusTile({required this.targetLanguage});
+  const _SupportStatusTile({
+    required this.targetLanguage,
+    required this.listenLanguages,
+  });
 
   final String targetLanguage;
+  final List<String> listenLanguages;
 
   @override
   Widget build(BuildContext context) {
@@ -346,8 +367,8 @@ class _SupportStatusTile extends StatelessWidget {
         final support = service.current;
         if (support == null && !service.probing) {
           // First visit before the startup probe finished — kick one off.
-          WidgetsBinding.instance.addPostFrameCallback(
-              (_) => service.ensure(targetLanguage: targetLanguage));
+          WidgetsBinding.instance.addPostFrameCallback((_) => service.ensure(
+              targetLanguage: targetLanguage, sourceLanguages: listenLanguages));
         }
         final String status;
         if (support == null || service.probing) {
@@ -371,8 +392,8 @@ class _SupportStatusTile extends StatelessWidget {
           title: const Text('On-device Live Translation'),
           subtitle: Text(status),
           onTap: () async {
-            final current =
-                await service.ensure(targetLanguage: targetLanguage);
+            final current = await service.refresh(
+                targetLanguage: targetLanguage, sourceLanguages: listenLanguages);
             if (!context.mounted) return;
             if (current.supported) {
               await _showStatusDialog(context, current);
@@ -381,6 +402,7 @@ class _SupportStatusTile extends StatelessWidget {
                 context,
                 support: current,
                 targetLanguage: targetLanguage,
+                sourceLanguages: listenLanguages,
               );
             }
           },
@@ -485,22 +507,26 @@ class _SupportStatusTile extends StatelessWidget {
     ).whenComplete(() => dismissed = true));
 
     String? failure;
+    final pending =
+        sharedLiveTranslationSupport.current?.pendingDownloads ?? const [];
     try {
       await NativeSpeechAssets.install(
-        targetLanguage: targetLanguage,
+        languages: pending,
         onProgress: (value) => progress.value = value,
       );
-    } catch (error) {
-      failure = '$error';
+    } catch (_) {
+      final names = pending.map(_languageName).join(', ');
+      failure = "$names couldn't be prepared. "
+          'Check your internet connection and try again.';
     }
     // Installation changes the device's installed set — re-probe (required).
     final refreshed = await sharedLiveTranslationSupport.refresh(
-        targetLanguage: targetLanguage);
+        targetLanguage: targetLanguage, sourceLanguages: listenLanguages);
     if (!context.mounted) return;
     if (!dismissed) Navigator.of(context, rootNavigator: true).pop();
     if (failure != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Language download failed: $failure')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(failure)));
     }
     await _showStatusDialog(context, refreshed);
   }
