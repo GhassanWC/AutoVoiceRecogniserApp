@@ -67,6 +67,15 @@ import UIKit
       TranslationBridge.handle(call, result: result)
     }
 
+    // Audio language identification (VoxLingua107 Core ML, bundled at CI
+    // time) — the isolated developer test drives this until it is proven on
+    // a real iPhone; only then does the session pipeline adopt it.
+    let languageId = FlutterMethodChannel(
+      name: "app.livetranslator/langid", binaryMessenger: messenger)
+    languageId.setMethodCallHandler { call, result in
+      LanguageIdBridge.handle(call, result: result)
+    }
+
     // Thermal/battery/memory snapshots for on-device AI instrumentation.
     let stats = FlutterMethodChannel(
       name: "app.livetranslator/devicestats", binaryMessenger: messenger)

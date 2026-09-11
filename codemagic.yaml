@@ -16,15 +16,57 @@ workflows:
       xcode: latest
       cocoapods: default
 
+    cache:
+      cache_paths:
+        # pip wheels (torch is ~800 MB) + the finished language-ID model so
+        # the Core ML conversion only re-runs when the script changes.
+        - ~/Library/Caches/pip
+        - ~/.langid_model_cache
+
     scripts:
       - name: Get Flutter packages
         script: |
           # Flutter plugins integrate via CocoaPods (the committed
-          # ios/Podfile). The on-device engine uses only OS frameworks
-          # (Speech, Translation, NaturalLanguage) — no third-party ML
-          # packages and no model downloads in this build.
+          # ios/Podfile). Speech/translation use OS frameworks; the ONLY
+          # bundled ML asset is the small VoxLingua107 language-ID model
+          # converted in the next step (~45 MB, Apache-2.0). No Whisper.
           flutter config --no-enable-swift-package-manager
           flutter pub get
+
+      - name: Convert + verify VoxLingua107 language-ID Core ML model
+        script: |
+          #!/bin/bash
+          # Spoken-language identification straight from AUDIO (107
+          # languages), fully on-device, $0 recurring cost. The script's own
+          # gate: the converted Core ML model must numerically match the
+          # PyTorch original on real audio, and stay under the 100 MB size
+          # limit — otherwise this build FAILS here, never on the iPhone.
+          set -e
+          CACHE="$HOME/.langid_model_cache"
+          KEY=$(shasum -a 256 ../tools/convert_langid_coreml.py | cut -c1-16)
+          DEST="ios/Runner/LanguageID"
+          if [ -f "$CACHE/$KEY/labels.json" ]; then
+            echo "[LANGID] using cached conversion ($KEY)"
+            rm -rf "$DEST"
+            mkdir -p "$DEST"
+            cp -R "$CACHE/$KEY/." "$DEST/"
+          else
+            python3 -m venv "$HOME/.langid_venv"
+            source "$HOME/.langid_venv/bin/activate"
+            pip install --quiet --upgrade pip
+            pip install --quiet "torch==2.3.1" "torchaudio==2.3.1" \
+              "coremltools==8.1" "speechbrain==1.0.2" "numpy<2"
+            python3 ../tools/convert_langid_coreml.py
+            deactivate
+            rm -rf "$CACHE/$KEY"
+            mkdir -p "$CACHE/$KEY"
+            cp -R "$DEST/." "$CACHE/$KEY/"
+          fi
+          echo "[LANGID] bundled contents:"
+          find "$DEST" -maxdepth 2 | sort
+          echo "[LANGID] bundled size: $(du -sh "$DEST" | cut -f1)"
+          test -d "$DEST/VoxLingua107LangID.mlmodelc" || { echo "[LANGID] missing mlmodelc"; exit 1; }
+          test -f "$DEST/labels.json" || { echo "[LANGID] missing labels.json"; exit 1; }
 
       - name: Install CocoaPods
         script: |
@@ -62,8 +104,68 @@ workflows:
         script: |
           flutter build ipa --release \
             --build-name=1.0.0 \
-            --build-number=19 \
+            --build-number=20 \
             --export-options-plist=/Users/builder/export_options.plist
+
+      - name: Verify language-ID model is INSIDE the app bundle (build gate)
+        script: |
+          #!/bin/bash
+          # Proof from the ACTUAL build products that Bundle.main will
+          # contain the language-ID model at runtime. A signed IPA without
+          # the model must never reach TestFlight — the detector would fail
+          # on every phone while CI looked green.
+          set -e
+
+          check_app() { # $1 = path to a Runner.app
+            local APP="$1"
+            local MODEL="$APP/LanguageID/VoxLingua107LangID.mlmodelc"
+            local LABELS="$APP/LanguageID/labels.json"
+            echo "[BUNDLE GATE] inspecting $APP"
+            if [ ! -d "$MODEL" ]; then
+              echo "[BUNDLE GATE] MISSING $MODEL"; return 1
+            fi
+            if [ -z "$(find "$MODEL" -type f | head -n 1)" ]; then
+              echo "[BUNDLE GATE] $MODEL exists but is EMPTY"; return 1
+            fi
+            if [ ! -f "$LABELS" ]; then
+              echo "[BUNDLE GATE] MISSING $LABELS"; return 1
+            fi
+            # 107-language sanity: a truncated labels file means a broken
+            # index→language mapping even if the model itself loaded.
+            local LABEL_COUNT
+            LABEL_COUNT=$(python3 -c "import json,sys;print(len(json.load(open(sys.argv[1]))))" "$LABELS")
+            if [ "$LABEL_COUNT" -lt 100 ]; then
+              echo "[BUNDLE GATE] labels.json has only $LABEL_COUNT entries"; return 1
+            fi
+            echo "[BUNDLE GATE] OK  model $(du -sh "$MODEL" | cut -f1), $LABEL_COUNT labels"
+            return 0
+          }
+
+          # 1. The archive's app (source of the export).
+          ARCHIVE=$(find build/ios/archive -name "*.xcarchive" -type d | head -n 1)
+          if [ -z "$ARCHIVE" ]; then
+            echo "[BUNDLE GATE] ERROR: no .xcarchive under build/ios/archive"; exit 1
+          fi
+          check_app "$ARCHIVE/Products/Applications/Runner.app" || {
+            echo "[BUNDLE GATE] FAILED in the archive — the Xcode folder"
+            echo "reference to ios/Runner/LanguageID did not copy resources."
+            exit 1
+          }
+
+          # 2. The SHIPPED IPA itself (what TestFlight actually receives).
+          IPA=$(find build/ios/ipa -name "*.ipa" | head -n 1)
+          if [ -z "$IPA" ]; then
+            echo "[BUNDLE GATE] ERROR: no .ipa under build/ios/ipa"; exit 1
+          fi
+          UNPACK=$(mktemp -d)
+          unzip -q "$IPA" -d "$UNPACK"
+          IPA_APP=$(find "$UNPACK/Payload" -maxdepth 1 -name "*.app" -type d | head -n 1)
+          check_app "$IPA_APP" || {
+            echo "[BUNDLE GATE] FAILED inside the exported IPA."
+            exit 1
+          }
+          rm -rf "$UNPACK"
+          echo "[BUNDLE GATE] PASSED — the model ships in this IPA."
 
     artifacts:
       - build/ios/ipa/*.ipa

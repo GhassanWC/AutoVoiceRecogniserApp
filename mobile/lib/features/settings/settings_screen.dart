@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../models/app_settings.dart';
+import '../../services/native/language_id.dart';
 import '../../services/native/live_translation_support.dart';
 import '../../services/permissions/mic_diagnostics.dart';
 import '../../services/storage/history_store.dart';
@@ -133,6 +134,13 @@ class SettingsScreen extends StatelessWidget {
             onChanged: (value) => controller.update((s) => s.copyWith(developerDiagnostics: value)),
           ),
           ListTile(
+            leading: const Icon(Icons.graphic_eq_rounded),
+            title: const Text('Test Language Detection'),
+            subtitle: const Text('Speak one sentence — the on-device detector '
+                'names the language (no speech recognition involved)'),
+            onTap: () => _testLanguageDetection(context),
+          ),
+          ListTile(
             leading: const Icon(Icons.mic_none_rounded),
             title: const Text('Test Microphone Permission'),
             subtitle: const Text(
@@ -165,6 +173,56 @@ class SettingsScreen extends StatelessWidget {
             listenLanguages: settings.listenLanguages,
           ),
           const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  /// The ISOLATED audio language-ID test the new architecture is gated on:
+  /// capture one spoken sentence, run ONLY the VoxLingua107 detector, and
+  /// show language + confidence + top alternatives. Test English, Arabic,
+  /// Hindi, Thai and Bengali on the real iPhone before the pipeline adopts it.
+  Future<void> _testLanguageDetection(BuildContext context) async {
+    final navigator = Navigator.of(context);
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(width: 16),
+            Expanded(
+              child: Text('SPEAK ONE CLEAR SENTENCE now…\n\n'
+                  'The on-device detector identifies the language from the '
+                  'audio itself (5 seconds).'),
+            ),
+          ],
+        ),
+      ),
+    ));
+
+    final report = await runLanguageIdTest();
+
+    navigator.pop(); // close the progress dialog
+    if (!context.mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(report.passed
+            ? 'Language detection: PASS'
+            : 'Language detection: FAILED'),
+        content: SingleChildScrollView(
+          child: SelectableText(
+            report.details,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Close'),
+          ),
         ],
       ),
     );

@@ -1,5 +1,22 @@
 # On-device engine — NATIVE platform speech + translation (production path)
 
+> **ARCHITECTURE CHANGE IN PROGRESS (2026-09-11): audio language ID first.**
+> Final product: the user picks ONLY the target language; a small on-device
+> Core ML detector (VoxLingua107 ECAPA, SpeechBrain, Apache-2.0, 107
+> languages, ~45 MB fp16, converted+verified at CI time by
+> `tools/convert_langid_coreml.py` — numeric-parity gate vs PyTorch, 100 MB
+> hard size limit) identifies the SPOKEN language from each VAD utterance's
+> AUDIO, then exactly ONE Apple recognizer runs for that language
+> (`AppleSpeechLocaleResolver` priority: installed SpeechTranscriber →
+> on-device SFSpeechRecognizer → network SFSpeechRecognizer → honest
+> "recognition unavailable for {language}"; downloads never block Start).
+> GATE: Settings → Developer → **Test Language Detection** (detector only,
+> no speech recognition) must pass on a real iPhone in EN/AR/HI/TH/BN
+> before the session pipeline, Listen-for UI removal, and single-recognizer
+> flow land. The confidence threshold is tuned from those device runs, not
+> hardcoded. Until then the selected-languages pipeline below remains
+> active.
+
 Selected in **Settings → Developer → Translation Engine**:
 
 - **Native on-device** (production goal): the phone's OWN speech recognition
