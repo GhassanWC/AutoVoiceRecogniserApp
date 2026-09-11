@@ -54,6 +54,9 @@ workflows:
             python3 -m venv "$HOME/.langid_venv"
             source "$HOME/.langid_venv/bin/activate"
             pip install --quiet --upgrade pip
+            # setuptools first: Python 3.12 removed distutils, and
+            # coremltools 8.x still imports it — setuptools ships the shim.
+            pip install --quiet --upgrade setuptools
             pip install --quiet "torch==2.3.1" "torchaudio==2.3.1" \
               "coremltools==8.1" "speechbrain==1.0.2" "numpy<2"
             python3 ../tools/convert_langid_coreml.py
