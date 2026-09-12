@@ -41,6 +41,34 @@ class AudioLanguageId {
   static Future<Map<Object?, Object?>> status() async =>
       await _channel.invokeMethod<Map<Object?, Object?>>('status') ?? {};
 
+  /// Phase 2: utterance → detector → resolver → ONE Apple recognizer for
+  /// the detected language → text. Never runs parallel recognizers.
+  static Future<DetectTranscribeResult> detectAndTranscribe(
+      Uint8List pcm16) async {
+    final reply = await _channel.invokeMethod<Map<Object?, Object?>>(
+      'detectAndTranscribe',
+      {'pcm16': pcm16, 'sampleRate': 16000},
+    ).timeout(const Duration(seconds: 90));
+    return DetectTranscribeResult(
+      language: '${reply?['language'] ?? 'und'}',
+      confidence: (reply?['confidence'] as num?)?.toDouble() ?? 0,
+      alternatives: [
+        for (final alt in reply?['alternatives'] as List<Object?>? ?? [])
+          (
+            '${(alt as Map<Object?, Object?>)['language']}',
+            (alt['confidence'] as num?)?.toDouble() ?? 0,
+          )
+      ],
+      detectionMs: (reply?['detectionMs'] as num?)?.toInt() ?? 0,
+      speechAvailable: reply?['speechAvailable'] == true,
+      backend: '${reply?['backend'] ?? 'unknown'}',
+      locale: reply?['locale'] as String?,
+      text: reply?['text'] as String?,
+      speechMs: (reply?['speechMs'] as num?)?.toInt(),
+      speechError: reply?['speechError'] as String?,
+    );
+  }
+
   static Future<LanguageDetection> detect(Uint8List pcm16) async {
     final reply = await _channel.invokeMethod<Map<Object?, Object?>>(
       'detect',
@@ -61,10 +89,160 @@ class AudioLanguageId {
   }
 }
 
+/// Result of the Phase-2 chain: detection + single-recognizer transcription.
+class DetectTranscribeResult {
+  const DetectTranscribeResult({
+    required this.language,
+    required this.confidence,
+    required this.alternatives,
+    required this.detectionMs,
+    required this.speechAvailable,
+    required this.backend,
+    required this.locale,
+    required this.text,
+    required this.speechMs,
+    required this.speechError,
+  });
+
+  final String language;
+  final double confidence;
+  final List<(String, double)> alternatives;
+  final int detectionMs;
+
+  /// False when Apple has NO recognition path for the detected language —
+  /// detection still SUCCEEDED; these are two separate facts.
+  final bool speechAvailable;
+
+  /// "transcriber" | "onDevice" | "network" | "unsupported".
+  final String backend;
+  final String? locale;
+  final String? text;
+  final int? speechMs;
+  final String? speechError;
+}
+
 class LanguageIdTestReport {
   const LanguageIdTestReport({required this.passed, required this.details});
   final bool passed;
   final String details;
+}
+
+/// Settings → Developer → Test Detect + Transcribe — the Phase-2 proof:
+/// one spoken utterance → language detector → AppleSpeechLocaleResolver →
+/// exactly ONE Apple recognizer for the detected language → text.
+/// No translation. Report shows detected language, confidence, chosen
+/// locale + backend, recognized text, and both latencies. Run on a real
+/// iPhone in English, Arabic, Hindi, Thai and Bengali.
+Future<LanguageIdTestReport> runDetectTranscribeTest({
+  MicPermissionService? permissions,
+  AudioCaptureService? capture,
+  Duration speakFor = const Duration(seconds: 5),
+}) async {
+  final lines = <String>[];
+  void log(String line) {
+    lines.add(line);
+    developer.log(line, name: 'langid');
+  }
+
+  LanguageIdTestReport fail(String reason) {
+    log(reason);
+    return LanguageIdTestReport(passed: false, details: lines.join('\n'));
+  }
+
+  log('[PHASE 2 TEST — detect → ONE recognizer → text; no translation]');
+
+  Map<Object?, Object?> status;
+  try {
+    status = await AudioLanguageId.status();
+  } on MissingPluginException {
+    return fail('Language identification is iOS-only in this build.');
+  }
+  if (status['modelBundled'] != true) {
+    return fail('This build was made without the CI model-conversion step.');
+  }
+
+  // Microphone permission (native truth; request only if undetermined).
+  final service = permissions ?? MicPermissionService();
+  var permission = await service.currentStatus();
+  if (permission == MicPermissionStatus.denied) {
+    permission = await service.request();
+  }
+  if (permission != MicPermissionStatus.granted) {
+    return fail('Microphone permission is not granted '
+        '(enable it in Settings → Live Translator → Microphone).');
+  }
+
+  // One utterance through the real environmental pipeline (unchanged).
+  log('Speak now — one clear sentence (${speakFor.inSeconds}s)…');
+  final audio = capture ?? AudioCaptureService();
+  final chunks = BytesBuilder(copy: true);
+  String? stoppedReason;
+  try {
+    await audio.start(
+      onAudio: chunks.add,
+      onStopped: (reason) => stoppedReason = reason,
+    );
+  } on AudioCaptureUnsupportedException {
+    return fail('Native audio capture is unavailable on this platform.');
+  } catch (error) {
+    return fail('Could not start the microphone: $error');
+  }
+  await Future<void>.delayed(speakFor);
+  await audio.stop();
+  final pcm = chunks.takeBytes();
+  final seconds = pcm.length / 2 / AudioCaptureService.sampleRate;
+  log('Captured ${pcm.length} bytes (${seconds.toStringAsFixed(2)}s)');
+  if (stoppedReason != null) {
+    return fail('Capture stopped early (reason=$stoppedReason).');
+  }
+  if (seconds < 1) {
+    return fail('Too little audio arrived.');
+  }
+
+  DetectTranscribeResult outcome;
+  try {
+    outcome = await AudioLanguageId.detectAndTranscribe(pcm);
+  } on PlatformException catch (error) {
+    return fail('Failed — ${error.message}');
+  } on TimeoutException {
+    return fail('Detect + transcribe did not answer in time.');
+  }
+
+  final name = languageForCode(outcome.language)?.name ?? outcome.language;
+  log('Detected language: $name (${outcome.language})');
+  log('Detection confidence: ${(outcome.confidence * 100).toStringAsFixed(1)}%');
+  log('Detection latency: ${outcome.detectionMs}ms');
+  var rank = 1;
+  for (final (code, prob) in outcome.alternatives) {
+    log('  $rank. ${languageForCode(code)?.name ?? code} ${prob.toStringAsFixed(2)}');
+    rank++;
+  }
+  if (!outcome.speechAvailable) {
+    // Detection SUCCEEDED; Apple just cannot transcribe this language here.
+    log('$name was detected, but speech recognition is not available '
+        'for it on this device.');
+    return LanguageIdTestReport(passed: false, details: lines.join('\n'));
+  }
+  log('Chosen Apple locale: ${outcome.locale ?? 'unknown'}');
+  log('Speech backend: ${switch (outcome.backend) {
+    'transcriber' => 'SpeechTranscriber (installed, on-device)',
+    'onDevice' => 'SFSpeechRecognizer (on-device)',
+    'network' => 'SFSpeechRecognizer (Apple network)',
+    _ => outcome.backend,
+  }}');
+  if (outcome.speechError != null) {
+    log('Speech latency: ${outcome.speechMs ?? '?'}ms');
+    return fail('Transcription failed — ${outcome.speechError}');
+  }
+  log('Speech latency: ${outcome.speechMs ?? '?'}ms');
+  final text = outcome.text?.trim() ?? '';
+  log('Recognized text: ${text.isEmpty ? '(empty — was anything said?)' : text}');
+  if (text.isEmpty) {
+    return fail('The recognizer returned no text — speak a clear sentence '
+        'and run again.');
+  }
+  log('Phase 2 (detect → transcribe): PASS');
+  return LanguageIdTestReport(passed: true, details: lines.join('\n'));
 }
 
 /// Settings → Developer → Test Language Detection — the ISOLATED native

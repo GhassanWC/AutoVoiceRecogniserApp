@@ -141,6 +141,13 @@ class SettingsScreen extends StatelessWidget {
             onTap: () => _testLanguageDetection(context),
           ),
           ListTile(
+            leading: const Icon(Icons.record_voice_over_outlined),
+            title: const Text('Test Detect + Transcribe'),
+            subtitle: const Text('Phase 2: detect the language, then run ONE '
+                'Apple recognizer for it — no translation'),
+            onTap: () => _testDetectTranscribe(context),
+          ),
+          ListTile(
             leading: const Icon(Icons.mic_none_rounded),
             title: const Text('Test Microphone Permission'),
             subtitle: const Text(
@@ -173,6 +180,53 @@ class SettingsScreen extends StatelessWidget {
             listenLanguages: settings.listenLanguages,
           ),
           const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  /// Phase 2 proof: utterance → detector → ONE Apple recognizer → text.
+  Future<void> _testDetectTranscribe(BuildContext context) async {
+    final navigator = Navigator.of(context);
+    unawaited(showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(width: 16),
+            Expanded(
+              child: Text('SPEAK ONE CLEAR SENTENCE now…\n\n'
+                  'The detector identifies the language, then one Apple '
+                  'recognizer transcribes it (5-second capture).'),
+            ),
+          ],
+        ),
+      ),
+    ));
+
+    final report = await runDetectTranscribeTest();
+
+    navigator.pop(); // close the progress dialog
+    if (!context.mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(report.passed
+            ? 'Detect + Transcribe: PASS'
+            : 'Detect + Transcribe: FAILED'),
+        content: SingleChildScrollView(
+          child: SelectableText(
+            report.details,
+            style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Close'),
+          ),
         ],
       ),
     );

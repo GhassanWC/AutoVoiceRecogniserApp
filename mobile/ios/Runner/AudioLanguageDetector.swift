@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreML
 import Flutter
 import Foundation
@@ -226,6 +227,194 @@ enum AppleSpeechLocaleResolver {
   }
 }
 
+/// Phase 2: exactly ONE Apple speech recognizer for the DETECTED language
+/// (never a parallel competition). The backend is whatever
+/// AppleSpeechLocaleResolver picked: installed SpeechTranscriber first,
+/// on-device SFSpeechRecognizer second, network-backed SFSpeechRecognizer
+/// third.
+enum SingleSpeechRecognizer {
+  struct Outcome {
+    let text: String
+  }
+
+  enum RecognizerError: LocalizedError {
+    case unavailable(String)
+    case notAuthorized
+    case timedOut
+
+    var errorDescription: String? {
+      switch self {
+      case .unavailable(let detail): return "Recognizer unavailable: \(detail)"
+      case .notAuthorized:
+        return "Speech recognition permission is not granted — enable it in "
+          + "Settings → Live Translator."
+      case .timedOut: return "Speech recognition timed out."
+      }
+    }
+  }
+
+  /// PCM16LE mono → Float32 AVAudioPCMBuffer (the recognizers' input).
+  static func floatBuffer(fromPCM16 data: Data, sampleRate: Double)
+    -> AVAudioPCMBuffer?
+  {
+    let frames = data.count / 2
+    guard frames > 0,
+      let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1,
+        interleaved: false),
+      let buffer = AVAudioPCMBuffer(
+        pcmFormat: format, frameCapacity: AVAudioFrameCount(frames))
+    else { return nil }
+    buffer.frameLength = AVAudioFrameCount(frames)
+    guard let channel = buffer.floatChannelData?[0] else { return nil }
+    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+      let int16 = raw.bindMemory(to: Int16.self)
+      for i in 0..<frames {
+        channel[i] = Float(Int16(littleEndian: int16[i])) / 32768.0
+      }
+    }
+    return buffer
+  }
+
+  static func ensureAuthorization() async -> Bool {
+    if SFSpeechRecognizer.authorizationStatus() == .authorized { return true }
+    return await withCheckedContinuation { continuation in
+      SFSpeechRecognizer.requestAuthorization { status in
+        continuation.resume(returning: status == .authorized)
+      }
+    }
+  }
+
+  static func transcribe(
+    pcm16: Data, sampleRate: Int,
+    availability: AppleSpeechLocaleResolver.Availability
+  ) async throws -> Outcome {
+    guard let buffer = floatBuffer(fromPCM16: pcm16,
+                                   sampleRate: Double(sampleRate))
+    else { throw RecognizerError.unavailable("could not build audio buffer") }
+    switch availability {
+    case .transcriberReady(let locale):
+      if #available(iOS 26.0, *) {
+        let text = try await transcriberOnce(buffer: buffer, locale: locale)
+        return Outcome(text: text)
+      }
+      throw RecognizerError.unavailable("SpeechTranscriber needs iOS 26")
+    case .onDevice(let locale):
+      return Outcome(text: try await sfTranscribe(
+        buffer: buffer, locale: locale, onDeviceOnly: true))
+    case .networkBacked(let locale):
+      return Outcome(text: try await sfTranscribe(
+        buffer: buffer, locale: locale, onDeviceOnly: false))
+    case .unsupported:
+      throw RecognizerError.unavailable("no Apple recognition path")
+    }
+  }
+
+  /// iOS 26 SpeechAnalyzer/SpeechTranscriber, ONE locale, one utterance.
+  @available(iOS 26.0, *)
+  private static func transcriberOnce(buffer: AVAudioPCMBuffer, locale: Locale)
+    async throws -> String
+  {
+    let transcriber = SpeechTranscriber(locale: locale,
+                                        preset: .progressiveTranscription)
+    let analyzer = SpeechAnalyzer(modules: [transcriber])
+    var input = buffer
+    if let bestFormat = await SpeechAnalyzer.bestAvailableAudioFormat(
+      compatibleWith: [transcriber]),
+      bestFormat != buffer.format,
+      let converted = convert(buffer: buffer, to: bestFormat)
+    {
+      input = converted
+    }
+    async let collected: String = {
+      var text = ""
+      do {
+        for try await result in transcriber.results where result.isFinal {
+          text += String(result.text.characters)
+        }
+      } catch {
+        NSLog("[PHASE2] transcriber results error: \(error)")
+      }
+      return text
+    }()
+    let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+    try await analyzer.start(inputSequence: inputSequence)
+    inputBuilder.yield(AnalyzerInput(buffer: input))
+    inputBuilder.finish()
+    try await analyzer.finalizeAndFinishThroughEndOfInput()
+    return await collected.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private static func convert(buffer: AVAudioPCMBuffer, to format: AVAudioFormat)
+    -> AVAudioPCMBuffer?
+  {
+    guard let converter = AVAudioConverter(from: buffer.format, to: format)
+    else { return nil }
+    let ratio = format.sampleRate / buffer.format.sampleRate
+    let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+    guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity)
+    else { return nil }
+    var fed = false
+    let status = converter.convert(to: out, error: nil) { _, outStatus in
+      if fed {
+        outStatus.pointee = .endOfStream
+        return nil
+      }
+      fed = true
+      outStatus.pointee = .haveData
+      return buffer
+    }
+    return status == .error ? nil : out
+  }
+
+  /// SFSpeechRecognizer, ONE locale, one utterance; on-device or
+  /// network-backed per the resolver's verdict.
+  private static func sfTranscribe(
+    buffer: AVAudioPCMBuffer, locale: Locale, onDeviceOnly: Bool
+  ) async throws -> String {
+    guard await ensureAuthorization() else {
+      throw RecognizerError.notAuthorized
+    }
+    guard let recognizer = SFSpeechRecognizer(locale: locale),
+      recognizer.isAvailable
+    else {
+      throw RecognizerError.unavailable(
+        "SFSpeechRecognizer for \(locale.identifier) is not available "
+          + (onDeviceOnly ? "on-device" : "(network path)"))
+    }
+    let request = SFSpeechAudioBufferRecognitionRequest()
+    request.requiresOnDeviceRecognition = onDeviceOnly
+    request.shouldReportPartialResults = false
+    request.append(buffer)
+    request.endAudio()
+    let resumeQueue = DispatchQueue(label: "langid.sf.single")
+    return try await withCheckedThrowingContinuation { continuation in
+      var finished = false
+      var task: SFSpeechRecognitionTask?
+      task = recognizer.recognitionTask(with: request) { result, error in
+        resumeQueue.async {
+          if finished { return }
+          if let result, result.isFinal {
+            finished = true
+            continuation.resume(
+              returning: result.bestTranscription.formattedString)
+          } else if let error {
+            finished = true
+            continuation.resume(throwing: error)
+          }
+        }
+      }
+      // Hard cap: one wedged recognizer must never hang the test.
+      resumeQueue.asyncAfter(deadline: .now() + 30) {
+        if finished { return }
+        finished = true
+        task?.cancel()
+        continuation.resume(throwing: RecognizerError.timedOut)
+      }
+    }
+  }
+}
+
 /// MethodChannel front for the detector — used by the ISOLATED developer
 /// test first (Settings → Developer → Test Language Detection); the full
 /// pipeline adopts it only after the test passes on a real iPhone.
@@ -250,6 +439,82 @@ enum LanguageIdBridge {
           "speechPaths": speech,
         ]
         await MainActor.run { result(payload) }
+      }
+    case "detectAndTranscribe":
+      // Phase 2: utterance → detector → resolver → ONE recognizer → text.
+      guard let data = ((call.arguments as? [String: Any])?["pcm16"]
+        as? FlutterStandardTypedData)?.data
+      else {
+        result(FlutterError(code: "bad_args", message: "pcm16 audio is required", details: nil))
+        return
+      }
+      let sampleRate =
+        ((call.arguments as? [String: Any])?["sampleRate"] as? Int) ?? 16000
+      DispatchQueue.global(qos: .userInitiated).async {
+        let detectStarted = Date()
+        let detection: AudioLanguageDetector.DetectionResult
+        do {
+          detection = try AudioLanguageDetector.shared.detect(pcm16: data)
+        } catch {
+          DispatchQueue.main.async {
+            result(FlutterError(
+              code: "langid_failed",
+              message: (error as? LocalizedError)?.errorDescription ?? "\(error)",
+              details: nil))
+          }
+          return
+        }
+        let detectionMs = Int(Date().timeIntervalSince(detectStarted) * 1000)
+        Task {
+          let availability = await AppleSpeechLocaleResolver.resolve(
+            languageCode: detection.language)
+          var payload: [String: Any] = [
+            "language": detection.language,
+            "confidence": detection.confidence,
+            "detectionMs": detectionMs,
+            "alternatives": detection.alternatives.map {
+              ["language": $0.language, "confidence": $0.confidence]
+            },
+          ]
+          let backend: String
+          let localeId: String?
+          switch availability {
+          case .transcriberReady(let locale):
+            backend = "transcriber"
+            localeId = locale.identifier
+          case .onDevice(let locale):
+            backend = "onDevice"
+            localeId = locale.identifier
+          case .networkBacked(let locale):
+            backend = "network"
+            localeId = locale.identifier
+          case .unsupported:
+            backend = "unsupported"
+            localeId = nil
+          }
+          payload["backend"] = backend
+          payload["locale"] = localeId as Any
+          if case .unsupported = availability {
+            payload["speechAvailable"] = false
+            await MainActor.run { result(payload) }
+            return
+          }
+          payload["speechAvailable"] = true
+          let speechStarted = Date()
+          do {
+            let outcome = try await SingleSpeechRecognizer.transcribe(
+              pcm16: data, sampleRate: sampleRate, availability: availability)
+            payload["text"] = outcome.text
+            payload["speechMs"] =
+              Int(Date().timeIntervalSince(speechStarted) * 1000)
+          } catch {
+            payload["speechError"] =
+              (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            payload["speechMs"] =
+              Int(Date().timeIntervalSince(speechStarted) * 1000)
+          }
+          await MainActor.run { result(payload) }
+        }
       }
     case "detect":
       guard let data = ((call.arguments as? [String: Any])?["pcm16"]
