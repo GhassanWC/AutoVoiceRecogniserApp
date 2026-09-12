@@ -165,10 +165,10 @@ class SettingsScreen extends StatelessWidget {
           ),
           ListTile(
             leading: const Icon(Icons.hearing_rounded),
-            title: const Text('Listening Languages'),
-            subtitle: Text(settings.listenLanguages.isEmpty
-                ? 'None selected — add languages to listen for'
-                : settings.listenLanguages.map(listenLanguageName).join(', ')),
+            title: const Text('Listening Languages (debug)'),
+            subtitle: Text('Production sessions detect the source language '
+                'automatically. Legacy selection: '
+                '${settings.listenLanguages.isEmpty ? 'none' : settings.listenLanguages.map(listenLanguageName).join(', ')}'),
             trailing: const Icon(Icons.chevron_right_rounded),
             onTap: () => Navigator.push(
               context,

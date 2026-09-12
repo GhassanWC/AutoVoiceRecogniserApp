@@ -110,6 +110,13 @@ final class AudioLanguageDetector {
     }
   }
 
+  /// Loads the Core ML model + labels once, without detecting anything —
+  /// called at Start Listening so no session utterance ever pays the model
+  /// load, and the same instance is reused for the whole session.
+  func warmup() throws {
+    try loadIfNeeded()
+  }
+
   // ── Detection ──────────────────────────────────────────────────────────────
 
   /// PCM16LE mono 16 kHz utterance → detected language + top alternatives.
@@ -439,6 +446,20 @@ enum LanguageIdBridge {
           "speechPaths": speech,
         ]
         await MainActor.run { result(payload) }
+      }
+    case "warmup":
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          try AudioLanguageDetector.shared.warmup()
+          DispatchQueue.main.async { result(nil) }
+        } catch {
+          DispatchQueue.main.async {
+            result(FlutterError(
+              code: "langid_warmup_failed",
+              message: (error as? LocalizedError)?.errorDescription ?? "\(error)",
+              details: nil))
+          }
+        }
       }
     case "detectAndTranscribe":
       // Phase 2: utterance → detector → resolver → ONE recognizer → text.

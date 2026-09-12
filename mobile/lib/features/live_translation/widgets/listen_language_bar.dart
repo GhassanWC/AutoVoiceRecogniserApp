@@ -8,19 +8,18 @@ import '../../../services/native/live_translation_support.dart';
 import '../../../services/storage/settings_store.dart';
 import '../../../utils/languages.dart';
 import '../live_translation_controller.dart';
-import 'language_picker_sheet.dart';
 
-/// The native engine's language controls on the main screen.
+/// The native engine's language control on the main screen — Phase 3:
+/// the user picks ONLY the target language; the source language is
+/// AUTOMATIC (detected per utterance by the on-device detector).
 ///
 /// Idle:
-///   Translate to: [ 🇸🇦 Arabic ▾ ]
-///   Listen for:   [ English ✓ ] [ Thai ↓ ] [ + Add language ]
+///   Translate to: [ 🇸🇦 Arabic ▾ ]     Source language: Automatic
 ///
 /// While listening:
-///   Listening for: English • Thai   →   Arabic
+///   Auto-detecting the spoken language   →   Arabic
 ///
-/// The user picks the listening languages ONCE; every utterance is then
-/// auto-detected among them. Only shown for the native on-device engine.
+/// (The old "Listen for" multi-select lives on only as a Developer tool.)
 class ListenLanguageBar extends StatelessWidget {
   const ListenLanguageBar({super.key});
 
@@ -37,81 +36,35 @@ class ListenLanguageBar extends StatelessWidget {
         languageForCode(settings.targetLanguage)?.name ?? settings.targetLanguage;
 
     if (controller.state != ListeningState.idle) {
-      final active = controller.activeLanguages.isEmpty
-          ? settings.listenLanguages
-          : controller.activeLanguages;
       return Padding(
         padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
         child: Text(
-          'Listening for: ${active.map(listenLanguageName).join(' • ')}'
-          '   →   $targetName',
+          'Auto-detecting the spoken language   →   $targetName',
           textAlign: TextAlign.center,
           style: theme.textTheme.bodySmall,
         ),
       );
     }
 
-    return ListenableBuilder(
-      listenable: sharedLiveTranslationSupport,
-      builder: (context, _) {
-        final support = sharedLiveTranslationSupport.current;
-        return Padding(
-          padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Wrap(
-                spacing: 8,
-                runSpacing: 4,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  Text('Translate to:', style: theme.textTheme.bodySmall),
-                  ActionChip(
-                    avatar: Text(
-                        languageForCode(settings.targetLanguage)?.flag ?? '🌐'),
-                    label: Text(targetName),
-                    onPressed: () => _pickTarget(context),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              Wrap(
-                spacing: 8,
-                runSpacing: 4,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  Text('Listen for:', style: theme.textTheme.bodySmall),
-                  for (final code in settings.listenLanguages)
-                    InputChip(
-                      avatar: _statusIcon(context, support?.statusFor(code)),
-                      label: Text(listenLanguageName(code)),
-                      onPressed: () => showListenLanguagePicker(context),
-                    ),
-                  ActionChip(
-                    avatar: const Icon(Icons.add_rounded, size: 18),
-                    label: Text(settings.listenLanguages.isEmpty
-                        ? 'Add languages'
-                        : 'Add language'),
-                    onPressed: () => showListenLanguagePicker(context),
-                  ),
-                ],
-              ),
-            ],
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 4,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        alignment: WrapAlignment.center,
+        children: [
+          Text('Translate to:', style: theme.textTheme.bodySmall),
+          ActionChip(
+            avatar: Text(languageForCode(settings.targetLanguage)?.flag ?? '🌐'),
+            label: Text(targetName),
+            onPressed: () => _pickTarget(context),
           ),
-        );
-      },
+          Text('Source language: Automatic', style: theme.textTheme.bodySmall),
+        ],
+      ),
     );
   }
-
-  Widget? _statusIcon(BuildContext context, String? status) => switch (status) {
-        'ready' => const Icon(Icons.check_circle_rounded,
-            size: 18, color: Colors.green),
-        'downloadRequired' =>
-          const Icon(Icons.download_for_offline_outlined, size: 18),
-        'unsupported' => Icon(Icons.error_outline_rounded,
-            size: 18, color: Theme.of(context).colorScheme.error),
-        _ => null,
-      };
 
   /// Target language picker (same catalog as Settings → My Language).
   Future<void> _pickTarget(BuildContext context) async {
@@ -145,12 +98,11 @@ class ListenLanguageBar extends StatelessWidget {
         ),
       ),
     );
-    // Changing the target NEVER touches the listening selection; only the
-    // translation pair statuses need re-probing.
+    // New utterances use the new target; translation pair statuses refresh.
     if (!context.mounted) return;
     unawaited(sharedLiveTranslationSupport.refresh(
       targetLanguage: controller.settings.targetLanguage,
-      sourceLanguages: controller.settings.listenLanguages,
+      sourceLanguages: const ['en'],
     ));
   }
 }

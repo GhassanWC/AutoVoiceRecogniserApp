@@ -26,6 +26,7 @@ class LocalPipeline {
     required this.targetLanguage,
     required this.onMessageCreated,
     required this.onMessageResolved,
+    this.onMessageDiscarded,
     this.diagnosticsLog,
     DeviceStatsService? stats,
     String Function()? messageIdFactory,
@@ -47,6 +48,11 @@ class LocalPipeline {
     required String translatedText,
     required bool translated,
   }) onMessageResolved;
+
+  /// The utterance should NOT become a bubble (language unidentifiable,
+  /// recognizer unavailable, pure silence): remove the pending bubble and
+  /// optionally surface [reason] subtly. Null → legacy resolve behavior.
+  final void Function(String messageId, String reason)? onMessageDiscarded;
 
   /// Developer-mode logger (null → dart:developer).
   final void Function(String line)? diagnosticsLog;
@@ -91,14 +97,22 @@ class LocalPipeline {
       final transcriptMs = DateTime.now().difference(started).inMilliseconds;
 
       if (transcript.text.isEmpty) {
-        onMessageResolved(
-          messageId,
-          originalText: '',
-          sourceLanguage: 'und',
-          translatedText: '…',
-          translated: false,
-        );
-        _log('[LOCAL] id=$messageId no speech recognized (${transcriptMs}ms)');
+        // No renderable speech: unidentifiable language, unavailable
+        // recognizer, or silence. Never a nonsense bubble.
+        final reason = transcript.discardNotice ?? '';
+        if (onMessageDiscarded != null) {
+          onMessageDiscarded!(messageId, reason);
+        } else {
+          onMessageResolved(
+            messageId,
+            originalText: '',
+            sourceLanguage: 'und',
+            translatedText: '…',
+            translated: false,
+          );
+        }
+        _log('[LOCAL] id=$messageId discarded (${transcriptMs}ms)'
+            '${reason.isEmpty ? '' : ' reason="$reason"'}');
         return;
       }
 

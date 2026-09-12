@@ -42,12 +42,18 @@ class NativeOnDeviceTranslator implements LocalTranslator {
     // Unknown source: let the platform auto-detect (Apple supports a nil
     // source); "und" from silence never reaches here (pipeline skips empty).
     final from = sourceLanguage == 'und' ? null : sourceLanguage;
+    final started = DateTime.now();
     try {
       final reply = await _channel.invokeMethod<Map<Object?, Object?>>(
         'translate',
         {'text': text, 'from': from, 'to': targetLanguage},
       ).timeout(const Duration(seconds: 30));
       final translated = (reply?['text'] as String? ?? '').trim();
+      developer.log(
+        '[TRANSLATE] $sourceLanguage → $targetLanguage '
+        'latency=${DateTime.now().difference(started).inMilliseconds}ms',
+        name: 'local',
+      );
       return translated.isEmpty ? null : translated;
     } catch (error) {
       // null → the bubble shows the transcript with a Retry action; the

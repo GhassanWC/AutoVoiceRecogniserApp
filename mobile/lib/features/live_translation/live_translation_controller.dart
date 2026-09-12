@@ -14,6 +14,7 @@ import '../../services/audio/vad_segmenter.dart';
 import '../../services/auth/api_client.dart';
 import '../../services/local/local_pipeline.dart';
 import '../../services/local/local_speech_engine.dart';
+import '../../services/native/detecting_speech_engine.dart';
 import '../../services/native/live_translation_support.dart';
 import '../../services/native/native_translator.dart';
 import '../../utils/languages.dart';
@@ -86,9 +87,15 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   /// 0..1 microphone level for the waveform animation.
   double micLevel = 0;
 
-  /// Languages the CURRENT native session is listening for (session UI:
-  /// "Listening for: English • Thai"). Empty when idle or on other engines.
+  /// Languages the CURRENT native session is listening for. With the
+  /// automatic-source engine this stays empty (source = automatic).
   List<String> activeLanguages = [];
+
+  /// Cross-language pairs that already showed a "translation unavailable"
+  /// notice this session (one snackbar per pair, not per utterance).
+  final Set<String> _translateNoticeShown = {};
+  String _lastDiscardNotice = '';
+  DateTime _lastDiscardNoticeAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// Persistent problem shown as a banner (null = none).
   String? errorBanner;
@@ -142,6 +149,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     _usingMock = settings.settings.mockMode;
     state = ListeningState.starting;
     notifyListeners();
+    developer.log('[START 1] tapped', name: 'local');
 
     if (_usingMock) {
       _startMock();
@@ -156,6 +164,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     }
     switch (permission) {
       case MicPermissionStatus.granted:
+        developer.log('[START 2] microphone permission granted', name: 'local');
         break;
       case MicPermissionStatus.permanentlyDenied:
         permissionPermanentlyDenied = true;
@@ -243,79 +252,33 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   /// ONE selected language is fully valid.
   Future<void> _startLocalEngine() async {
     final target = settings.settings.targetLanguage;
-    final selected = settings.settings.listenLanguages;
+    final targetName = languageForCode(target)?.name ?? target;
+    _translateNoticeShown.clear();
 
-    if (selected.isEmpty) {
-      _failStart('Select at least one language to listen for '
-          '(Listen for → Add language).');
-      return;
-    }
-
-    // 1. Capability gate, probed for THIS selection.
-    final support = await sharedLiveTranslationSupport.refresh(
-        targetLanguage: target, sourceLanguages: selected);
+    // 1. Device gate. SOURCE LANGUAGE IS AUTOMATIC — the detector handles
+    //    every utterance — so only device-level support matters here.
+    final support = await sharedLiveTranslationSupport.ensure(
+        targetLanguage: target, sourceLanguages: const ['en']);
     if (!support.supported) {
+      developer.log('[START 4] device unsupported: ${support.reason}',
+          name: 'local');
       _failStart(support.reason);
       return;
     }
-    if (support.missingLanguages.isNotEmpty) {
-      final names = support.missingLanguages
-          .map((code) => languageForCode(code)?.name ?? code)
-          .join(', ');
-      _failStart('$names is not available on this device. '
-          'Remove it from your listening languages to start.');
-      return;
-    }
 
-    // 2. Selected-but-not-downloaded speech models: fetch exactly those
-    //    through the OS (AssetInventory) with live progress, then start
-    //    automatically — a pending pack is a download, never an error.
-    if (support.pendingDownloads.isNotEmpty) {
-      try {
-        activityLabel = 'Preparing Live Translation…';
-        notifyListeners();
-        await NativeSpeechAssets.install(
-          languages: support.pendingDownloads,
-          onProgress: (progress) {
-            final code = progress.language;
-            final name =
-                code == null ? null : (languageForCode(code)?.name ?? code);
-            activityLabel = name == null
-                ? 'Preparing Live Translation…'
-                : 'Downloading $name speech… '
-                    '${(progress.fraction * 100).toStringAsFixed(0)}%';
-            notifyListeners();
-          },
-        );
-      } catch (error) {
-        developer.log('[NATIVE STT] asset install failed: $error', name: 'local');
-        final names = support.pendingDownloads
-            .map((code) => languageForCode(code)?.name ?? code)
-            .join(', ');
-        _failStart("$names couldn't be prepared. "
-            'Check your internet connection and try again.');
-        return;
-      }
-      activityLabel = null;
-      // Installed set changed — re-run the capability check (required).
-      await sharedLiveTranslationSupport.refresh(
-          targetLanguage: target, sourceLanguages: selected);
-    }
-
-    // 3. Speech setup: recognizers for the SELECTED languages only.
-    final engine = _localEngine ??= NativeSpeechEngine();
+    // 2. Warm the language detector ONCE per session (never per utterance).
+    final engine = _localEngine ??= DetectingSpeechEngine();
     try {
-      await engine.load(selected);
+      await engine.load(const []); // source languages: automatic
+      developer.log('[START 4] language detector ready', name: 'local');
     } catch (error) {
-      developer.log('[NATIVE STT] setup failed: $error', name: 'local');
-      _failStart('Could not start on-device speech recognition — $error');
+      developer.log('[START 4] detector warmup FAILED: $error', name: 'local');
+      _failStart('Automatic language detection is unavailable in this build.');
       return;
     }
-    activeLanguages = List.of(selected);
 
-    // 3. Language pack for the target: the platform's own download flow.
-    //    A pending download is normal, not an error.
-    final targetName = languageForCode(target)?.name ?? target;
+    // 3. Target-language translation pack: the platform's own download
+    //    flow. A pending download is normal, never an error.
     activityLabel = 'Preparing $targetName translation…';
     notifyListeners();
     await NativeOnDeviceTranslator.prepare(targetLanguage: target);
@@ -347,6 +310,37 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
             languageConfidence: known ? 0.9 : null,
           ),
         );
+        // Cross-language pair that Apple couldn't translate: the bubble
+        // keeps the source transcript; tell the user subtly, once per
+        // language pair per session. Same-language passthrough is normal.
+        if (!translated &&
+            known &&
+            sourceLanguage != settings.settings.targetLanguage &&
+            _translateNoticeShown.add(sourceLanguage)) {
+          final sourceName =
+              languageForCode(sourceLanguage)?.name ?? sourceLanguage;
+          final targetName =
+              languageForCode(settings.settings.targetLanguage)?.name ??
+                  settings.settings.targetLanguage;
+          _notices.add('Translation to $targetName isn\'t available for '
+              '$sourceName right now.');
+        }
+      },
+      onMessageDiscarded: (messageId, reason) {
+        // No renderable speech — remove the pending bubble, never show a
+        // nonsense translation. The reason (e.g. "Couldn't identify the
+        // spoken language.") surfaces as a subtle snackbar, throttled so a
+        // noisy room can't spam it.
+        _removeMessage(messageId);
+        final now = DateTime.now();
+        if (reason.isNotEmpty &&
+            (reason != _lastDiscardNotice ||
+                now.difference(_lastDiscardNoticeAt).inSeconds > 8)) {
+          _lastDiscardNotice = reason;
+          _lastDiscardNoticeAt = now;
+          _notices.add(reason);
+        }
+        notifyListeners();
       },
       diagnosticsLog: (line) {
         if (settings.settings.developerDiagnostics) developer.log(line, name: 'local');
@@ -372,16 +366,21 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
         onAudio: _handleCapturedAudio,
         onStopped: _handleCaptureStopped,
       );
+      developer.log('[START 3] audio session configured', name: 'local');
+      developer.log('[START 5] VAD started', name: 'local');
     } on AudioCaptureUnsupportedException {
+      developer.log('[START 3] capture unsupported on this platform', name: 'local');
       _failStart('Microphone capture is not available on this platform.');
       return;
-    } catch (_) {
+    } catch (error) {
+      developer.log('[START 3] capture start FAILED: $error', name: 'local');
       _failStart('Could not start the microphone. It may be in use by another app.');
       return;
     }
 
     _sessionStartedAt = DateTime.now();
     state = ListeningState.listening;
+    developer.log('[START 6] LISTENING', name: 'local');
     notifyListeners();
   }
 
@@ -648,6 +647,14 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     _sessionMessages.add(message);
     _logStage('[8] CHAT_MESSAGE_CREATED id=$messageId');
     return messages.length - 1;
+  }
+
+  /// Removes a pending bubble that turned out to have no renderable speech
+  /// (unidentifiable language, unavailable recognizer, silence).
+  void _removeMessage(String messageId) {
+    messages.removeWhere((m) => m.id == messageId);
+    _sessionMessages.removeWhere((m) => m.id == messageId);
+    _logStage('[8] CHAT_MESSAGE_DISCARDED id=$messageId');
   }
 
   /// Updates the message in place — never creates a second bubble for the

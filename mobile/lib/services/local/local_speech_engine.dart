@@ -6,12 +6,23 @@ import 'local_language_detect.dart';
 
 /// One recognized utterance from the on-device recognizer.
 class LocalTranscript {
-  const LocalTranscript({required this.text, required this.language});
+  const LocalTranscript({
+    required this.text,
+    required this.language,
+    this.discardNotice,
+  });
+
   final String text;
 
   /// ISO 639-1 code the platform detected (backed up by script analysis),
   /// or "und" for silence/non-speech.
   final String language;
+
+  /// Non-null when this utterance should NOT become a chat bubble — e.g.
+  /// the language couldn't be identified confidently, or Apple has no
+  /// recognizer for the detected language. The pipeline discards the
+  /// pending bubble and surfaces this short user-facing message subtly.
+  final String? discardNotice;
 }
 
 /// Abstract so the pipeline and tests never touch the native bridge directly.

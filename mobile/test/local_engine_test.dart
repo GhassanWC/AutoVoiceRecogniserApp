@@ -43,12 +43,19 @@ class _Resolved {
   final bool translated;
 }
 
-({LocalPipeline pipeline, List<String> created, List<_Resolved> resolved}) buildPipeline(
+({
+  LocalPipeline pipeline,
+  List<String> created,
+  List<_Resolved> resolved,
+  List<(String, String)> discarded,
+}) buildPipeline(
   FakeLocalSpeechEngine engine, {
   String targetLanguage = 'ar',
+  bool withDiscard = false,
 }) {
   final created = <String>[];
   final resolved = <_Resolved>[];
+  final discarded = <(String, String)>[];
   var counter = 0;
   final pipeline = LocalPipeline(
     engine: engine,
@@ -63,9 +70,16 @@ class _Resolved {
         required translated}) {
       resolved.add(_Resolved(id, originalText, sourceLanguage, translatedText, translated));
     },
+    onMessageDiscarded:
+        withDiscard ? (id, reason) => discarded.add((id, reason)) : null,
     diagnosticsLog: (_) {},
   );
-  return (pipeline: pipeline, created: created, resolved: resolved);
+  return (
+    pipeline: pipeline,
+    created: created,
+    resolved: resolved,
+    discarded: discarded
+  );
 }
 
 void feedSegment(LocalPipeline pipeline, String segmentId, {int chunks = 5, int durationMs = 500}) {
@@ -94,6 +108,37 @@ void main() {
   });
 
   group('LocalPipeline (Phase A)', () {
+    test('unidentifiable language DISCARDS the bubble with the notice, no resolve', () async {
+      // Phase 3: low-confidence detection / Apple-unsupported language must
+      // never become a nonsense translation bubble.
+      final engine = FakeLocalSpeechEngine([
+        const LocalTranscript(
+          text: '',
+          language: 'und',
+          discardNotice: "Couldn't identify the spoken language.",
+        ),
+      ]);
+      final harness = buildPipeline(engine, withDiscard: true);
+      feedSegment(harness.pipeline, 'seg-1');
+      await harness.pipeline.drain();
+
+      expect(harness.created, ['local_0']); // pending bubble appeared…
+      expect(harness.discarded,
+          [('local_0', "Couldn't identify the spoken language.")]);
+      expect(harness.resolved, isEmpty); // …and was withdrawn, not resolved
+    });
+
+    test('empty transcript keeps legacy resolve when no discard callback exists', () async {
+      final engine = FakeLocalSpeechEngine(
+          [const LocalTranscript(text: '', language: 'und')]);
+      final harness = buildPipeline(engine); // no onMessageDiscarded
+      feedSegment(harness.pipeline, 'seg-1');
+      await harness.pipeline.drain();
+
+      expect(harness.resolved, hasLength(1));
+      expect(harness.resolved.single.translated, isFalse);
+    });
+
     test('utterance → pending bubble → transcript + language resolve the SAME id', () async {
       final engine =
           FakeLocalSpeechEngine([const LocalTranscript(text: 'สวัสดีครับ', language: 'th')]);

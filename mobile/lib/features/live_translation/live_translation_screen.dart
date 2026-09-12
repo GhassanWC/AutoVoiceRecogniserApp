@@ -51,7 +51,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
       final settings = context.read<SettingsController>().settings;
       sharedLiveTranslationSupport.ensure(
         targetLanguage: settings.targetLanguage,
-        sourceLanguages: settings.listenLanguages,
+        sourceLanguages: const ['en'], // source is automatic
       );
     });
   }
@@ -93,7 +93,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
           !settings.mockMode) {
         final support = await sharedLiveTranslationSupport.ensure(
           targetLanguage: settings.targetLanguage,
-          sourceLanguages: settings.listenLanguages,
+          sourceLanguages: const ['en'], // source is automatic
         );
         if (!support.supported) {
           if (mounted) {
@@ -101,7 +101,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
               context,
               support: support,
               targetLanguage: settings.targetLanguage,
-              sourceLanguages: settings.listenLanguages,
+              sourceLanguages: const ['en'], // source is automatic
             );
           }
           return;
@@ -308,7 +308,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
                             context,
                             support: support,
                             targetLanguage: settings.targetLanguage,
-                            sourceLanguages: settings.listenLanguages,
+                            sourceLanguages: const ['en'], // source is automatic
                           ),
                 );
               },
