@@ -38,10 +38,11 @@ LABEL_FIXES = {"iw": "he", "jw": "jv"}
 
 
 def main() -> None:
+    import wave
+
     import coremltools as ct
     import numpy as np
     import torch
-    import torchaudio
     from speechbrain.inference.classifiers import EncoderClassifier
 
     torch.set_grad_enabled(False)
@@ -114,17 +115,24 @@ def main() -> None:
         subprocess.run(
             ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1",
              str(aiff), str(wav_path)], check=True)
-        wave, sr = torchaudio.load(str(wav_path))
-        assert sr == SAMPLE_RATE, f"unexpected sample rate {sr}"
-        wave = wave[:1, :]
-        if wave.shape[1] < WINDOW_SAMPLES:  # tile-pad exactly like the app
-            reps = WINDOW_SAMPLES // wave.shape[1] + 1
-            wave = wave.repeat(1, reps)
-        wave = wave[:, :WINDOW_SAMPLES]
+        # Stdlib WAV read (afconvert wrote plain PCM16 LE mono) — no
+        # torchaudio backend needed, so the "no working audio backend"
+        # warning on the CI Mac is harmless.
+        with wave.open(str(wav_path), "rb") as reader:
+            assert reader.getframerate() == SAMPLE_RATE, \
+                f"unexpected sample rate {reader.getframerate()}"
+            assert reader.getnchannels() == 1, "expected mono"
+            pcm = reader.readframes(reader.getnframes())
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        signal = torch.from_numpy(samples).unsqueeze(0)
+        if signal.shape[1] < WINDOW_SAMPLES:  # tile-pad exactly like the app
+            reps = WINDOW_SAMPLES // signal.shape[1] + 1
+            signal = signal.repeat(1, reps)
+        signal = signal[:, :WINDOW_SAMPLES]
 
-        torch_probs = wrapper(wave).numpy()[0]
+        torch_probs = wrapper(signal).numpy()[0]
         coreml_out = ct.models.MLModel(str(pkg)).predict(
-            {"waveform": wave.numpy().astype(np.float32)})
+            {"waveform": signal.numpy().astype(np.float32)})
         coreml_probs = np.array(coreml_out["probabilities"]).reshape(-1)
 
         torch_top = int(torch_probs.argmax())
