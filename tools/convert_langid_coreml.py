@@ -87,22 +87,8 @@ def main() -> None:
     print("[LANGID] tracing …")
     traced = torch.jit.trace(wrapper, example)
 
-    print("[LANGID] converting to Core ML (fp16, ALL compute units) …")
-    mlmodel = ct.convert(
-        traced,
-        inputs=[ct.TensorType(name="waveform", shape=(1, WINDOW_SAMPLES),
-                              dtype=np.float32)],
-        outputs=[ct.TensorType(name="probabilities")],
-        minimum_deployment_target=ct.target.iOS16,
-        compute_precision=ct.precision.FLOAT16,
-        convert_to="mlprogram",
-    )
-
     with tempfile.TemporaryDirectory() as tmp:
-        pkg = Path(tmp) / f"{MODEL_NAME}.mlpackage"
-        mlmodel.save(str(pkg))
-
-        # ── Verification 1: numeric parity on real audio ──────────────────
+        # ── Parity reference audio, prepared BEFORE conversion ────────────
         # Real speech via macOS TTS (`say`) — the gate is CONVERSION
         # FIDELITY (torch vs coreml agreement), not model quality; quality
         # is judged on the real iPhone per the product gate.
@@ -129,25 +115,55 @@ def main() -> None:
             reps = WINDOW_SAMPLES // signal.shape[1] + 1
             signal = signal.repeat(1, reps)
         signal = signal[:, :WINDOW_SAMPLES]
-
         torch_probs = wrapper(signal).numpy()[0]
-        coreml_out = ct.models.MLModel(str(pkg)).predict(
-            {"waveform": signal.numpy().astype(np.float32)})
-        coreml_probs = np.array(coreml_out["probabilities"]).reshape(-1)
-
         torch_top = int(torch_probs.argmax())
-        coreml_top = int(coreml_probs.argmax())
-        max_diff = float(np.abs(torch_probs - coreml_probs).max())
         print(f"[LANGID] torch top-1: {labels[torch_top]} "
               f"({torch_probs[torch_top]:.3f})")
-        print(f"[LANGID] coreml top-1: {labels[coreml_top]} "
-              f"({coreml_probs[coreml_top]:.3f})  max prob diff {max_diff:.4f}")
-        for rank, i in enumerate(np.argsort(-coreml_probs)[:5], start=1):
-            print(f"[LANGID]   {rank}. {labels[int(i)]} {coreml_probs[int(i)]:.3f}")
-        if torch_top != coreml_top or max_diff > 0.05:
-            sys.exit("[LANGID] FAIL: Core ML output diverges from PyTorch — "
-                     "conversion is broken, refusing to ship it.")
-        if labels[coreml_top] != "en":
+
+        # ── Convert: fp16 first (half the size), fp32 fallback ────────────
+        # The audio frontend (STFT power → log-mel → per-utterance variance
+        # normalization) can collapse in fp16 — observed on CI as en→ja with
+        # max prob diff 0.96. Parity against PyTorch decides, per precision.
+        pkg = None
+        for precision, precision_name in (
+            (ct.precision.FLOAT16, "fp16"),
+            (ct.precision.FLOAT32, "fp32"),
+        ):
+            print(f"[LANGID] converting to Core ML ({precision_name}) …")
+            mlmodel = ct.convert(
+                traced,
+                inputs=[ct.TensorType(name="waveform",
+                                      shape=(1, WINDOW_SAMPLES),
+                                      dtype=np.float32)],
+                outputs=[ct.TensorType(name="probabilities")],
+                minimum_deployment_target=ct.target.iOS16,
+                compute_precision=precision,
+                convert_to="mlprogram",
+            )
+            candidate = Path(tmp) / f"{MODEL_NAME}-{precision_name}.mlpackage"
+            mlmodel.save(str(candidate))
+
+            coreml_out = ct.models.MLModel(str(candidate)).predict(
+                {"waveform": signal.numpy().astype(np.float32)})
+            coreml_probs = np.array(coreml_out["probabilities"]).reshape(-1)
+            coreml_top = int(coreml_probs.argmax())
+            max_diff = float(np.abs(torch_probs - coreml_probs).max())
+            print(f"[LANGID] {precision_name} top-1: {labels[coreml_top]} "
+                  f"({coreml_probs[coreml_top]:.3f})  max prob diff {max_diff:.4f}")
+            for rank, i in enumerate(np.argsort(-coreml_probs)[:5], start=1):
+                print(f"[LANGID]   {rank}. {labels[int(i)]} "
+                      f"{coreml_probs[int(i)]:.3f}")
+            if coreml_top == torch_top and max_diff <= 0.05:
+                pkg = candidate
+                print(f"[LANGID] parity OK at {precision_name}")
+                break
+            print(f"[LANGID] {precision_name} diverges from PyTorch — "
+                  "not shippable, trying next precision …")
+        if pkg is None:
+            sys.exit("[LANGID] FAIL: no precision produced a Core ML model "
+                     "matching PyTorch — conversion is broken, refusing to "
+                     "ship it.")
+        if labels[torch_top] != "en":
             print("[LANGID] WARNING: synthetic English clip not detected as "
                   "'en' (TTS audio is out-of-domain; informational only).")
 
