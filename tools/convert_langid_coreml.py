@@ -206,14 +206,38 @@ def main() -> None:
             json.dumps(frontend_config(padding)))
 
     # ── Python reference feature pipeline (official modules) ──────────────
+    def check_feats(raw_np, sig, feats, tag):
+        """Guard the EXACT official path: for seconds of 16 kHz speech the
+        feature tensor must be [1, hundreds_of_frames, 60] — never a
+        single frame. A degenerate shape here means the waveform or the
+        feature call is wrong, and everything downstream is garbage."""
+        print(f"[LANGID] {tag}: raw.shape={raw_np.shape} "
+              f"sig.shape={tuple(sig.shape)} feats.shape={tuple(feats.shape)}")
+        assert raw_np.ndim == 1 and raw_np.shape[0] > SAMPLE_RATE // 10, \
+            f"{tag}: waveform is degenerate: {raw_np.shape}"
+        assert feats.ndim == 3, f"{tag}: feats.ndim={feats.ndim}, " \
+            f"shape={tuple(feats.shape)} — expected [1, frames, {n_mels}]"
+        assert feats.shape[0] == 1, f"{tag}: batch={feats.shape[0]}"
+        assert feats.shape[2] == n_mels, \
+            f"{tag}: last dim {feats.shape[2]} != n_mels {n_mels} " \
+            f"(full shape {tuple(feats.shape)}) — transposed?"
+        assert feats.shape[1] > 10, \
+            f"{tag}: only {feats.shape[1]} time frame(s) " \
+            f"(full shape {tuple(feats.shape)}) — averaged/sliced/" \
+            f"wrong-axis unsqueeze? raw had {raw_np.shape[0]} samples"
+
     def official_features(samples_np):
         sig = torch.from_numpy(samples_np).unsqueeze(0)
         feats = fbank(sig)
-        return mean_var_norm(feats, torch.ones(1))[0].numpy()
+        feats = mean_var_norm(feats, torch.ones(1))
+        check_feats(samples_np, sig, feats, "official_features")
+        return feats[0].numpy()
 
     def official_probs(samples_np):
         sig = torch.from_numpy(samples_np).unsqueeze(0)
-        feats = mean_var_norm(fbank(sig), torch.ones(1))
+        feats = fbank(sig)
+        feats = mean_var_norm(feats, torch.ones(1))
+        check_feats(samples_np, sig, feats, "official_probs")
         out = head(embedding_model(feats, torch.ones(1)))
         return torch.softmax(out.squeeze(1), dim=-1)[0].numpy()
 
