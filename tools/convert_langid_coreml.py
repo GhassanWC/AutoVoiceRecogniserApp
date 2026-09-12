@@ -120,13 +120,22 @@ def main() -> None:
         print(f"[LANGID] torch top-1: {labels[torch_top]} "
               f"({torch_probs[torch_top]:.3f})")
 
-        # ── Convert: fp16 first (half the size), fp32 fallback ────────────
-        # The audio frontend (STFT power → log-mel → per-utterance variance
-        # normalization) can collapse in fp16 — observed on CI as en→ja with
-        # max prob diff 0.96. Parity against PyTorch decides, per precision.
+        # The eager model is no longer needed (the traced graph carries its
+        # own copy of the weights) — free it before conversion. The CI Mac
+        # ran out of headroom when two conversions and the eager model were
+        # all resident at once.
+        import gc
+        del wrapper, classifier
+        gc.collect()
+
+        # ── Convert at fp32 ONLY ──────────────────────────────────────────
+        # fp16 was measured to collapse the audio frontend (STFT power →
+        # log-mel → per-utterance variance normalization): CI showed en→ja
+        # with max prob diff 0.96, so it is not attempted anymore. Weight
+        # palettization (fp32 compute, compressed weights) is the future
+        # size optimization — it must pass this same parity gate.
         pkg = None
         for precision, precision_name in (
-            (ct.precision.FLOAT16, "fp16"),
             (ct.precision.FLOAT32, "fp32"),
         ):
             print(f"[LANGID] converting to Core ML ({precision_name}) …")

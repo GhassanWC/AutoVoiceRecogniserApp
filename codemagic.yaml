@@ -66,7 +66,9 @@ workflows:
             pip install --quiet "torch==2.3.1" "torchaudio==2.3.1" \
               "coremltools==8.1" "speechbrain==1.0.2" "numpy<2" \
               "requests" "huggingface_hub<1.0" "soundfile"
-            python3 ../tools/convert_langid_coreml.py
+            # -u: unbuffered, so if the process dies the log shows the real
+            # last line instead of a truncated progress bar.
+            python3 -u ../tools/convert_langid_coreml.py
             deactivate
             rm -rf "$CACHE/$KEY"
             mkdir -p "$CACHE/$KEY"
