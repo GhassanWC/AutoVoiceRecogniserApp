@@ -123,7 +123,7 @@ workflows:
         script: |
           flutter build ipa --release \
             --build-name=1.0.0 \
-            --build-number=21 \
+            --build-number=22 \
             --export-options-plist=/Users/builder/export_options.plist
 
       - name: Verify language-ID model is INSIDE the app bundle (build gate)
