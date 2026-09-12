@@ -61,9 +61,11 @@ workflows:
             # but not guaranteed by its dependency resolution on this image;
             # soundfile: gives torchaudio a working backend (belt+braces —
             # the script itself reads WAVs via the stdlib).
+            # huggingface_hub must stay <1.0: the 1.x line removed the
+            # use_auth_token kwarg that speechbrain 1.0.2 still passes.
             pip install --quiet "torch==2.3.1" "torchaudio==2.3.1" \
               "coremltools==8.1" "speechbrain==1.0.2" "numpy<2" \
-              "requests" "huggingface_hub" "soundfile"
+              "requests" "huggingface_hub<1.0" "soundfile"
             python3 ../tools/convert_langid_coreml.py
             deactivate
             rm -rf "$CACHE/$KEY"
