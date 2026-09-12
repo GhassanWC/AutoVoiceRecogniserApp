@@ -238,92 +238,149 @@ def main() -> None:
                 convert_to="mlprogram",
             )
 
-        print("[LANGID] converting full model to Core ML (fp32) …")
-        mlmodel = convert(traced, "waveform", (1, WINDOW_SAMPLES),
-                          "probabilities")
-        pkg = Path(tmp) / f"{MODEL_NAME}.mlpackage"
-        mlmodel.save(str(pkg))
-        del mlmodel
+        def parity(probs, tag):
+            top = int(probs.argmax())
+            diff = float(np.abs(torch_probs - probs).max())
+            print(f"[LANGID] {tag} top-1: {labels[top]} "
+                  f"({probs[top]:.3f})  max prob diff {diff:.4f}")
+            for rank, i in enumerate(np.argsort(-probs)[:5], start=1):
+                print(f"[LANGID]   {rank}. {labels[int(i)]} {probs[int(i)]:.3f}")
+            return top == torch_top and diff <= 0.05
 
+        def ship(pkgs, pipeline):
+            total_mb = 0.0
+            for candidate in pkgs:
+                total_mb += sum(f.stat().st_size for f in candidate.rglob("*")
+                                if f.is_file()) / (1024 * 1024)
+            print(f"[LANGID] mlpackage size ({pipeline}): {total_mb:.1f} MB "
+                  f"(limit {MAX_MODEL_MB})")
+            if total_mb > MAX_MODEL_MB:
+                sys.exit(f"[LANGID] FAIL: {total_mb:.1f} MB exceeds the "
+                         f"{MAX_MODEL_MB} MB product limit.")
+            if OUT_DIR.exists():
+                shutil.rmtree(OUT_DIR)
+            OUT_DIR.mkdir(parents=True)
+            for candidate in pkgs:
+                subprocess.run(
+                    ["xcrun", "coremlcompiler", "compile", str(candidate),
+                     str(OUT_DIR)], check=True)
+            (OUT_DIR / "labels.json").write_text(json.dumps(labels))
+            (OUT_DIR / "model_info.json").write_text(json.dumps({
+                "source": "speechbrain/lang-id-voxlingua107-ecapa",
+                "license": "Apache-2.0",
+                "pipeline": pipeline,
+                "windowSamples": WINDOW_SAMPLES,
+                "sampleRate": SAMPLE_RATE,
+                "mlpackageMB": round(total_mb, 1),
+            }))
+            bundled_mb = sum(f.stat().st_size for f in OUT_DIR.rglob("*")
+                             if f.is_file()) / (1024 * 1024)
+            print(f"[LANGID] bundled (compiled, {pipeline}) size: "
+                  f"{bundled_mb:.1f} MB → {OUT_DIR}")
+            if labels[torch_top] != "en":
+                print("[LANGID] WARNING: synthetic English clip not detected "
+                      "as 'en' (TTS audio is out-of-domain; informational).")
+            print("[LANGID] PASSED")
+
+        print("[LANGID] converting full model to Core ML (fp32) …")
+        pkg = Path(tmp) / f"{MODEL_NAME}.mlpackage"
+        convert(traced, "waveform", (1, WINDOW_SAMPLES),
+                "probabilities").save(str(pkg))
         coreml_out = ct.models.MLModel(str(pkg)).predict(
             {"waveform": signal.numpy().astype(np.float32)})
         coreml_probs = np.array(coreml_out["probabilities"]).reshape(-1)
-        coreml_top = int(coreml_probs.argmax())
-        max_diff = float(np.abs(torch_probs - coreml_probs).max())
-        print(f"[LANGID] coreml top-1: {labels[coreml_top]} "
-              f"({coreml_probs[coreml_top]:.3f})  max prob diff {max_diff:.4f}")
-        for rank, i in enumerate(np.argsort(-coreml_probs)[:5], start=1):
-            print(f"[LANGID]   {rank}. {labels[int(i)]} {coreml_probs[int(i)]:.3f}")
+        if parity(coreml_probs, "FULL coreml"):
+            print("[LANGID] parity OK (single model, fp32, ConvSTFT)")
+            ship([pkg], "single")
+            return
 
-        if coreml_top != torch_top or max_diff > 0.05:
-            # ── Stage diagnostics: WHICH half is broken? ──────────────────
-            print("[LANGID] full model diverges — running stage diagnostics …")
-            front_traced = torch.jit.trace(Frontend().eval(), example)
-            front_pkg = Path(tmp) / "front.mlpackage"
-            convert(front_traced, "waveform", (1, WINDOW_SAMPLES),
-                    "features").save(str(front_pkg))
-            front_out = ct.models.MLModel(str(front_pkg)).predict(
-                {"waveform": signal.numpy().astype(np.float32)})
-            front_flat = np.array(front_out["features"]).reshape(-1)
-            torch_flat = torch_feats.reshape(-1)
-            if front_flat.size != torch_flat.size:
-                print(f"[LANGID] FRONTEND output size {front_flat.size} != "
-                      f"torch {torch_flat.size} — frontend broken (shape).")
-            else:
-                f_diff = float(np.abs(torch_flat - front_flat).max())
-                f_scale = float(np.abs(torch_flat).max())
-                print(f"[LANGID] FRONTEND (wav→feats) max abs diff "
-                      f"{f_diff:.5f} (feature scale {f_scale:.1f})")
+        # ── The fused graph diverges (known: en→lo, backend alone exact) ──
+        # Plan B: convert frontend (wav→feats) and backend (feats→probs) as
+        # SEPARATE Core ML models, chain them, and apply the same
+        # end-to-end parity gate to the chained pair. Splitting bypasses
+        # whatever whole-graph optimizer pass corrupts the fused model.
+        print("[LANGID] full model diverges — trying the SPLIT pipeline …")
+        front_traced = torch.jit.trace(Frontend().eval(), example)
+        front_pkg = Path(tmp) / "LangIDFrontend.mlpackage"
+        convert(front_traced, "waveform", (1, WINDOW_SAMPLES),
+                "features").save(str(front_pkg))
+        front_out = ct.models.MLModel(str(front_pkg)).predict(
+            {"waveform": signal.numpy().astype(np.float32)})
+        front_feats = np.array(front_out["features"]).astype(np.float32)
+        torch_flat = torch_feats.reshape(-1)
+        front_flat = front_feats.reshape(-1)
+        if front_flat.size == torch_flat.size:
+            f_diff = float(np.abs(torch_flat - front_flat).max())
+            f_scale = float(np.abs(torch_flat).max())
+            print(f"[LANGID] FRONTEND (wav→feats) max abs diff {f_diff:.5f} "
+                  f"(feature scale {f_scale:.1f})")
+        else:
+            print(f"[LANGID] FRONTEND output size {front_flat.size} != "
+                  f"torch {torch_flat.size} — frontend broken (shape).")
 
-            back_traced = torch.jit.trace(
-                Backend().eval(), torch.from_numpy(torch_feats))
-            back_pkg = Path(tmp) / "back.mlpackage"
-            convert(back_traced, "features", torch_feats.shape,
-                    "probabilities").save(str(back_pkg))
-            back_out = ct.models.MLModel(str(back_pkg)).predict(
-                {"features": torch_feats.astype(np.float32)})
-            back_probs = np.array(back_out["probabilities"]).reshape(-1)
-            b_diff = float(np.abs(torch_probs - back_probs).max())
-            b_top = int(back_probs.argmax())
-            print(f"[LANGID] BACKEND (torch feats→probs) top-1 "
-                  f"{labels[b_top]} ({back_probs[b_top]:.3f}), "
-                  f"max prob diff {b_diff:.4f}")
-            sys.exit("[LANGID] FAIL: Core ML full model diverges from "
-                     "PyTorch — see stage diagnostics above for the broken "
-                     "half. Refusing to ship it.")
+        back_traced = torch.jit.trace(
+            Backend().eval(), torch.from_numpy(torch_feats))
+        back_pkg = Path(tmp) / "LangIDBackend.mlpackage"
+        convert(back_traced, "features", torch_feats.shape,
+                "probabilities").save(str(back_pkg))
+        back_model = ct.models.MLModel(str(back_pkg))
+        back_probs = np.array(back_model.predict(
+            {"features": torch_feats.astype(np.float32)})[
+                "probabilities"]).reshape(-1)
+        parity(back_probs, "BACKEND (torch feats)")
 
-        print("[LANGID] parity OK (fp32, ConvSTFT)")
-        if labels[torch_top] != "en":
-            print("[LANGID] WARNING: synthetic English clip not detected as "
-                  "'en' (TTS audio is out-of-domain; informational only).")
+        if front_flat.size == torch_flat.size:
+            chained_probs = np.array(back_model.predict(
+                {"features": front_feats.reshape(torch_feats.shape)})[
+                    "probabilities"]).reshape(-1)
+            if parity(chained_probs, "CHAINED front→back"):
+                print("[LANGID] parity OK (split pipeline, fp32, ConvSTFT)")
+                ship([front_pkg, back_pkg], "split")
+                return
 
-        # ── Size gate ─────────────────────────────────────────────────────
-        pkg_mb = sum(f.stat().st_size for f in pkg.rglob("*") if f.is_file()) \
-            / (1024 * 1024)
-        print(f"[LANGID] mlpackage size: {pkg_mb:.1f} MB (limit {MAX_MODEL_MB})")
-        if pkg_mb > MAX_MODEL_MB:
-            sys.exit(f"[LANGID] FAIL: model {pkg_mb:.1f} MB exceeds the "
-                     f"{MAX_MODEL_MB} MB product limit.")
+        # ── Still broken: bisect the frontend into sub-stages ─────────────
+        from speechbrain.processing.features import spectral_magnitude
 
-        # ── Compile for the bundle (app loads .mlmodelc directly) ─────────
-        if OUT_DIR.exists():
-            shutil.rmtree(OUT_DIR)
-        OUT_DIR.mkdir(parents=True)
-        subprocess.run(
-            ["xcrun", "coremlcompiler", "compile", str(pkg), str(OUT_DIR)],
-            check=True)
-        (OUT_DIR / "labels.json").write_text(json.dumps(labels))
-        (OUT_DIR / "model_info.json").write_text(json.dumps({
-            "source": "speechbrain/lang-id-voxlingua107-ecapa",
-            "license": "Apache-2.0",
-            "windowSamples": WINDOW_SAMPLES,
-            "sampleRate": SAMPLE_RATE,
-            "mlpackageMB": round(pkg_mb, 1),
-        }))
-        bundled_mb = sum(f.stat().st_size for f in OUT_DIR.rglob("*")
-                         if f.is_file()) / (1024 * 1024)
-        print(f"[LANGID] bundled (compiled) size: {bundled_mb:.1f} MB → {OUT_DIR}")
-        print("[LANGID] PASSED")
+        class UpToStft(torch.nn.Module):
+            def forward(self, wav):
+                return fbank.compute_STFT(wav)
+
+        class UpToMag(torch.nn.Module):
+            def forward(self, wav):
+                return spectral_magnitude(fbank.compute_STFT(wav))
+
+        class UpToFbank(torch.nn.Module):
+            def forward(self, wav):
+                return fbank(wav)
+
+        for stage_name, module, out_name in (
+            ("STFT", UpToStft(), "stft"),
+            ("MAGNITUDE", UpToMag(), "magnitude"),
+            ("FBANK", UpToFbank(), "fbank"),
+        ):
+            try:
+                ref = module.eval()(signal).numpy()
+                stage_traced = torch.jit.trace(module.eval(), example)
+                stage_pkg = Path(tmp) / f"stage_{out_name}.mlpackage"
+                convert(stage_traced, "waveform", (1, WINDOW_SAMPLES),
+                        out_name).save(str(stage_pkg))
+                got = np.array(ct.models.MLModel(str(stage_pkg)).predict(
+                    {"waveform": signal.numpy().astype(np.float32)})[
+                        out_name]).reshape(-1)
+                ref_flat = ref.reshape(-1)
+                if got.size != ref_flat.size:
+                    print(f"[LANGID] BISECT {stage_name}: size {got.size} != "
+                          f"{ref_flat.size} (BROKEN: shape)")
+                    break
+                s_diff = float(np.abs(ref_flat - got).max())
+                s_scale = float(np.abs(ref_flat).max())
+                print(f"[LANGID] BISECT {stage_name}: max abs diff "
+                      f"{s_diff:.5f} (scale {s_scale:.2f})")
+            except Exception as error:  # keep bisecting even if one fails
+                print(f"[LANGID] BISECT {stage_name}: crashed — {error}")
+        sys.exit("[LANGID] FAIL: both single and split pipelines diverge "
+                 "from PyTorch — see the bisect stages above for the first "
+                 "broken frontend op. Refusing to ship.")
 
 
 if __name__ == "__main__":

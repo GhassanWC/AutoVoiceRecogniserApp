@@ -47,7 +47,17 @@ final class AudioLanguageDetector {
   private static let windowSamples = 80_000
   private static let sampleRate = 16_000
 
-  private var model: MLModel?
+  /// CI may ship either ONE fused model or a SPLIT pair (frontend
+  /// wav→features + backend features→probabilities). The split exists
+  /// because coremltools' fused-graph conversion diverged numerically; the
+  /// separately-converted halves passed the parity gate. model_info.json's
+  /// "pipeline" field says which layout this build carries.
+  private enum LoadedModel {
+    case single(MLModel)
+    case split(frontend: MLModel, backend: MLModel)
+  }
+
+  private var model: LoadedModel?
   private var labels: [String] = []
   private let loadLock = NSLock()
 
@@ -57,11 +67,16 @@ final class AudioLanguageDetector {
     Bundle.main.resourceURL?.appendingPathComponent("LanguageID")
   }
 
-  /// True when the CI-bundled model is inside this build.
+  /// True when the CI-bundled model is inside this build (either layout).
   static var isModelBundled: Bool {
     guard let dir = assetDirectory else { return false }
-    return FileManager.default.fileExists(
+    let fm = FileManager.default
+    return fm.fileExists(
       atPath: dir.appendingPathComponent("VoxLingua107LangID.mlmodelc").path)
+      || (fm.fileExists(
+        atPath: dir.appendingPathComponent("LangIDFrontend.mlmodelc").path)
+        && fm.fileExists(
+          atPath: dir.appendingPathComponent("LangIDBackend.mlmodelc").path))
   }
 
   static var bundledModelBytes: Int {
@@ -80,18 +95,32 @@ final class AudioLanguageDetector {
     defer { loadLock.unlock() }
     if model != nil { return }
     guard let dir = Self.assetDirectory else { throw DetectorError.modelMissing }
-    let modelURL = dir.appendingPathComponent("VoxLingua107LangID.mlmodelc")
     let labelsURL = dir.appendingPathComponent("labels.json")
-    guard FileManager.default.fileExists(atPath: modelURL.path),
-      let labelData = try? Data(contentsOf: labelsURL),
+    guard let labelData = try? Data(contentsOf: labelsURL),
       let labelList = try? JSONDecoder().decode([String].self, from: labelData),
       !labelList.isEmpty
     else { throw DetectorError.modelMissing }
     let configuration = MLModelConfiguration()
     configuration.computeUnits = .all  // let Core ML pick ANE/GPU/CPU
+    let fm = FileManager.default
+    let singleURL = dir.appendingPathComponent("VoxLingua107LangID.mlmodelc")
+    let frontURL = dir.appendingPathComponent("LangIDFrontend.mlmodelc")
+    let backURL = dir.appendingPathComponent("LangIDBackend.mlmodelc")
     do {
-      model = try MLModel(contentsOf: modelURL, configuration: configuration)
+      if fm.fileExists(atPath: singleURL.path) {
+        model = .single(try MLModel(contentsOf: singleURL, configuration: configuration))
+      } else if fm.fileExists(atPath: frontURL.path),
+        fm.fileExists(atPath: backURL.path)
+      {
+        model = .split(
+          frontend: try MLModel(contentsOf: frontURL, configuration: configuration),
+          backend: try MLModel(contentsOf: backURL, configuration: configuration))
+      } else {
+        throw DetectorError.modelMissing
+      }
       labels = labelList
+    } catch let error as DetectorError {
+      throw error
     } catch {
       throw DetectorError.inferenceFailed("\(error)")
     }
@@ -131,8 +160,20 @@ final class AudioLanguageDetector {
 
     let output: MLFeatureProvider
     do {
-      output = try model.prediction(
-        from: try MLDictionaryFeatureProvider(dictionary: ["waveform": input]))
+      switch model {
+      case .single(let fused):
+        output = try fused.prediction(
+          from: try MLDictionaryFeatureProvider(dictionary: ["waveform": input]))
+      case .split(let frontend, let backend):
+        let frontOut = try frontend.prediction(
+          from: try MLDictionaryFeatureProvider(dictionary: ["waveform": input]))
+        guard let features = frontOut.featureValue(for: "features")?.multiArrayValue
+        else { throw DetectorError.inferenceFailed("missing features output") }
+        output = try backend.prediction(
+          from: try MLDictionaryFeatureProvider(dictionary: ["features": features]))
+      }
+    } catch let error as DetectorError {
+      throw error
     } catch {
       throw DetectorError.inferenceFailed("\(error)")
     }

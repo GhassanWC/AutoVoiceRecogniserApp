@@ -77,7 +77,11 @@ workflows:
           echo "[LANGID] bundled contents:"
           find "$DEST" -maxdepth 2 | sort
           echo "[LANGID] bundled size: $(du -sh "$DEST" | cut -f1)"
-          test -d "$DEST/VoxLingua107LangID.mlmodelc" || { echo "[LANGID] missing mlmodelc"; exit 1; }
+          # Either the fused model or the verified split pair must exist.
+          if [ ! -d "$DEST/VoxLingua107LangID.mlmodelc" ] && \
+             { [ ! -d "$DEST/LangIDFrontend.mlmodelc" ] || [ ! -d "$DEST/LangIDBackend.mlmodelc" ]; }; then
+            echo "[LANGID] missing mlmodelc (single or split pair)"; exit 1
+          fi
           test -f "$DEST/labels.json" || { echo "[LANGID] missing labels.json"; exit 1; }
 
       - name: Install CocoaPods
@@ -134,7 +138,13 @@ workflows:
             local LABELS="$APP/LanguageID/labels.json"
             echo "[BUNDLE GATE] inspecting $APP"
             if [ ! -d "$MODEL" ]; then
-              echo "[BUNDLE GATE] MISSING $MODEL"; return 1
+              # Split pipeline: verified frontend+backend pair instead.
+              if [ -d "$APP/LanguageID/LangIDFrontend.mlmodelc" ] && \
+                 [ -d "$APP/LanguageID/LangIDBackend.mlmodelc" ]; then
+                MODEL="$APP/LanguageID/LangIDBackend.mlmodelc"
+              else
+                echo "[BUNDLE GATE] MISSING $MODEL (and no split pair)"; return 1
+              fi
             fi
             if [ -z "$(find "$MODEL" -type f | head -n 1)" ]; then
               echo "[BUNDLE GATE] $MODEL exists but is EMPTY"; return 1
