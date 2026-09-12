@@ -8,18 +8,27 @@ Python/macOS toolchain). The output is a COMPILED .mlmodelc plus a
 labels.json (index → ISO 639-1 code, with the model card's known label bugs
 fixed: iw→he, jw→jv), dropped into ios/Runner/LanguageID/ for bundling.
 
-The build gate (verify step in codemagic.yaml) relies on this script's own
-verification: the converted Core ML model must NUMERICALLY match the
-original PyTorch model on real audio (same top-1, small max prob diff) —
-conversion bugs fail the build, never the iPhone.
+Verification story (all inside this script — a broken conversion can never
+ship):
+1. torch.stft is replaced with an equivalent conv1d-based DFT BEFORE
+   tracing, because coremltools' torch.stft conversion produced a graph
+   that diverged from PyTorch at BOTH fp16 and fp32 (measured on CI:
+   en 1.000 → ja 0.848 / lo 0.429). The replacement is verified numerically
+   against the original IN EAGER PYTORCH first — a mistake in the manual
+   DFT fails the build before conversion even starts.
+2. The converted full model must match PyTorch on real audio (same top-1,
+   max prob diff ≤ 0.05).
+3. If it still diverges, the script converts the frontend (wav→features)
+   and backend (features→probs) separately and prints per-stage parity, so
+   the CI log names the broken stage instead of leaving us guessing.
+4. Hard 100 MB size gate.
 
-End-to-end graph traced from the RAW WAVEFORM (fbank + normalization +
-ECAPA + classifier + softmax), so the app needs no hand-written DSP that
-could drift from training-time features. Fixed 5-second input window
-(80000 samples @16 kHz); the app tile-pads shorter utterances.
+Fixed 5-second input window (80000 samples @ 16 kHz); the app tile-pads
+shorter utterances.
 """
 
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -29,7 +38,7 @@ from pathlib import Path
 SAMPLE_RATE = 16000
 WINDOW_SECONDS = 5
 WINDOW_SAMPLES = SAMPLE_RATE * WINDOW_SECONDS
-MAX_MODEL_MB = 100  # hard product limit; ~45 MB expected at fp16
+MAX_MODEL_MB = 100  # hard product limit
 OUT_DIR = Path("ios/Runner/LanguageID")
 MODEL_NAME = "VoxLingua107LangID"
 
@@ -64,15 +73,20 @@ def main() -> None:
         labels.append(LABEL_FIXES.get(code, code))
     print(f"[LANGID] {len(labels)} languages, e.g. {labels[:8]} …")
 
+    fbank = classifier.mods.compute_features
+    mean_var_norm = classifier.mods.mean_var_norm
+    embedding_model = classifier.mods.embedding_model
+    head = classifier.mods.classifier
+
     class WaveToLanguageProbs(torch.nn.Module):
         """Raw 16 kHz waveform [1, T] → language probabilities [1, N]."""
 
-        def __init__(self, cls):
+        def __init__(self):
             super().__init__()
-            self.compute_features = cls.mods.compute_features
-            self.mean_var_norm = cls.mods.mean_var_norm
-            self.embedding_model = cls.mods.embedding_model
-            self.classifier = cls.mods.classifier
+            self.compute_features = fbank
+            self.mean_var_norm = mean_var_norm
+            self.embedding_model = embedding_model
+            self.classifier = head
 
         def forward(self, wav):
             lengths = torch.ones(wav.shape[0])
@@ -82,13 +96,77 @@ def main() -> None:
             out = self.classifier(embedding)
             return torch.softmax(out.squeeze(1), dim=-1)
 
-    wrapper = WaveToLanguageProbs(classifier).eval()
-    example = torch.zeros(1, WINDOW_SAMPLES)
-    print("[LANGID] tracing …")
-    traced = torch.jit.trace(wrapper, example)
+    class Frontend(torch.nn.Module):
+        def forward(self, wav):
+            lengths = torch.ones(wav.shape[0])
+            return mean_var_norm(fbank(wav), lengths)
+
+    class Backend(torch.nn.Module):
+        def forward(self, feats):
+            lengths = torch.ones(feats.shape[0])
+            out = head(embedding_model(feats, lengths))
+            return torch.softmax(out.squeeze(1), dim=-1)
+
+    class ConvSTFT(torch.nn.Module):
+        """Drop-in replacement for speechbrain.processing.features.STFT
+        that computes the identical one-sided STFT with a single conv1d
+        (framing + windowing + DFT fused into the kernel). Every op used
+        (pad, conv1d, permute, stack) converts exactly to Core ML —
+        unlike torch.stft, whose converted graph diverged on CI.
+        Output layout matches SpeechBrain: [batch, time, n_freq, 2].
+        """
+
+        def __init__(self, original):
+            super().__init__()
+            n_fft = int(original.n_fft)
+            self.n_fft = n_fft
+            # SpeechBrain versions store hop_length either in ms (10) or in
+            # samples (160); values ≤ 50 can only be ms at 16 kHz. The eager
+            # parity check below catches any residual mismatch anyway.
+            hop = float(original.hop_length)
+            self.hop_length = int(round(hop)) if hop > 50 else int(
+                round(original.sample_rate * hop / 1000.0))
+            self.center = bool(original.center)
+            self.pad_mode = str(original.pad_mode)
+            if getattr(original, "normalized_stft", False):
+                raise RuntimeError("normalized_stft not supported")
+            window = original.window.detach().to(torch.float32)
+            win_length = window.numel()  # the window IS win_length samples
+            # torch.stft centers a shorter window inside n_fft.
+            if win_length < n_fft:
+                left = (n_fft - win_length) // 2
+                padded = torch.zeros(n_fft)
+                padded[left:left + win_length] = window
+                window = padded
+            n_freq = n_fft // 2 + 1
+            n = torch.arange(n_fft, dtype=torch.float32)
+            k = torch.arange(n_freq, dtype=torch.float32).unsqueeze(1)
+            angle = 2.0 * math.pi * k * n / n_fft
+            real_basis = torch.cos(angle) * window
+            imag_basis = -torch.sin(angle) * window
+            weight = torch.cat([real_basis, imag_basis], dim=0).unsqueeze(1)
+            self.register_buffer("weight", weight)  # [2F, 1, n_fft]
+            self.n_freq = n_freq
+
+        def forward(self, x):
+            # x: [batch, time]
+            if self.center:
+                mode = "constant" if self.pad_mode == "constant" else self.pad_mode
+                x = torch.nn.functional.pad(
+                    x.unsqueeze(1), (self.n_fft // 2, self.n_fft // 2),
+                    mode=mode)
+            else:
+                x = x.unsqueeze(1)
+            spec = torch.nn.functional.conv1d(
+                x, self.weight, stride=self.hop_length)  # [B, 2F, T']
+            real = spec[:, :self.n_freq, :]
+            imag = spec[:, self.n_freq:, :]
+            # → SpeechBrain layout [batch, time, n_freq, 2]
+            return torch.stack(
+                [real.permute(0, 2, 1), imag.permute(0, 2, 1)], dim=-1)
 
     with tempfile.TemporaryDirectory() as tmp:
-        # ── Parity reference audio, prepared BEFORE conversion ────────────
+        # ── Parity reference audio, prepared BEFORE any conversion ────────
         # Real speech via macOS TTS (`say`) — the gate is CONVERSION
         # FIDELITY (torch vs coreml agreement), not model quality; quality
         # is judged on the real iPhone per the product gate.
@@ -101,9 +179,6 @@ def main() -> None:
         subprocess.run(
             ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1",
              str(aiff), str(wav_path)], check=True)
-        # Stdlib WAV read (afconvert wrote plain PCM16 LE mono) — no
-        # torchaudio backend needed, so the "no working audio backend"
-        # warning on the CI Mac is harmless.
         with wave.open(str(wav_path), "rb") as reader:
             assert reader.getframerate() == SAMPLE_RATE, \
                 f"unexpected sample rate {reader.getframerate()}"
@@ -115,68 +190,114 @@ def main() -> None:
             reps = WINDOW_SAMPLES // signal.shape[1] + 1
             signal = signal.repeat(1, reps)
         signal = signal[:, :WINDOW_SAMPLES]
+
+        wrapper = WaveToLanguageProbs().eval()
         torch_probs = wrapper(signal).numpy()[0]
         torch_top = int(torch_probs.argmax())
         print(f"[LANGID] torch top-1: {labels[torch_top]} "
               f"({torch_probs[torch_top]:.3f})")
+        torch_feats = Frontend().eval()(signal).numpy()
 
-        # The eager model is no longer needed (the traced graph carries its
-        # own copy of the weights) — free it before conversion. The CI Mac
-        # ran out of headroom when two conversions and the eager model were
-        # all resident at once.
-        import gc
-        del wrapper, classifier
-        gc.collect()
+        # ── Replace torch.stft with the conv1d DFT, verified in eager ─────
+        original_stft = fbank.compute_STFT
+        conv_stft = ConvSTFT(original_stft).eval()
+        stft_ref = original_stft(signal)
+        stft_new = conv_stft(signal)
+        if stft_ref.shape != stft_new.shape:
+            sys.exit(f"[LANGID] FAIL: ConvSTFT shape {tuple(stft_new.shape)} "
+                     f"!= SpeechBrain {tuple(stft_ref.shape)} — hop/window "
+                     "interpretation bug, refusing to trace.")
+        stft_diff = float((stft_ref - stft_new).abs().max())
+        stft_scale = float(stft_ref.abs().max())
+        print(f"[LANGID] ConvSTFT eager parity: max abs diff {stft_diff:.6f} "
+              f"(signal scale {stft_scale:.1f})")
+        if stft_diff > max(1e-3, 1e-5 * stft_scale):
+            sys.exit("[LANGID] FAIL: ConvSTFT does not reproduce "
+                     "SpeechBrain's STFT — script bug, refusing to trace.")
+        fbank.compute_STFT = conv_stft
+        patched_probs = wrapper(signal).numpy()[0]
+        patched_diff = float(np.abs(torch_probs - patched_probs).max())
+        print(f"[LANGID] patched-model eager parity: max prob diff "
+              f"{patched_diff:.6f}")
+        if patched_diff > 1e-3:
+            sys.exit("[LANGID] FAIL: STFT replacement changed the model "
+                     "output in eager mode — script bug.")
 
-        # ── Convert at fp32 ONLY ──────────────────────────────────────────
-        # fp16 was measured to collapse the audio frontend (STFT power →
-        # log-mel → per-utterance variance normalization): CI showed en→ja
-        # with max prob diff 0.96, so it is not attempted anymore. Weight
-        # palettization (fp32 compute, compressed weights) is the future
-        # size optimization — it must pass this same parity gate.
-        pkg = None
-        for precision, precision_name in (
-            (ct.precision.FLOAT32, "fp32"),
-        ):
-            print(f"[LANGID] converting to Core ML ({precision_name}) …")
-            mlmodel = ct.convert(
-                traced,
-                inputs=[ct.TensorType(name="waveform",
-                                      shape=(1, WINDOW_SAMPLES),
+        example = torch.zeros(1, WINDOW_SAMPLES)
+        print("[LANGID] tracing (with ConvSTFT) …")
+        traced = torch.jit.trace(wrapper, example)
+
+        def convert(module_traced, in_name, in_shape, out_name):
+            return ct.convert(
+                module_traced,
+                inputs=[ct.TensorType(name=in_name, shape=in_shape,
                                       dtype=np.float32)],
-                outputs=[ct.TensorType(name="probabilities")],
+                outputs=[ct.TensorType(name=out_name)],
                 minimum_deployment_target=ct.target.iOS16,
-                compute_precision=precision,
+                compute_precision=ct.precision.FLOAT32,
                 convert_to="mlprogram",
             )
-            candidate = Path(tmp) / f"{MODEL_NAME}-{precision_name}.mlpackage"
-            mlmodel.save(str(candidate))
 
-            coreml_out = ct.models.MLModel(str(candidate)).predict(
+        print("[LANGID] converting full model to Core ML (fp32) …")
+        mlmodel = convert(traced, "waveform", (1, WINDOW_SAMPLES),
+                          "probabilities")
+        pkg = Path(tmp) / f"{MODEL_NAME}.mlpackage"
+        mlmodel.save(str(pkg))
+        del mlmodel
+
+        coreml_out = ct.models.MLModel(str(pkg)).predict(
+            {"waveform": signal.numpy().astype(np.float32)})
+        coreml_probs = np.array(coreml_out["probabilities"]).reshape(-1)
+        coreml_top = int(coreml_probs.argmax())
+        max_diff = float(np.abs(torch_probs - coreml_probs).max())
+        print(f"[LANGID] coreml top-1: {labels[coreml_top]} "
+              f"({coreml_probs[coreml_top]:.3f})  max prob diff {max_diff:.4f}")
+        for rank, i in enumerate(np.argsort(-coreml_probs)[:5], start=1):
+            print(f"[LANGID]   {rank}. {labels[int(i)]} {coreml_probs[int(i)]:.3f}")
+
+        if coreml_top != torch_top or max_diff > 0.05:
+            # ── Stage diagnostics: WHICH half is broken? ──────────────────
+            print("[LANGID] full model diverges — running stage diagnostics …")
+            front_traced = torch.jit.trace(Frontend().eval(), example)
+            front_pkg = Path(tmp) / "front.mlpackage"
+            convert(front_traced, "waveform", (1, WINDOW_SAMPLES),
+                    "features").save(str(front_pkg))
+            front_out = ct.models.MLModel(str(front_pkg)).predict(
                 {"waveform": signal.numpy().astype(np.float32)})
-            coreml_probs = np.array(coreml_out["probabilities"]).reshape(-1)
-            coreml_top = int(coreml_probs.argmax())
-            max_diff = float(np.abs(torch_probs - coreml_probs).max())
-            print(f"[LANGID] {precision_name} top-1: {labels[coreml_top]} "
-                  f"({coreml_probs[coreml_top]:.3f})  max prob diff {max_diff:.4f}")
-            for rank, i in enumerate(np.argsort(-coreml_probs)[:5], start=1):
-                print(f"[LANGID]   {rank}. {labels[int(i)]} "
-                      f"{coreml_probs[int(i)]:.3f}")
-            if coreml_top == torch_top and max_diff <= 0.05:
-                pkg = candidate
-                print(f"[LANGID] parity OK at {precision_name}")
-                break
-            print(f"[LANGID] {precision_name} diverges from PyTorch — "
-                  "not shippable, trying next precision …")
-        if pkg is None:
-            sys.exit("[LANGID] FAIL: no precision produced a Core ML model "
-                     "matching PyTorch — conversion is broken, refusing to "
-                     "ship it.")
+            front_flat = np.array(front_out["features"]).reshape(-1)
+            torch_flat = torch_feats.reshape(-1)
+            if front_flat.size != torch_flat.size:
+                print(f"[LANGID] FRONTEND output size {front_flat.size} != "
+                      f"torch {torch_flat.size} — frontend broken (shape).")
+            else:
+                f_diff = float(np.abs(torch_flat - front_flat).max())
+                f_scale = float(np.abs(torch_flat).max())
+                print(f"[LANGID] FRONTEND (wav→feats) max abs diff "
+                      f"{f_diff:.5f} (feature scale {f_scale:.1f})")
+
+            back_traced = torch.jit.trace(
+                Backend().eval(), torch.from_numpy(torch_feats))
+            back_pkg = Path(tmp) / "back.mlpackage"
+            convert(back_traced, "features", torch_feats.shape,
+                    "probabilities").save(str(back_pkg))
+            back_out = ct.models.MLModel(str(back_pkg)).predict(
+                {"features": torch_feats.astype(np.float32)})
+            back_probs = np.array(back_out["probabilities"]).reshape(-1)
+            b_diff = float(np.abs(torch_probs - back_probs).max())
+            b_top = int(back_probs.argmax())
+            print(f"[LANGID] BACKEND (torch feats→probs) top-1 "
+                  f"{labels[b_top]} ({back_probs[b_top]:.3f}), "
+                  f"max prob diff {b_diff:.4f}")
+            sys.exit("[LANGID] FAIL: Core ML full model diverges from "
+                     "PyTorch — see stage diagnostics above for the broken "
+                     "half. Refusing to ship it.")
+
+        print("[LANGID] parity OK (fp32, ConvSTFT)")
         if labels[torch_top] != "en":
             print("[LANGID] WARNING: synthetic English clip not detected as "
                   "'en' (TTS audio is out-of-domain; informational only).")
 
-        # ── Verification 2: size gate ─────────────────────────────────────
+        # ── Size gate ─────────────────────────────────────────────────────
         pkg_mb = sum(f.stat().st_size for f in pkg.rglob("*") if f.is_file()) \
             / (1024 * 1024)
         print(f"[LANGID] mlpackage size: {pkg_mb:.1f} MB (limit {MAX_MODEL_MB})")
