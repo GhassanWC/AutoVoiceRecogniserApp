@@ -43,21 +43,15 @@ final class AudioLanguageDetector {
 
   static let shared = AudioLanguageDetector()
 
-  /// Fixed analysis window baked into the Core ML graph (5 s @ 16 kHz).
-  private static let windowSamples = 80_000
   private static let sampleRate = 16_000
 
-  /// CI may ship either ONE fused model or a SPLIT pair (frontend
-  /// wav→features + backend features→probabilities). The split exists
-  /// because coremltools' fused-graph conversion diverged numerically; the
-  /// separately-converted halves passed the parity gate. model_info.json's
-  /// "pipeline" field says which layout this build carries.
-  private enum LoadedModel {
-    case single(MLModel)
-    case split(frontend: MLModel, backend: MLModel)
-  }
-
-  private var model: LoadedModel?
+  /// Features are computed NATIVELY (SpeechBrainFbank, vDSP) and only the
+  /// ECAPA+classifier backend runs in Core ML — the waveform→features
+  /// Core ML conversion diverged irreparably while the backend converted
+  /// exactly (diff 0.0000), so the app keeps the good half and replaces
+  /// the bad half with build-time-exported, CI-parity-tested Swift DSP.
+  private var backend: MLModel?
+  private var fbank: SpeechBrainFbank?
   private var labels: [String] = []
   private let loadLock = NSLock()
 
@@ -67,16 +61,14 @@ final class AudioLanguageDetector {
     Bundle.main.resourceURL?.appendingPathComponent("LanguageID")
   }
 
-  /// True when the CI-bundled model is inside this build (either layout).
+  /// True when the CI-produced assets are inside this build.
   static var isModelBundled: Bool {
     guard let dir = assetDirectory else { return false }
     let fm = FileManager.default
     return fm.fileExists(
-      atPath: dir.appendingPathComponent("VoxLingua107LangID.mlmodelc").path)
-      || (fm.fileExists(
-        atPath: dir.appendingPathComponent("LangIDFrontend.mlmodelc").path)
-        && fm.fileExists(
-          atPath: dir.appendingPathComponent("LangIDBackend.mlmodelc").path))
+      atPath: dir.appendingPathComponent("LangIDBackend.mlmodelc").path)
+      && fm.fileExists(atPath: dir.appendingPathComponent("frontend.json").path)
+      && fm.fileExists(atPath: dir.appendingPathComponent("frontend.bin").path)
   }
 
   static var bundledModelBytes: Int {
@@ -93,34 +85,25 @@ final class AudioLanguageDetector {
   private func loadIfNeeded() throws {
     loadLock.lock()
     defer { loadLock.unlock() }
-    if model != nil { return }
+    if backend != nil { return }
     guard let dir = Self.assetDirectory else { throw DetectorError.modelMissing }
     let labelsURL = dir.appendingPathComponent("labels.json")
     guard let labelData = try? Data(contentsOf: labelsURL),
       let labelList = try? JSONDecoder().decode([String].self, from: labelData),
       !labelList.isEmpty
     else { throw DetectorError.modelMissing }
+    let backURL = dir.appendingPathComponent("LangIDBackend.mlmodelc")
+    guard FileManager.default.fileExists(atPath: backURL.path) else {
+      throw DetectorError.modelMissing
+    }
     let configuration = MLModelConfiguration()
     configuration.computeUnits = .all  // let Core ML pick ANE/GPU/CPU
-    let fm = FileManager.default
-    let singleURL = dir.appendingPathComponent("VoxLingua107LangID.mlmodelc")
-    let frontURL = dir.appendingPathComponent("LangIDFrontend.mlmodelc")
-    let backURL = dir.appendingPathComponent("LangIDBackend.mlmodelc")
     do {
-      if fm.fileExists(atPath: singleURL.path) {
-        model = .single(try MLModel(contentsOf: singleURL, configuration: configuration))
-      } else if fm.fileExists(atPath: frontURL.path),
-        fm.fileExists(atPath: backURL.path)
-      {
-        model = .split(
-          frontend: try MLModel(contentsOf: frontURL, configuration: configuration),
-          backend: try MLModel(contentsOf: backURL, configuration: configuration))
-      } else {
-        throw DetectorError.modelMissing
-      }
+      fbank = try SpeechBrainFbank(assetsDirectory: dir)
+      backend = try MLModel(contentsOf: backURL, configuration: configuration)
       labels = labelList
-    } catch let error as DetectorError {
-      throw error
+    } catch let error as SpeechBrainFbank.FbankError {
+      throw DetectorError.inferenceFailed(error.errorDescription ?? "\(error)")
     } catch {
       throw DetectorError.inferenceFailed("\(error)")
     }
@@ -133,47 +116,34 @@ final class AudioLanguageDetector {
   /// inside, so dispatch from a background context).
   func detect(pcm16: Data) throws -> DetectionResult {
     try loadIfNeeded()
-    guard let model, !labels.isEmpty else { throw DetectorError.modelMissing }
+    guard let backend, let fbank, !labels.isEmpty else {
+      throw DetectorError.modelMissing
+    }
     let sampleCount = pcm16.count / 2
     guard sampleCount > Self.sampleRate / 4 else { throw DetectorError.badAudio }
 
-    // PCM16 → normalized floats in the model's fixed window. Short
-    // utterances are TILE-padded (repeated), not zero-padded — the graph's
-    // per-utterance feature normalization would otherwise be skewed by
-    // silence. Long utterances use their middle 5 seconds.
-    let input = try MLMultiArray(
-      shape: [1, NSNumber(value: Self.windowSamples)], dataType: .float32)
-    let pointer = input.dataPointer.bindMemory(
-      to: Float32.self, capacity: Self.windowSamples)
+    // Int16 PCM → Float32 [-1, 1] ONCE (the VAD buffer is already 16 kHz),
+    // then the CI-parity-tested native feature pipeline.
+    var samples = [Float](repeating: 0, count: sampleCount)
     pcm16.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
       let int16 = raw.bindMemory(to: Int16.self)
-      let start = sampleCount > Self.windowSamples
-        ? (sampleCount - Self.windowSamples) / 2
-        : 0
-      for i in 0..<Self.windowSamples {
-        let index = sampleCount > Self.windowSamples
-          ? start + i
-          : i % sampleCount  // tile
-        pointer[i] = Float32(Int16(littleEndian: int16[index])) / 32768.0
+      for i in 0..<sampleCount {
+        samples[i] = Float(Int16(littleEndian: int16[i])) / 32768.0
       }
     }
+    let features = fbank.compute(fbank.prepare(samples: samples))
 
     let output: MLFeatureProvider
     do {
-      switch model {
-      case .single(let fused):
-        output = try fused.prediction(
-          from: try MLDictionaryFeatureProvider(dictionary: ["waveform": input]))
-      case .split(let frontend, let backend):
-        let frontOut = try frontend.prediction(
-          from: try MLDictionaryFeatureProvider(dictionary: ["waveform": input]))
-        guard let features = frontOut.featureValue(for: "features")?.multiArrayValue
-        else { throw DetectorError.inferenceFailed("missing features output") }
-        output = try backend.prediction(
-          from: try MLDictionaryFeatureProvider(dictionary: ["features": features]))
-      }
-    } catch let error as DetectorError {
-      throw error
+      let input = try MLMultiArray(
+        shape: [1, NSNumber(value: fbank.config.frames),
+                NSNumber(value: fbank.config.nMels)],
+        dataType: .float32)
+      let pointer = input.dataPointer.bindMemory(
+        to: Float32.self, capacity: features.count)
+      for i in 0..<features.count { pointer[i] = features[i] }
+      output = try backend.prediction(
+        from: try MLDictionaryFeatureProvider(dictionary: ["features": input]))
     } catch {
       throw DetectorError.inferenceFailed("\(error)")
     }

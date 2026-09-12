@@ -43,7 +43,11 @@ workflows:
           # limit — otherwise this build FAILS here, never on the iPhone.
           set -e
           CACHE="$HOME/.langid_model_cache"
-          KEY=$(shasum -a 256 ../tools/convert_langid_coreml.py | cut -c1-16)
+          # Key covers the converter AND the shipping Swift DSP + harness —
+          # any of them changing must re-run the full parity suite.
+          KEY=$(cat ../tools/convert_langid_coreml.py \
+                    ../tools/LangIdParityMain.swift \
+                    ios/Runner/SpeechBrainFbank.swift | shasum -a 256 | cut -c1-16)
           DEST="ios/Runner/LanguageID"
           if [ -f "$CACHE/$KEY/labels.json" ]; then
             echo "[LANGID] using cached conversion ($KEY)"
@@ -77,11 +81,10 @@ workflows:
           echo "[LANGID] bundled contents:"
           find "$DEST" -maxdepth 2 | sort
           echo "[LANGID] bundled size: $(du -sh "$DEST" | cut -f1)"
-          # Either the fused model or the verified split pair must exist.
-          if [ ! -d "$DEST/VoxLingua107LangID.mlmodelc" ] && \
-             { [ ! -d "$DEST/LangIDFrontend.mlmodelc" ] || [ ! -d "$DEST/LangIDBackend.mlmodelc" ]; }; then
-            echo "[LANGID] missing mlmodelc (single or split pair)"; exit 1
-          fi
+          # Native-frontend layout: Core ML backend + exported DSP constants.
+          test -d "$DEST/LangIDBackend.mlmodelc" || { echo "[LANGID] missing LangIDBackend.mlmodelc"; exit 1; }
+          test -f "$DEST/frontend.json" || { echo "[LANGID] missing frontend.json"; exit 1; }
+          test -f "$DEST/frontend.bin" || { echo "[LANGID] missing frontend.bin"; exit 1; }
           test -f "$DEST/labels.json" || { echo "[LANGID] missing labels.json"; exit 1; }
 
       - name: Install CocoaPods
@@ -134,21 +137,20 @@ workflows:
 
           check_app() { # $1 = path to a Runner.app
             local APP="$1"
-            local MODEL="$APP/LanguageID/VoxLingua107LangID.mlmodelc"
+            local MODEL="$APP/LanguageID/LangIDBackend.mlmodelc"
             local LABELS="$APP/LanguageID/labels.json"
             echo "[BUNDLE GATE] inspecting $APP"
             if [ ! -d "$MODEL" ]; then
-              # Split pipeline: verified frontend+backend pair instead.
-              if [ -d "$APP/LanguageID/LangIDFrontend.mlmodelc" ] && \
-                 [ -d "$APP/LanguageID/LangIDBackend.mlmodelc" ]; then
-                MODEL="$APP/LanguageID/LangIDBackend.mlmodelc"
-              else
-                echo "[BUNDLE GATE] MISSING $MODEL (and no split pair)"; return 1
-              fi
+              echo "[BUNDLE GATE] MISSING $MODEL"; return 1
             fi
             if [ -z "$(find "$MODEL" -type f | head -n 1)" ]; then
               echo "[BUNDLE GATE] $MODEL exists but is EMPTY"; return 1
             fi
+            for EXTRA in frontend.json frontend.bin; do
+              if [ ! -f "$APP/LanguageID/$EXTRA" ]; then
+                echo "[BUNDLE GATE] MISSING $APP/LanguageID/$EXTRA"; return 1
+              fi
+            done
             if [ ! -f "$LABELS" ]; then
               echo "[BUNDLE GATE] MISSING $LABELS"; return 1
             fi
