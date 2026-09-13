@@ -33,6 +33,33 @@ class LanguageDetection {
   final String speechPath;
 }
 
+/// THE single audio-preparation entry point for language identification.
+///
+/// Every caller — the developer detector tests AND the live session engine —
+/// MUST route utterance PCM through this before the native detector, so
+/// there is exactly ONE preprocessing pipeline (regression-tested). It
+/// normalizes the byte layout on the Dart side; the final 5-second
+/// window/padding policy (chosen by CI parity against the official model)
+/// is applied natively by SpeechBrainFbank.prepare, identically for all
+/// callers.
+Uint8List prepareLanguageIdAudio(Uint8List pcm16) {
+  var out = pcm16;
+  // PCM16 must be an even number of bytes.
+  if (out.length.isOdd) {
+    out = Uint8List.sublistView(out, 0, out.length - 1);
+  }
+  // Cap merged utterances at 15 s (center-kept) so a runaway buffer can
+  // never balloon the native call; the model window is 5 s anyway.
+  const maxSamples = 15 * 16000;
+  final totalSamples = out.length ~/ 2;
+  if (totalSamples > maxSamples) {
+    final startSample = (totalSamples - maxSamples) ~/ 2;
+    out = Uint8List.sublistView(
+        out, startSample * 2, (startSample + maxSamples) * 2);
+  }
+  return out;
+}
+
 class AudioLanguageId {
   static const MethodChannel _channel = MethodChannel('app.livetranslator/langid');
 
@@ -201,7 +228,9 @@ Future<LanguageIdTestReport> runDetectTranscribeTest({
 
   DetectTranscribeResult outcome;
   try {
-    outcome = await AudioLanguageId.detectAndTranscribe(pcm);
+    // Same single preprocessing path the live session uses — never two.
+    outcome = await AudioLanguageId.detectAndTranscribe(
+        prepareLanguageIdAudio(pcm));
   } on PlatformException catch (error) {
     return fail('Failed — ${error.message}');
   } on TimeoutException {
@@ -330,7 +359,8 @@ Future<LanguageIdTestReport> runLanguageIdTest({
   LanguageDetection detection;
   final started = DateTime.now();
   try {
-    detection = await AudioLanguageId.detect(pcm);
+    // Same single preprocessing path the live session uses — never two.
+    detection = await AudioLanguageId.detect(prepareLanguageIdAudio(pcm));
   } on PlatformException catch (error) {
     return fail('Detection failed — ${error.message}');
   }

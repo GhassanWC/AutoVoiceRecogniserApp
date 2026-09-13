@@ -186,13 +186,44 @@ void main() {
         const LocalTranscript(text: 'Good morning', language: 'en'),
       ]);
       final harness = buildPipeline(engine);
-      feedSegment(harness.pipeline, 'seg-1');
-      feedSegment(harness.pipeline, 'seg-2');
+      // ≥ minSpeechMsForLangId so each segment flushes independently.
+      feedSegment(harness.pipeline, 'seg-1', durationMs: 2000);
+      feedSegment(harness.pipeline, 'seg-2', durationMs: 2000);
       await harness.pipeline.drain();
 
       expect(harness.created, ['local_0', 'local_1']);
       expect(harness.resolved.map((r) => r.messageId), ['local_0', 'local_1']);
       expect(harness.resolved.map((r) => r.originalText), ['Hello', 'Good morning']);
+    });
+
+    test('short adjacent segments MERGE into one language-ID utterance', () async {
+      // "Hello" · short pause · "how are you?" → ONE detector call with the
+      // concatenated audio, ONE bubble — never tiny chunks into VoxLingua.
+      final engine = FakeLocalSpeechEngine(
+          [const LocalTranscript(text: 'Hello how are you', language: 'en')]);
+      final harness = buildPipeline(engine);
+      feedSegment(harness.pipeline, 'seg-1', durationMs: 500);
+      expect(harness.created, isEmpty,
+          reason: 'below the minimum — held, no bubble yet');
+      feedSegment(harness.pipeline, 'seg-2', durationMs: 600);
+      await harness.pipeline.drain(); // stop/flush emits the merged utterance
+
+      expect(harness.created, ['local_0']);
+      expect(harness.resolved, hasLength(1));
+      // 5 chunks × 3200 bytes per segment, merged: one 32000-byte utterance.
+      expect(engine.receivedByteLengths, [32000]);
+    });
+
+    test('reaching the minimum flushes immediately without waiting for a gap', () async {
+      final engine = FakeLocalSpeechEngine(
+          [const LocalTranscript(text: 'Long sentence', language: 'en')]);
+      final harness = buildPipeline(engine);
+      feedSegment(harness.pipeline, 'seg-1', durationMs: 700);
+      feedSegment(harness.pipeline, 'seg-2', durationMs: 900); // total 1600 ≥ 1500
+      expect(harness.created, ['local_0'],
+          reason: 'minimum reached → flushed before any drain/timer');
+      await harness.pipeline.drain();
+      expect(engine.receivedByteLengths, [32000]);
     });
 
     test('an engine failure resolves the bubble with an error, never hangs', () async {

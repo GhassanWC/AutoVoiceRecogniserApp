@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:developer' as developer;
 import 'dart:typed_data';
 
@@ -28,6 +29,8 @@ class LocalPipeline {
     required this.onMessageResolved,
     this.onMessageDiscarded,
     this.diagnosticsLog,
+    this.minSpeechMsForLangId = 1500,
+    this.mergeGapMs = 1000,
     DeviceStatsService? stats,
     String Function()? messageIdFactory,
   })  : _stats = stats ?? DeviceStatsService(),
@@ -57,11 +60,26 @@ class LocalPipeline {
   /// Developer-mode logger (null → dart:developer).
   final void Function(String line)? diagnosticsLog;
 
+  /// Language identification needs speech CONTEXT: a VAD segment shorter
+  /// than this is held and merged with speech arriving within [mergeGapMs]
+  /// ("Hello" · 300 ms pause · "how are you?" becomes ONE detector
+  /// utterance). Long silence flushes whatever is held — unrelated speech
+  /// across a long pause is never merged. The 5-second model window itself
+  /// is an INPUT FORMAT (native tile-padding handles short speech), not a
+  /// requirement that a person talks for five seconds.
+  final int minSpeechMsForLangId;
+  final int mergeGapMs;
+
   final DeviceStatsService _stats;
   final String Function() _messageIdFactory;
 
   final Map<String, BytesBuilder> _segments = {};
   Future<void> _queue = Future<void>.value();
+
+  BytesBuilder? _pending;
+  int _pendingDurationMs = 0;
+  int _pendingSampleRate = 16000;
+  Timer? _mergeTimer;
 
   void handleSegmentStart(String segmentId, int sampleRate) {
     _segments[segmentId] = BytesBuilder(copy: false);
@@ -78,10 +96,37 @@ class LocalPipeline {
     final pcm = builder.takeBytes();
     if (pcm.isEmpty) return;
 
-    final messageId = _messageIdFactory();
-    onMessageCreated(messageId); // bubble appears the moment speech ends
+    // Accumulate until there is enough voiced speech for language ID.
+    (_pending ??= BytesBuilder(copy: false)).add(pcm);
+    _pendingDurationMs += durationMs;
+    _pendingSampleRate = sampleRate;
+    _mergeTimer?.cancel();
+    if (_pendingDurationMs >= minSpeechMsForLangId) {
+      _flushPending();
+    } else {
+      _log('[LOCAL] holding ${_pendingDurationMs}ms of speech for language '
+          'ID (min $minSpeechMsForLangId; merge window ${mergeGapMs}ms)');
+      _mergeTimer =
+          Timer(Duration(milliseconds: mergeGapMs), _flushPending);
+    }
+  }
 
-    // Whisper runs one utterance at a time (single native context).
+  /// Emits the accumulated utterance: the bubble appears now, and inference
+  /// runs on the pipeline's serial queue (one utterance at a time).
+  void _flushPending() {
+    _mergeTimer?.cancel();
+    _mergeTimer = null;
+    final pending = _pending;
+    if (pending == null) return;
+    _pending = null;
+    final durationMs = _pendingDurationMs;
+    _pendingDurationMs = 0;
+    final pcm = pending.takeBytes();
+    if (pcm.isEmpty) return;
+    final sampleRate = _pendingSampleRate;
+
+    final messageId = _messageIdFactory();
+    onMessageCreated(messageId);
     _queue = _queue.then((_) => _process(messageId, pcm, durationMs, sampleRate));
   }
 
@@ -152,8 +197,12 @@ class LocalPipeline {
     }
   }
 
-  /// Resolves when all queued utterances finished (Stop Listening).
-  Future<void> drain() => _queue;
+  /// Resolves when all queued utterances finished (Stop Listening). Any
+  /// speech still held for merging is flushed first, so nothing is lost.
+  Future<void> drain() {
+    _flushPending();
+    return _queue;
+  }
 
   void _log(String line) {
     if (diagnosticsLog != null) {

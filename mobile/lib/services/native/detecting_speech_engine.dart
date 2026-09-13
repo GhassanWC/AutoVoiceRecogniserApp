@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:developer' as developer;
+import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 
@@ -22,12 +24,14 @@ import 'language_id.dart';
 class DetectingSpeechEngine implements LocalSpeechEngine {
   static const MethodChannel _channel = MethodChannel('app.livetranslator/langid');
 
-  /// Minimum detector confidence before an utterance is trusted. Deliberately
-  /// LENIENT: real-iPhone Phase-1/2 tests showed correct detections well
-  /// above this, and an overly aggressive threshold would silently eat
-  /// speech. Tune from session [LANG-ID] logs, which always show the top
-  /// candidates.
-  static const double confidenceThreshold = 0.40;
+  /// Acceptance rule = confidence TOGETHER WITH the separation between the
+  /// two best candidates — never a blind absolute threshold. A dominant
+  /// top-1 (en 0.34 vs cy 0.05) is a strong identification even below 0.40;
+  /// a photo finish (en 0.27 vs de 0.25) is genuinely ambiguous. These are
+  /// PERMISSIVE debug values for the TestFlight measurement build — tune
+  /// from real session [LANG-ID] logs, which always print top1/top2/margin.
+  static const double minTop1Confidence = 0.20;
+  static const double minMargin = 0.10;
 
   bool _loaded = false;
 
@@ -55,19 +59,47 @@ class DetectingSpeechEngine implements LocalSpeechEngine {
   @override
   Future<LocalTranscript> transcribe(Uint8List pcm16, int sampleRate) async {
     if (!_loaded) throw StateError('Detector not warmed up');
-    final outcome = await AudioLanguageId.detectAndTranscribe(pcm16);
-    final name = languageForCode(outcome.language)?.name ?? outcome.language;
-    final alternatives = outcome.alternatives
-        .map((alt) => '${alt.$1} ${alt.$2.toStringAsFixed(2)}')
-        .join('  ');
+
+    // THE shared preparation path (same function as the developer tests).
+    final prepared = prepareLanguageIdAudio(pcm16);
+
+    // [LIVE-AUDIO]: exactly what the detector receives from the live VAD.
+    final samples = prepared.length ~/ 2;
+    final data = ByteData.sublistView(prepared);
+    var peak = 0;
+    var sumSquares = 0.0;
+    for (var i = 0; i < samples; i++) {
+      final s = data.getInt16(i * 2, Endian.little);
+      if (s.abs() > peak) peak = s.abs();
+      sumSquares += (s / 32768.0) * (s / 32768.0);
+    }
+    final rms = samples == 0 ? 0.0 : math.sqrt(sumSquares / samples);
     developer.log(
-      '[LANG-ID] ${outcome.language} '
-      'confidence=${outcome.confidence.toStringAsFixed(2)} '
-      'latency=${outcome.detectionMs}ms  top: $alternatives',
+      '[LIVE-AUDIO] samples=$samples '
+      'durationMs=${(samples * 1000 / sampleRate).round()} '
+      'rms=${rms.toStringAsFixed(4)} peak=$peak/32767',
       name: 'local',
     );
 
-    if (outcome.confidence < confidenceThreshold) {
+    final outcome = await AudioLanguageId.detectAndTranscribe(prepared);
+    final name = languageForCode(outcome.language)?.name ?? outcome.language;
+    final top1 = outcome.confidence;
+    final top2 =
+        outcome.alternatives.length > 1 ? outcome.alternatives[1].$2 : 0.0;
+    final top2Code =
+        outcome.alternatives.length > 1 ? outcome.alternatives[1].$1 : '-';
+    final margin = top1 - top2;
+    developer.log(
+      '[LANG-ID] top1=${outcome.language} '
+      'confidence=${top1.toStringAsFixed(2)} '
+      'top2=$top2Code ${top2.toStringAsFixed(2)} '
+      'margin=${margin.toStringAsFixed(2)} '
+      'latency=${outcome.detectionMs}ms',
+      name: 'local',
+    );
+
+    final ambiguous = top1 < minTop1Confidence || margin < minMargin;
+    if (ambiguous) {
       return const LocalTranscript(
         text: '',
         language: 'und',
