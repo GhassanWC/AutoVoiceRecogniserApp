@@ -9,38 +9,42 @@ class PrivacyPolicyScreen extends StatelessWidget {
       'The microphone is only active while a Live Translation session is running — '
           'after you press “Start Listening” and before you press “Stop Listening”. '
           'The app never records secretly, never starts by itself, and always shows a '
-          'visible “Listening” indicator (plus a system notification on Android) while active.'
+          'visible “Listening” indicator (plus a system notification on Android) while active. '
+          'Leaving the app also stops listening.'
     ),
     (
       'What audio is processed',
-      'Speech detection runs on your phone. Only short segments that actually contain '
-          'speech are sent, encrypted, to our translation service. Silence and background '
-          'noise are not uploaded.'
+      'While you are listening, microphone audio is streamed over an encrypted '
+          'connection to Google\'s Gemini service, which detects the spoken language, '
+          'transcribes it, and translates it into your language in real time. '
+          'Translation requires an internet connection — it does not happen on the device.'
     ),
     (
       'Is audio stored?',
-      'No. Audio segments are processed in memory to produce the transcription and '
-          'translation, then discarded immediately. Raw audio is never written to disk '
-          'on the server or on your phone.'
+      'No. Audio is processed in real time to produce the transcription and '
+          'translation. The app never saves raw audio to your phone, and never '
+          'stores audio in your account.'
     ),
     (
       'What text is stored',
-      'By default, nothing. If you enable “Save translation history”, translated '
-          'conversations (text only) are stored on your device, and you can delete them '
-          'at any time from History or Settings.'
+      'Finalized translations (text only — the original sentence, its translation, '
+          'and the detected language) are saved to your private translation history in '
+          'your account. Only you can access your history, and you can delete '
+          'individual sessions or everything at any time.'
+    ),
+    (
+      'Your account',
+      'Your account stores your name, email, and chosen translation language. '
+          'Sign-in is handled by Firebase Authentication. Deleting your account from '
+          'the Profile screen permanently removes your account and your entire '
+          'translation history.'
     ),
     (
       'Who processes the data',
-      'Speech recognition and translation may be performed by third-party AI providers '
-          '(for example speech-to-text and translation APIs) acting as processors. '
-          'Segments are sent to them over encrypted connections solely to produce your '
-          'translation.'
-    ),
-    (
-      'Deleting your data',
-      'Use “Delete history” in Settings to remove all locally saved conversations. '
-          'Server-side session records contain metadata only (no audio) and are used for '
-          'service operation and abuse prevention.'
+      'Speech recognition and translation are performed by Google\'s Gemini API '
+          'acting as a processor. Account data and translation history are stored in '
+          'Google Firebase. Data is always sent over encrypted connections and is used '
+          'solely to provide your translations.'
     ),
     (
       'Local laws',

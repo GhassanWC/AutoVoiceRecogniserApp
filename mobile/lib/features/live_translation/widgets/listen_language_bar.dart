@@ -1,17 +1,13 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../../../models/app_settings.dart';
-import '../../../services/native/live_translation_support.dart';
 import '../../../services/storage/settings_store.dart';
 import '../../../utils/languages.dart';
 import '../live_translation_controller.dart';
 
-/// The native engine's language control on the main screen — Phase 3:
-/// the user picks ONLY the target language; the source language is
-/// AUTOMATIC (detected per utterance by the on-device detector).
+/// The target-language control on the main screen. The user picks ONLY the
+/// language they want translations INTO — the source language is always
+/// detected automatically by Gemini, per utterance.
 ///
 /// Idle:
 ///   Translate to: [ 🇸🇦 Arabic ▾ ]     Source language: Automatic
@@ -19,7 +15,8 @@ import '../live_translation_controller.dart';
 /// While listening:
 ///   Auto-detecting the spoken language   →   Arabic
 ///
-/// (The old "Listen for" multi-select lives on only as a Developer tool.)
+/// Changing the target during an active session restarts the Gemini session
+/// with the new language (handled by the controller).
 class ListenLanguageBar extends StatelessWidget {
   const ListenLanguageBar({super.key});
 
@@ -27,10 +24,6 @@ class ListenLanguageBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final settings = context.watch<SettingsController>().settings;
     final controller = context.watch<LiveTranslationController>();
-    if (settings.translationEngine != TranslationEngine.onDevice ||
-        settings.mockMode) {
-      return const SizedBox.shrink();
-    }
     final theme = Theme.of(context);
     final targetName =
         languageForCode(settings.targetLanguage)?.name ?? settings.targetLanguage;
@@ -98,11 +91,5 @@ class ListenLanguageBar extends StatelessWidget {
         ),
       ),
     );
-    // New utterances use the new target; translation pair statuses refresh.
-    if (!context.mounted) return;
-    unawaited(sharedLiveTranslationSupport.refresh(
-      targetLanguage: controller.settings.targetLanguage,
-      sourceLanguages: const ['en'],
-    ));
   }
 }

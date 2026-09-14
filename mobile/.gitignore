@@ -47,6 +47,7 @@ app.*.map.json
 # Widget Preview related
 .widget_preview/
 
-
-# CI-converted VoxLingua107 language-ID Core ML model (built on Codemagic)
-ios/Runner/LanguageID/
+# Firebase per-platform config (injected locally by `flutterfire configure`
+# and in CI from secure env vars; lib/firebase_options.dart IS committed)
+ios/Runner/GoogleService-Info.plist
+android/app/google-services.json

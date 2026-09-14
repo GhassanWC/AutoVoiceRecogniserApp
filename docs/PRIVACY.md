@@ -1,75 +1,42 @@
-# Privacy model
+# Privacy rules (enforced in code)
 
-Privacy is a product feature here, not a compliance checkbox. These are the
-rules and where the code enforces them.
+The app translates live speech via Google's Gemini Live Translate API.
+Translation is **not** on-device — never claim that it is. These rules are
+product law; each names the code that enforces it.
 
-## The rules
+1. **The microphone never starts by itself.** Only the Start Listening button
+   starts a session (`LiveTranslationController.startListening`); holding the
+   OS permission never triggers capture. Android's foreground service is
+   `START_NOT_STICKY`.
 
-1. **The microphone never starts on its own.**
-   Only the explicit *Start Listening* action starts capture. Granting the OS
-   permission does not start a session (`LiveTranslationController.startListening`
-   is the only entry point; the Android service is `START_NOT_STICKY`, so the OS
-   never resurrects it after reboot or kill).
+2. **Listening is always visible.** The pulsing "Listening" pill + waveform
+   (`ListeningIndicator`) on screen, a persistent notification with a Stop
+   action on Android, the OS microphone indicator on iOS.
 
-2. **Listening is always visible.**
-   In-app: the pulsing "● Listening" pill (text, not just color), tappable for
-   an explanation and a Stop button. Android background: a persistent
-   foreground-service notification with a Stop action. iOS: the system
-   microphone indicator — never suppressed or worked around.
+3. **Stop means stop, immediately.** `LiveTranslationService.stop()` stops
+   native capture FIRST, then closes the Gemini socket — not one extra sample
+   is recorded or sent after Stop.
 
-3. **Stop means stop, immediately.**
-   *Stop Listening* tears down native capture first, then flushes/closes the
-   session (`stopListening()` ordering). The notification Stop action kills
-   capture natively before informing Dart.
+4. **Leaving the app stops the session.** `didChangeAppLifecycleState` stops
+   listening when the app is backgrounded. No silent background capture.
 
-4. **Audio streams only between Start Listening and Stop Listening.**
-   While listening is active, microphone audio streams continuously to the
-   backend (over WSS/HTTPS in production) so distant/room speech is never
-   discarded by an on-device gate; prolonged absolute silence (an empty room)
-   pauses the upload as a bandwidth optimization. Stop Listening immediately
-   ends both capture and streaming, and raw audio is never stored anywhere.
+5. **Audio streams only while listening, only to Gemini.** Microphone audio
+   goes over one encrypted WebSocket directly to the Gemini Live API — never
+   through Firebase, never to any other provider.
 
-5. **Raw audio is never stored.**
-   The backend holds segment audio in memory only for the duration of the
-   recognition call and discards it (`LiveSession.processSegment`). There is no
-   audio column in the schema, no file writes, no object storage. The mobile
-   app never writes audio to disk at all.
+6. **Raw audio is never stored.** Not on the device, not in Firestore
+   (`SessionRepository.addMessage` writes text fields only), not anywhere.
 
-6. **History is opt-in, local, text-only.**
-   `saveHistory` defaults to **off**. When on, translated conversations (text)
-   are stored on the device via `HistoryStore`, deletable per-session or
-   entirely (Settings → Delete history).
+7. **History is text-only and private to the user.** Finalized original +
+   translated text with detected language, stored under `users/{uid}` and
+   protected by Firestore rules (`firestore.rules`) so no other user can ever
+   read it. Delete history and delete account (which removes everything,
+   `UserRepository.deleteAllUserData`) are one tap away.
 
-7. **Provider keys live on the server.**
-   The app authenticates with a short guest JWT; OpenAI/Deepgram/Google keys
-   exist only in backend environment variables.
+8. **Secrets stay server-side.** The Gemini API key exists only in Secret
+   Manager, read by the `createLiveTranslateToken` Cloud Function, which
+   requires a signed-in user and a valid App Check token and returns only a
+   short-lived, single-use, config-locked ephemeral token.
 
-8. **Logs carry metadata, not conversations.**
-   The backend logger's contract (see `utils/logger.ts`): languages, latencies,
-   lengths and ids — never transcribed or translated text at info level.
-
-9. **No dark patterns around permissions.**
-   A denied permission is respected: the app shows one clear banner
-   ("Microphone access is disabled" + *Open Settings*) and never loops prompts.
-
-10. **Local laws are the user's context.**
-    The in-app privacy page tells users that recording/transcribing nearby
-    speech is regulated differently across countries and to be transparent
-    with people around them.
-
-## Data inventory
-
-| Data | Where | Retention |
-|---|---|---|
-| Audio segments | Backend RAM during one recognition call | Seconds; discarded immediately |
-| Transcriptions/translations | Device (only if history is on); backend DB (only if a future server-history opt-in sends `saveHistory: true`) | User-deletable |
-| Guest identity | JWT on device, user row in backend store | Until deleted |
-| Usage metering | speech-seconds & character counts per month | Aggregates only |
-| Diagnostics | Structured logs (no conversation content) | Operator-defined |
-
-## What the app must never do
-
-Hide microphone indicators, bypass OS privacy controls, record after Stop,
-auto-restart listening after reboot, or circumvent Android/iOS microphone
-policies. Any feature request that requires one of these is out of scope by
-design.
+User-facing copy lives in `mobile/lib/features/settings/privacy_policy_screen.dart`
+and must stay consistent with these rules.

@@ -3,8 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import '../../models/app_settings.dart';
-import '../../services/native/live_translation_support.dart';
 import '../../services/storage/settings_store.dart';
 import '../../utils/languages.dart';
 import '../history/history_screen.dart';
@@ -13,7 +11,6 @@ import 'live_translation_controller.dart';
 import 'widgets/listen_language_bar.dart';
 import 'widgets/listening_indicator.dart';
 import 'widgets/message_bubble.dart';
-import 'widgets/unsupported_dialog.dart';
 
 class LiveTranslationScreen extends StatefulWidget {
   const LiveTranslationScreen({super.key});
@@ -43,16 +40,6 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
       if (_isNearBottom && _showNewMessagePill) {
         setState(() => _showNewMessagePill = false);
       }
-    });
-    // App-startup capability probe (required): the Start button and the
-    // Settings status row reflect real device capability before first use.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      final settings = context.read<SettingsController>().settings;
-      sharedLiveTranslationSupport.ensure(
-        targetLanguage: settings.targetLanguage,
-        sourceLanguages: const ['en'], // source is automatic
-      );
     });
   }
 
@@ -86,27 +73,6 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
   Future<void> _toggleListening() async {
     final controller = _controller;
     if (controller.state == ListeningState.idle) {
-      // Native engine: never start a session on an unsupported device —
-      // block with the explanation dialog instead of a broken session.
-      final settings = context.read<SettingsController>().settings;
-      if (settings.translationEngine == TranslationEngine.onDevice &&
-          !settings.mockMode) {
-        final support = await sharedLiveTranslationSupport.ensure(
-          targetLanguage: settings.targetLanguage,
-          sourceLanguages: const ['en'], // source is automatic
-        );
-        if (!support.supported) {
-          if (mounted) {
-            await showLiveTranslationUnsupportedDialog(
-              context,
-              support: support,
-              targetLanguage: settings.targetLanguage,
-              sourceLanguages: const ['en'], // source is automatic
-            );
-          }
-          return;
-        }
-      }
       await controller.startListening();
     } else if (controller.isListening) {
       await controller.stopListening();
@@ -170,7 +136,8 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Delete this translation session?'),
+        title: const Text('Clear this conversation from the screen?'),
+        content: const Text('Saved history is kept — manage it in History.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
@@ -178,7 +145,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
           ),
           FilledButton(
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Delete'),
+            child: const Text('Clear'),
           ),
         ],
       ),
@@ -265,9 +232,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
                               showOriginal: settings.showOriginalText,
                               showTimestamp: settings.showTimestamps,
                               showLanguageLabels: settings.showLanguageLabels,
-                              onReplay: () => controller.replay(message),
                               onReport: () => controller.reportBadTranslation(message),
-                              onRetry: () => controller.retryTranslation(message),
                             );
                           },
                         ),
@@ -288,30 +253,9 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
               ),
             ),
             const ListenLanguageBar(),
-            ListenableBuilder(
-              listenable: sharedLiveTranslationSupport,
-              builder: (context, _) {
-                final settings = context.watch<SettingsController>().settings;
-                final support = sharedLiveTranslationSupport.current;
-                final blocked = settings.translationEngine ==
-                        TranslationEngine.onDevice &&
-                    !settings.mockMode &&
-                    support != null &&
-                    !support.supported;
-                return _BottomControl(
-                  state: controller.state,
-                  onPressed: _toggleListening,
-                  blocked: blocked,
-                  onBlockedTap: support == null
-                      ? null
-                      : () => showLiveTranslationUnsupportedDialog(
-                            context,
-                            support: support,
-                            targetLanguage: settings.targetLanguage,
-                            sourceLanguages: const ['en'], // source is automatic
-                          ),
-                );
-              },
+            _BottomControl(
+              state: controller.state,
+              onPressed: _toggleListening,
             ),
           ],
         ),
@@ -414,17 +358,10 @@ class _BottomControl extends StatelessWidget {
   const _BottomControl({
     required this.state,
     required this.onPressed,
-    this.blocked = false,
-    this.onBlockedTap,
   });
 
   final ListeningState state;
   final Future<void> Function() onPressed;
-
-  /// Native engine on an unsupported device: the button is disabled, and a
-  /// tap explains why instead of failing mysteriously.
-  final bool blocked;
-  final VoidCallback? onBlockedTap;
 
   @override
   Widget build(BuildContext context) {
@@ -432,20 +369,11 @@ class _BottomControl extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
       child: switch (state) {
-        ListeningState.idle => blocked
-            ? GestureDetector(
-                onTap: onBlockedTap,
-                child: FilledButton.icon(
-                  onPressed: null,
-                  icon: const Icon(Icons.mic_off_rounded, size: 26),
-                  label: const Text('Live Translation unavailable'),
-                ),
-              )
-            : FilledButton.icon(
-                onPressed: onPressed,
-                icon: const Icon(Icons.mic_rounded, size: 26),
-                label: const Text('Start Listening'),
-              ),
+        ListeningState.idle => FilledButton.icon(
+            onPressed: onPressed,
+            icon: const Icon(Icons.mic_rounded, size: 26),
+            label: const Text('Start Listening'),
+          ),
         ListeningState.starting => FilledButton.icon(
             onPressed: null,
             icon: const SizedBox(

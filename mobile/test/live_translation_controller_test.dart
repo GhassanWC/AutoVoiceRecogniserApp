@@ -1,158 +1,291 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
 
+import 'package:fake_cloud_firestore/fake_cloud_firestore.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:live_translator/features/live_translation/live_translation_controller.dart';
 import 'package:live_translator/models/translation_message.dart';
-import 'package:live_translator/models/ws_events.dart';
-import 'package:live_translator/services/auth/api_client.dart';
+import 'package:live_translator/services/audio/audio_capture_service.dart';
+import 'package:live_translator/services/audio/audio_playback_service.dart';
+import 'package:live_translator/services/firestore/session_repository.dart';
+import 'package:live_translator/services/gemini/live_translation_service.dart';
+import 'package:live_translator/services/permissions/mic_permission_service.dart';
 import 'package:live_translator/services/storage/settings_store.dart';
-import 'package:live_translator/services/websocket/live_translation_client.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-/// Feeds scripted server events into the controller without any network.
-class FakeLiveTranslationClient extends LiveTranslationClient {
-  FakeLiveTranslationClient() : super(api: ApiClient(serverUrlOverride: 'http://localhost'));
+class FakeSocket implements GeminiSocket {
+  final StreamController<dynamic> incoming = StreamController<dynamic>.broadcast();
+  final List<String> sent = [];
+  @override
+  Stream<dynamic> get messages => incoming.stream;
+  @override
+  void send(String data) => sent.add(data);
+  @override
+  Future<void> close() async {
+    if (!incoming.isClosed) await incoming.close();
+  }
 
-  final StreamController<ServerEvent> fakeEvents = StreamController.broadcast();
-  final StreamController<LiveConnectionState> fakeStates = StreamController.broadcast();
+  void serverSends(Map<String, dynamic> message) => incoming.add(jsonEncode(message));
+}
+
+class FakeCapture extends AudioCaptureService {
+  bool running = false;
+  @override
+  bool get isCapturing => running;
+  @override
+  Future<void> start({
+    required void Function(Uint8List pcm) onAudio,
+    required void Function(String reason) onStopped,
+  }) async {
+    running = true;
+  }
 
   @override
-  Stream<ServerEvent> get events => fakeEvents.stream;
-
-  @override
-  Stream<LiveConnectionState> get connectionStates => fakeStates.stream;
-
-  @override
-  Future<void> disconnect() async {}
-
-  @override
-  void dispose() {}
-
-  Future<void> emit(ServerEvent event) async {
-    fakeEvents.add(event);
-    await Future<void>.delayed(Duration.zero); // let the stream deliver
+  Future<void> stop() async {
+    running = false;
   }
 }
 
-TranslationStartedEvent started(String id) => TranslationStartedEvent(
-      messageId: id,
-      speakerId: null,
-      speakerLabel: null,
-      sourceLanguage: 'und',
-      targetLanguage: 'ar',
-      timestamp: DateTime(2026, 9, 6, 12, 0),
+class FakePlayback extends AudioPlaybackService {
+  final StreamController<bool> active = StreamController<bool>.broadcast();
+  @override
+  Stream<bool> get playbackActive => active.stream;
+  @override
+  Future<void> start() async {}
+  @override
+  Future<void> feed(Uint8List pcm) async {}
+  @override
+  Future<void> stop() async {}
+  @override
+  Future<void> dispose() async => active.close();
+}
+
+class GrantedPermissions extends MicPermissionService {
+  @override
+  Future<MicPermissionStatus> currentStatus() async => MicPermissionStatus.granted;
+  @override
+  Future<MicPermissionStatus> request() async => MicPermissionStatus.granted;
+}
+
+class DeniedPermissions extends MicPermissionService {
+  @override
+  Future<MicPermissionStatus> currentStatus() async =>
+      MicPermissionStatus.permanentlyDenied;
+  @override
+  Future<MicPermissionStatus> request() async => MicPermissionStatus.permanentlyDenied;
+}
+
+class Harness {
+  Harness({
+    MicPermissionService? permissions,
+    List<TokenRequestException?> tokenErrors = const [],
+  }) {
+    settings = SettingsController(SettingsStore());
+    var call = 0;
+    service = LiveTranslationService(
+      tokenProvider: (target) async {
+        tokenTargets.add(target);
+        final error = call < tokenErrors.length ? tokenErrors[call] : null;
+        call++;
+        if (error != null) throw error;
+        return LiveSessionToken(
+          token: 'tok',
+          model: 'm',
+          expireTime: DateTime.now().toUtc().add(const Duration(minutes: 30)),
+        );
+      },
+      connect: (uri) async {
+        final socket = FakeSocket();
+        sockets.add(socket);
+        return socket;
+      },
+      capture: FakeCapture(),
+      playback: FakePlayback(),
+      backoffDelays: const [Duration.zero],
+      playbackGateTail: Duration.zero,
     );
+    controller = LiveTranslationController(
+      settings: settings,
+      service: service,
+      permissions: permissions ?? GrantedPermissions(),
+      sessionRepository: SessionRepository(firestore: firestore),
+      uidProvider: () => 'user-1',
+    );
+  }
+
+  final FakeFirebaseFirestore firestore = FakeFirebaseFirestore();
+  final List<FakeSocket> sockets = [];
+  final List<String> tokenTargets = [];
+  late final SettingsController settings;
+  late final LiveTranslationService service;
+  late final LiveTranslationController controller;
+
+  FakeSocket get socket => sockets.last;
+
+  Future<void> pump() => Future<void>.delayed(Duration.zero);
+
+  Future<void> startAndConnect() async {
+    await controller.startListening();
+    socket.serverSends({'setupComplete': {}});
+    await pump();
+  }
+}
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  setUp(() => SharedPreferences.setMockInitialValues({}));
 
-  late FakeLiveTranslationClient client;
-  late LiveTranslationController controller;
+  test('start → listening; partial transcripts update ONE bubble in place', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    expect(h.controller.state, ListeningState.listening);
+    expect(h.tokenTargets, ['ar']);
 
-  setUp(() {
-    client = FakeLiveTranslationClient();
-    controller = LiveTranslationController(
-      settings: SettingsController(SettingsStore()),
-      client: client,
-    );
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'Hello', 'languageCode': 'en'}
+      }
+    });
+    await h.pump();
+    expect(h.controller.messages, hasLength(1));
+    final bubble = h.controller.messages.single;
+    expect(bubble.originalText, 'Hello');
+    expect(bubble.status, TranslationStatus.pending);
+    expect(bubble.sourceLanguage, 'en');
+
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': ' there'},
+        'outputTranscription': {'text': 'مرحبا'}
+      }
+    });
+    await h.pump();
+    expect(h.controller.messages, hasLength(1), reason: 'no duplicate bubbles');
+    expect(h.controller.messages.single.originalText, 'Hello there');
+    expect(h.controller.messages.single.translatedText, 'مرحبا');
   });
 
-  test('translation_started creates an in-progress bubble immediately', () async {
-    await client.emit(started('msg_1'));
+  test('finalized utterances (and ONLY those) are persisted to Firestore', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
 
-    expect(controller.messages, hasLength(1));
-    final message = controller.messages.single;
-    expect(message.id, 'msg_1');
-    expect(message.status, TranslationStatus.pending); // renders "Translating…"
-    expect(message.translatedText, isEmpty);
-    expect(message.sourceLanguage, 'und');
-    expect(message.targetLanguage, 'ar');
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'Hello', 'languageCode': 'en'},
+        'outputTranscription': {'text': 'مرحبا'}
+      }
+    });
+    await h.pump();
+    // Partial only — nothing persisted yet, no session doc either.
+    var sessions = await h.firestore.collection('users/user-1/sessions').get();
+    expect(sessions.docs, isEmpty);
+
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+    await h.pump();
+
+    sessions = await h.firestore.collection('users/user-1/sessions').get();
+    expect(sessions.docs, hasLength(1));
+    expect(sessions.docs.single.data()['targetLanguageCode'], 'ar');
+    final messages = await sessions.docs.single.reference.collection('messages').get();
+    expect(messages.docs, hasLength(1));
+    final data = messages.docs.single.data();
+    expect(data['originalText'], 'Hello');
+    expect(data['translatedText'], 'مرحبا');
+    expect(data['sourceLanguageCode'], 'en');
+    expect(data['targetLanguageCode'], 'ar');
+    expect(data.containsKey('audio'), isFalse);
+
+    await h.controller.stopListening();
+    final ended = await h.firestore.collection('users/user-1/sessions').get();
+    expect(ended.docs.single.data()['endedAt'], isNotNull);
+    expect(ended.docs.single.data()['messageCount'], 1);
+    expect(h.controller.lastSummary?.translationCount, 1);
   });
 
-  test('translation_delta for an existing message appends into the same bubble', () async {
-    await client.emit(started('msg_1'));
-    await client.emit(const TranslationDeltaEvent(messageId: 'msg_1', delta: 'مرح', reset: false));
-    await client.emit(const TranslationDeltaEvent(messageId: 'msg_1', delta: 'باً', reset: false));
+  test('source language changes are reflected automatically per utterance', () async {
+    final h = Harness();
+    await h.startAndConnect();
 
-    expect(controller.messages, hasLength(1));
-    expect(controller.messages.single.translatedText, 'مرحباً');
-    expect(controller.messages.single.status, TranslationStatus.pending);
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'Hello', 'languageCode': 'en'},
+        'turnComplete': true
+      }
+    });
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'สวัสดี', 'languageCode': 'th'},
+        'turnComplete': true
+      }
+    });
+    await h.pump();
+    expect(h.controller.messages, hasLength(2));
+    expect(h.controller.messages[0].sourceLanguage, 'en');
+    expect(h.controller.messages[1].sourceLanguage, 'th');
   });
 
-  test('translation_delta for an UNKNOWN messageId still creates the bubble', () async {
-    // No translation_started ever arrived (ordering/network race).
-    await client.emit(const TranslationDeltaEvent(messageId: 'msg_x', delta: 'مرح', reset: false));
-
-    expect(controller.messages, hasLength(1)); // created, not dropped
-    expect(controller.messages.single.id, 'msg_x');
-    expect(controller.messages.single.translatedText, 'مرح');
+  test('BCP-47 detected codes are normalized for display (pt-BR → pt)', () async {
+    final h = Harness();
+    await h.startAndConnect();
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'Olá', 'languageCode': 'pt-BR'}
+      }
+    });
+    await h.pump();
+    expect(h.controller.messages.single.sourceLanguage, 'pt');
   });
 
-  test('translation_complete for an unknown messageId still creates and finalizes it', () async {
-    await client.emit(const TranslationCompleteEvent(
-      messageId: 'msg_y',
-      translatedText: 'مرحباً',
-      sourceLanguage: 'en',
-      originalText: 'Hello',
-    ));
-
-    expect(controller.messages, hasLength(1));
-    final message = controller.messages.single;
-    expect(message.id, 'msg_y');
-    expect(message.status, TranslationStatus.done);
-    expect(message.translatedText, 'مرحباً');
-    expect(message.originalText, 'Hello');
-    expect(message.sourceLanguage, 'en');
+  test('quota error shows the quota banner and returns to a startable state', () async {
+    final h = Harness(tokenErrors: [
+      const TokenRequestException(LiveErrorKind.quota, 'quota'),
+    ]);
+    await h.controller.startListening();
+    await h.pump();
+    expect(h.controller.state, ListeningState.idle);
+    expect(h.controller.errorBanner, contains('capacity'));
   });
 
-  test('language_detected upgrades the SAME bubble after translation completed', () async {
-    await client.emit(started('msg_1'));
-    await client.emit(const TranslationDeltaEvent(messageId: 'msg_1', delta: 'مرحباً', reset: false));
-    await client.emit(const TranslationCompleteEvent(messageId: 'msg_1', translatedText: 'مرحباً'));
-    // Language metadata arrives strictly AFTER the translation — must still land.
-    await client.emit(const LanguageDetectedEvent(
-      messageId: 'msg_1',
-      languageCode: 'th',
-      languageName: 'Thai',
-    ));
-
-    expect(controller.messages, hasLength(1)); // same bubble, no duplicate
-    final message = controller.messages.single;
-    expect(message.sourceLanguage, 'th');
-    expect(message.languageConfidence, greaterThanOrEqualTo(0.5)); // label renders
-    expect(message.translatedText, 'مرحباً'); // translation untouched
-    expect(message.status, TranslationStatus.done);
+  test('permanently denied microphone never reaches the token service', () async {
+    final h = Harness(permissions: DeniedPermissions());
+    await h.controller.startListening();
+    expect(h.controller.state, ListeningState.idle);
+    expect(h.controller.permissionPermanentlyDenied, isTrue);
+    expect(h.controller.errorBanner, isNotNull);
+    expect(h.tokenTargets, isEmpty);
   });
 
-  test('unknown language_detected is ignored without crashing', () async {
-    await client.emit(started('msg_1'));
-    await client.emit(const LanguageDetectedEvent(
-      messageId: 'msg_1',
-      languageCode: 'und',
-      languageName: '',
-    ));
-    await client.emit(const LanguageDetectedEvent(
-      messageId: 'msg_missing',
-      languageCode: 'th',
-      languageName: 'Thai',
-    ));
+  test('changing the target language mid-session restarts with the new language', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    expect(h.tokenTargets, ['ar']);
 
-    expect(controller.messages, hasLength(1));
-    expect(controller.messages.single.sourceLanguage, 'und'); // stays "Speaker"
+    await h.settings.setTargetLanguage('en');
+    // Restart is async: old session stops, a new one starts.
+    await h.pump();
+    await h.pump();
+    await h.pump();
+    h.socket.serverSends({'setupComplete': {}});
+    await h.pump();
+
+    expect(h.tokenTargets, ['ar', 'en']);
+    expect(h.controller.state, ListeningState.listening);
   });
 
-  test('multiple deltas and the completion never create duplicate bubbles', () async {
-    await client.emit(started('msg_1'));
-    for (final delta in ['مر', 'ح', 'ب', 'اً']) {
-      await client.emit(TranslationDeltaEvent(messageId: 'msg_1', delta: delta, reset: false));
+  test('stop/start works repeatedly', () async {
+    final h = Harness();
+    for (var i = 0; i < 3; i++) {
+      await h.startAndConnect();
+      expect(h.controller.state, ListeningState.listening);
+      await h.controller.stopListening();
+      expect(h.controller.state, ListeningState.idle);
     }
-    await client.emit(started('msg_1')); // duplicate announcement (reconnect)
-    await client.emit(const TranslationCompleteEvent(
-      messageId: 'msg_1',
-      translatedText: 'مرحباً',
-    ));
-
-    expect(controller.messages, hasLength(1)); // one bubble through it all
-    expect(controller.messages.single.translatedText, 'مرحباً');
-    expect(controller.messages.single.status, TranslationStatus.done);
   });
 }

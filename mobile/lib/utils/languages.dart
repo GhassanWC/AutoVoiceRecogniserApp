@@ -95,6 +95,25 @@ LanguageInfo? languageForCode(String? code) {
 
 bool isRtlLanguage(String code) => languageForCode(code)?.isRtl ?? false;
 
+/// Maps our ISO 639-1 catalog codes to the BCP-47 form the Gemini Live
+/// Translate API expects. Kept in lockstep with the Cloud Function's
+/// server-side allowlist (functions/src/languages.ts) — update both together.
+String geminiCodeFor(String iso639) => switch (iso639.toLowerCase()) {
+      'zh' => 'zh-Hans',
+      'pt' => 'pt-BR',
+      final other => other,
+    };
+
+/// Normalizes a language code reported by Gemini (BCP-47, e.g. "pt-BR",
+/// "zh-Hans", "en-US") back to the catalog's primary subtag for display
+/// lookup. Unknown codes pass through unchanged.
+String normalizeDetectedLanguage(String code) {
+  final lower = code.toLowerCase();
+  if (languageForCode(lower) != null) return lower;
+  final primary = lower.split(RegExp('[-_]')).first;
+  return primary;
+}
+
 /// Display name for a detected source language, or null while the language is
 /// unknown/low-confidence — the bubble then shows just "Speaker". Never a
 /// literal "Language detected…" placeholder.

@@ -11,102 +11,41 @@ workflows:
     environment:
       groups:
         - code-signing
+        # firebase-config must define (as a SECURE variable):
+        #   GOOGLE_SERVICE_INFO_PLIST_B64 — base64 of the iOS
+        #   GoogleService-Info.plist produced by `flutterfire configure`
+        #   (locally: `base64 -i ios/Runner/GoogleService-Info.plist`).
+        - firebase-config
 
       vars:
         # App Store Connect → App Information → Apple ID
-        # Example: "1234567890"
         APP_STORE_APPLE_ID: "6808526994"
 
       flutter: stable
       xcode: latest
       cocoapods: default
 
-    cache:
-      cache_paths:
-        # pip wheels (torch is ~800 MB) + the finished language-ID model so
-        # the Core ML conversion only re-runs when the script changes.
-        - ~/Library/Caches/pip
-        - ~/.langid_model_cache
-
     scripts:
-      - name: Get Flutter packages
-        script: |
-          # Flutter plugins integrate via CocoaPods (the committed
-          # ios/Podfile). Speech/translation use OS frameworks; the ONLY
-          # bundled ML asset is the small VoxLingua107 language-ID model.
-          flutter config --no-enable-swift-package-manager
-          flutter pub get
-
-      - name: Convert + verify VoxLingua107 language-ID Core ML model
+      - name: Write Firebase iOS config
         script: |
           #!/bin/bash
           set -e
-
-          CACHE="$HOME/.langid_model_cache"
-
-          # Key covers the converter AND the shipping Swift DSP + harness.
-          KEY=$(cat ../tools/convert_langid_coreml.py \
-                    ../tools/LangIdParityMain.swift \
-                    ios/Runner/SpeechBrainFbank.swift | shasum -a 256 | cut -c1-16)
-
-          DEST="ios/Runner/LanguageID"
-
-          if [ -f "$CACHE/$KEY/labels.json" ]; then
-            echo "[LANGID] using cached conversion ($KEY)"
-
-            rm -rf "$DEST"
-            mkdir -p "$DEST"
-            cp -R "$CACHE/$KEY/." "$DEST/"
-          else
-            python3 -m venv "$HOME/.langid_venv"
-            source "$HOME/.langid_venv/bin/activate"
-
-            pip install --quiet --upgrade pip
-            pip install --quiet --upgrade setuptools
-
-            pip install --quiet \
-              "torch==2.3.1" \
-              "torchaudio==2.3.1" \
-              "coremltools==8.1" \
-              "speechbrain==1.0.2" \
-              "numpy<2" \
-              "requests" \
-              "huggingface_hub<1.0" \
-              "soundfile"
-
-            python3 -u ../tools/convert_langid_coreml.py
-
-            deactivate
-
-            rm -rf "$CACHE/$KEY"
-            mkdir -p "$CACHE/$KEY"
-            cp -R "$DEST/." "$CACHE/$KEY/"
+          if [ -z "$GOOGLE_SERVICE_INFO_PLIST_B64" ]; then
+            echo "GOOGLE_SERVICE_INFO_PLIST_B64 is not set (firebase-config group)."
+            exit 1
           fi
+          echo "$GOOGLE_SERVICE_INFO_PLIST_B64" | base64 --decode \
+            > ios/Runner/GoogleService-Info.plist
+          plutil -lint ios/Runner/GoogleService-Info.plist
 
-          echo "[LANGID] bundled contents:"
-          find "$DEST" -maxdepth 2 | sort
-
-          echo "[LANGID] bundled size: $(du -sh "$DEST" | cut -f1)"
-
-          test -d "$DEST/LangIDBackend.mlmodelc" || {
-            echo "[LANGID] missing LangIDBackend.mlmodelc"
-            exit 1
-          }
-
-          test -f "$DEST/frontend.json" || {
-            echo "[LANGID] missing frontend.json"
-            exit 1
-          }
-
-          test -f "$DEST/frontend.bin" || {
-            echo "[LANGID] missing frontend.bin"
-            exit 1
-          }
-
-          test -f "$DEST/labels.json" || {
-            echo "[LANGID] missing labels.json"
-            exit 1
-          }
+      - name: Get Flutter packages
+        script: |
+          # Flutter plugins (including the Firebase SDKs) integrate via
+          # CocoaPods — the committed ios/Podfile. No bundled ML assets:
+          # speech recognition, language detection and translation all run
+          # in Gemini Live Translate via an ephemeral-token WebSocket.
+          flutter config --no-enable-swift-package-manager
+          flutter pub get
 
       - name: Install CocoaPods
         script: |
@@ -139,6 +78,15 @@ workflows:
       - name: Flutter tests
         script: |
           flutter test
+
+      - name: Cloud Functions typecheck + tests
+        script: |
+          #!/bin/bash
+          set -e
+          cd ../functions
+          npm ci
+          npm run typecheck
+          npm test
 
       # -------------------------------------------------------------
       # AUTOMATIC TESTFLIGHT BUILD NUMBER
@@ -182,101 +130,34 @@ workflows:
             --build-number="$BUILD_NUMBER" \
             --export-options-plist=/Users/builder/export_options.plist
 
-      - name: Verify language-ID model is INSIDE the app bundle (build gate)
+      - name: Verify NO legacy ML models ship in the IPA (build gate)
         script: |
           #!/bin/bash
           set -e
 
-          check_app() {
-            local APP="$1"
-            local MODEL="$APP/LanguageID/LangIDBackend.mlmodelc"
-            local LABELS="$APP/LanguageID/labels.json"
-
-            echo "[BUNDLE GATE] inspecting $APP"
-
-            if [ ! -d "$MODEL" ]; then
-              echo "[BUNDLE GATE] MISSING $MODEL"
-              return 1
-            fi
-
-            if [ -z "$(find "$MODEL" -type f | head -n 1)" ]; then
-              echo "[BUNDLE GATE] $MODEL exists but is EMPTY"
-              return 1
-            fi
-
-            for EXTRA in frontend.json frontend.bin; do
-              if [ ! -f "$APP/LanguageID/$EXTRA" ]; then
-                echo "[BUNDLE GATE] MISSING $APP/LanguageID/$EXTRA"
-                return 1
-              fi
-            done
-
-            if [ ! -f "$LABELS" ]; then
-              echo "[BUNDLE GATE] MISSING $LABELS"
-              return 1
-            fi
-
-            LABEL_COUNT=$(python3 -c \
-              "import json,sys;print(len(json.load(open(sys.argv[1]))))" \
-              "$LABELS")
-
-            if [ "$LABEL_COUNT" -lt 100 ]; then
-              echo "[BUNDLE GATE] labels.json has only $LABEL_COUNT entries"
-              return 1
-            fi
-
-            echo "[BUNDLE GATE] OK model $(du -sh "$MODEL" | cut -f1), $LABEL_COUNT labels"
-
-            return 0
-          }
-
-          # -----------------------------------------------------------
-          # Check archive
-          # -----------------------------------------------------------
-          ARCHIVE=$(find build/ios/archive \
-            -name "*.xcarchive" \
-            -type d | head -n 1)
-
-          if [ -z "$ARCHIVE" ]; then
-            echo "[BUNDLE GATE] ERROR: no .xcarchive under build/ios/archive"
-            exit 1
-          fi
-
-          check_app "$ARCHIVE/Products/Applications/Runner.app" || {
-            echo "[BUNDLE GATE] FAILED in archive."
-            echo "[BUNDLE GATE] LanguageID resources were not copied."
-            exit 1
-          }
-
-          # -----------------------------------------------------------
-          # Check actual exported IPA
-          # -----------------------------------------------------------
-          IPA=$(find build/ios/ipa \
-            -name "*.ipa" | head -n 1)
-
+          IPA=$(find build/ios/ipa -name "*.ipa" | head -n 1)
           if [ -z "$IPA" ]; then
             echo "[BUNDLE GATE] ERROR: no .ipa under build/ios/ipa"
             exit 1
           fi
 
           UNPACK=$(mktemp -d)
-
           unzip -q "$IPA" -d "$UNPACK"
 
-          IPA_APP=$(find "$UNPACK/Payload" \
-            -maxdepth 1 \
-            -name "*.app" \
-            -type d | head -n 1)
-
-          check_app "$IPA_APP" || {
-            echo "[BUNDLE GATE] FAILED inside exported IPA."
-            rm -rf "$UNPACK"
-            exit 1
-          }
+          LEFTOVERS=$(find "$UNPACK/Payload" \
+            \( -iname "*.mlmodelc" -o -iname "*.mlmodel" -o -iname "*.mlpackage" \
+               -o -iname "*ggml*" -o -iname "*whisper*" -o -iname "*voxlingua*" \
+               -o -iname "LanguageID" \) | head -n 5)
 
           rm -rf "$UNPACK"
 
-          echo "[BUNDLE GATE] PASSED — language-ID model ships in this IPA."
+          if [ -n "$LEFTOVERS" ]; then
+            echo "[BUNDLE GATE] FAILED — legacy ML artifacts found in IPA:"
+            echo "$LEFTOVERS"
+            exit 1
+          fi
+
+          echo "[BUNDLE GATE] PASSED — no local speech/language models in this IPA."
 
     artifacts:
       - build/ios/ipa/*.ipa

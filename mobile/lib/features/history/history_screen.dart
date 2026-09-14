@@ -2,44 +2,120 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
-import '../../models/conversation_session.dart';
-import '../../services/storage/settings_store.dart';
-import '../../services/storage/history_store.dart';
+import '../../services/auth/auth_controller.dart';
+import '../../services/firestore/session_repository.dart';
 import '../../utils/languages.dart';
 import 'session_detail_screen.dart';
 
-class HistoryScreen extends StatefulWidget {
+/// Translation history from the signed-in user's private Firestore space.
+class HistoryScreen extends StatelessWidget {
   const HistoryScreen({super.key});
 
   @override
-  State<HistoryScreen> createState() => _HistoryScreenState();
-}
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final uid = context.watch<AuthController>().uid;
+    final sessions = context.read<SessionRepository>();
 
-class _HistoryScreenState extends State<HistoryScreen> {
-  final HistoryStore _store = HistoryStore();
-  late Future<List<ConversationSession>> _sessions = _store.loadSessions();
-
-  void _reload() {
-    setState(() => _sessions = _store.loadSessions());
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('History'),
+        actions: [
+          IconButton(
+            tooltip: 'Delete All History',
+            icon: const Icon(Icons.delete_sweep_outlined),
+            onPressed: uid == null ? null : () => _deleteAll(context, sessions, uid),
+          ),
+        ],
+      ),
+      body: uid == null
+          ? const Center(child: Text('Sign in to see your history.'))
+          : StreamBuilder<List<SessionSummaryDoc>>(
+              stream: sessions.watchSessions(uid),
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                if (snapshot.hasError) {
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(32),
+                      child: Text(
+                        'Could not load history.\nCheck your connection and try again.',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyLarge
+                            ?.copyWith(color: theme.colorScheme.outline),
+                      ),
+                    ),
+                  );
+                }
+                final docs = snapshot.data ?? const <SessionSummaryDoc>[];
+                if (docs.isEmpty) {
+                  return Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(32),
+                      child: Text(
+                        'No saved conversations yet.\nFinished translations are saved here automatically.',
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyLarge
+                            ?.copyWith(color: theme.colorScheme.outline),
+                      ),
+                    ),
+                  );
+                }
+                return ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: docs.length,
+                  itemBuilder: (context, index) {
+                    final session = docs[index];
+                    final language = languageForCode(session.targetLanguageCode);
+                    final count = session.messageCount;
+                    return Card(
+                      margin: const EdgeInsets.symmetric(vertical: 5),
+                      child: ListTile(
+                        onTap: () => Navigator.push(
+                          context,
+                          MaterialPageRoute<void>(
+                              builder: (_) => SessionDetailScreen(session: session)),
+                        ),
+                        leading:
+                            Text(language?.flag ?? '💬', style: const TextStyle(fontSize: 26)),
+                        title: Text(
+                          DateFormat.yMMMd().add_Hm().format(session.startedAt),
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        subtitle: Text([
+                          if (count != null)
+                            '$count translation${count == 1 ? '' : 's'}',
+                          if (language != null) '→ ${language.name}',
+                        ].join(' ')),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.delete_outline_rounded),
+                          onPressed: () => _deleteSession(context, sessions, uid, session),
+                        ),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+    );
   }
 
-  Future<void> _deleteSession(ConversationSession session) async {
-    final confirmed = await _confirm('Delete this translation session?');
-    if (confirmed) {
-      await _store.deleteSession(session.id);
-      _reload();
+  Future<void> _deleteSession(BuildContext context, SessionRepository sessions, String uid,
+      SessionSummaryDoc session) async {
+    if (await _confirm(context, 'Delete this translation session?')) {
+      await sessions.deleteSession(uid, session.id);
     }
   }
 
-  Future<void> _deleteAll() async {
-    final confirmed = await _confirm('Delete all saved translation history?');
-    if (confirmed) {
-      await _store.deleteAll();
-      _reload();
+  Future<void> _deleteAll(BuildContext context, SessionRepository sessions, String uid) async {
+    if (await _confirm(context, 'Delete all saved translation history?')) {
+      await sessions.deleteAllSessions(uid);
     }
   }
 
-  Future<bool> _confirm(String title) async {
+  Future<bool> _confirm(BuildContext context, String title) async {
     final result = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -53,77 +129,5 @@ class _HistoryScreenState extends State<HistoryScreen> {
       ),
     );
     return result == true;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final historyEnabled = context.watch<SettingsController>().settings.saveHistory;
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('History'),
-        actions: [
-          IconButton(
-            tooltip: 'Delete All History',
-            icon: const Icon(Icons.delete_sweep_outlined),
-            onPressed: _deleteAll,
-          ),
-        ],
-      ),
-      body: FutureBuilder<List<ConversationSession>>(
-        future: _sessions,
-        builder: (context, snapshot) {
-          final sessions = snapshot.data ?? [];
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(child: CircularProgressIndicator());
-          }
-          if (sessions.isEmpty) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(32),
-                child: Text(
-                  historyEnabled
-                      ? 'No saved conversations yet.\nSessions are saved here when they end.'
-                      : 'History is off.\nEnable “Save translation history” in Settings '
-                          'if you want sessions kept on this device.',
-                  textAlign: TextAlign.center,
-                  style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.outline),
-                ),
-              ),
-            );
-          }
-          return ListView.builder(
-            padding: const EdgeInsets.all(12),
-            itemCount: sessions.length,
-            itemBuilder: (context, index) {
-              final session = sessions[index];
-              final language = languageForCode(session.targetLanguage);
-              return Card(
-                margin: const EdgeInsets.symmetric(vertical: 5),
-                child: ListTile(
-                  onTap: () => Navigator.push(
-                    context,
-                    MaterialPageRoute<void>(
-                        builder: (_) => SessionDetailScreen(session: session)),
-                  ),
-                  leading: Text(language?.flag ?? '💬', style: const TextStyle(fontSize: 26)),
-                  title: Text(
-                    DateFormat.yMMMd().add_Hm().format(session.startedAt),
-                    style: const TextStyle(fontWeight: FontWeight.w700),
-                  ),
-                  subtitle: Text(
-                      '${session.messages.length} translation${session.messages.length == 1 ? '' : 's'}'
-                      '${language == null ? '' : ' → ${language.name}'}'),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.delete_outline_rounded),
-                    onPressed: () => _deleteSession(session),
-                  ),
-                ),
-              );
-            },
-          );
-        },
-      ),
-    );
   }
 }

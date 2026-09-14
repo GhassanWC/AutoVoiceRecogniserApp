@@ -1,0 +1,12 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // A user can only touch their own tree: users/{uid} and everything
+    // nested under it (sessions, messages). Identity comes from Firebase
+    // Authentication — never from client-supplied data.
+    match /users/{uid}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+    // Everything else is denied by default (no other top-level collections).
+  }
+}

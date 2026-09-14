@@ -50,6 +50,35 @@ void main() {
     }
   });
 
+  test('geminiCodeFor maps the catalog to Gemini BCP-47 forms', () {
+    expect(geminiCodeFor('zh'), 'zh-Hans');
+    expect(geminiCodeFor('pt'), 'pt-BR');
+    expect(geminiCodeFor('ar'), 'ar');
+    expect(geminiCodeFor('EN'), 'en');
+  });
+
+  test('catalog ↔ Cloud Function allowlist parity fixture', () {
+    // Mirror of functions/src/languages.ts ALLOWED_TARGET_LANGUAGES — the
+    // functions test pins the other direction. Update BOTH together.
+    const allowlist = {
+      'ar', 'en', 'es', 'fr', 'de', 'hi', 'zh-Hans', 'ja', 'ko', 'tr',
+      'pt-BR', 'ru', 'th', 'id', 'ms', 'it', 'nl', 'ur', 'fa', 'he',
+      'vi', 'pl', 'uk', 'el', 'sv',
+    };
+    expect(
+      kTargetLanguages.map((l) => geminiCodeFor(l.code)).toSet(),
+      allowlist,
+    );
+  });
+
+  test('normalizeDetectedLanguage folds Gemini BCP-47 codes back to the catalog', () {
+    expect(normalizeDetectedLanguage('pt-BR'), 'pt');
+    expect(normalizeDetectedLanguage('zh-Hans'), 'zh');
+    expect(normalizeDetectedLanguage('en-US'), 'en');
+    expect(normalizeDetectedLanguage('ar'), 'ar');
+    expect(normalizeDetectedLanguage('xx-YY'), 'xx');
+  });
+
   test('every catalog entry is complete', () {
     for (final language in kTargetLanguages) {
       expect(language.code.length, inInclusiveRange(2, 3));

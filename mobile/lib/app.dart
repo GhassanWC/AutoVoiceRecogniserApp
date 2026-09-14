@@ -1,8 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
-import 'features/live_translation/live_translation_screen.dart';
-import 'features/onboarding/onboarding_flow.dart';
+import 'features/auth/auth_gate.dart';
 import 'models/app_settings.dart';
 import 'services/storage/settings_store.dart';
 import 'theme/app_theme.dart';
@@ -30,7 +29,7 @@ class LiveTranslatorApp extends StatelessWidget {
           child: child ?? const SizedBox.shrink(),
         );
       },
-      home: settings.onboardingComplete ? const LiveTranslationScreen() : const OnboardingFlow(),
+      home: const AuthGate(),
     );
   }
 }
