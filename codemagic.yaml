@@ -11,10 +11,13 @@ workflows:
     environment:
       groups:
         - code-signing
-        # firebase-config must define (as a SECURE variable):
+        # firebase-config must define (as SECURE variables):
         #   GOOGLE_SERVICE_INFO_PLIST_B64 — base64 of the iOS
         #   GoogleService-Info.plist produced by `flutterfire configure`
         #   (locally: `base64 -i ios/Runner/GoogleService-Info.plist`).
+        #   GOOGLE_SERVER_CLIENT_ID — the OAuth *web* client ID
+        #   (xxx.apps.googleusercontent.com), passed to the app as a
+        #   dart-define for Google Sign-In on Android.
         - firebase-config
 
       vars:
@@ -26,16 +29,17 @@ workflows:
       cocoapods: default
 
     scripts:
-      - name: Write Firebase iOS config
+      - name: Restore Firebase iOS config
         script: |
           #!/bin/bash
           set -e
-          if [ -z "$GOOGLE_SERVICE_INFO_PLIST_B64" ]; then
-            echo "GOOGLE_SERVICE_INFO_PLIST_B64 is not set (firebase-config group)."
-            exit 1
-          fi
-          echo "$GOOGLE_SERVICE_INFO_PLIST_B64" | base64 --decode \
-            > ios/Runner/GoogleService-Info.plist
+          # working_directory is `mobile`, so the plist path is relative to it.
+          python3 - <<'PY'
+          import os, base64, pathlib
+          p = pathlib.Path("ios/Runner/GoogleService-Info.plist")
+          p.write_bytes(base64.b64decode(os.environ["GOOGLE_SERVICE_INFO_PLIST_B64"]))
+          print("Firebase plist restored")
+          PY
           plutil -lint ios/Runner/GoogleService-Info.plist
 
       - name: Get Flutter packages
@@ -128,6 +132,7 @@ workflows:
           flutter build ipa --release \
             --build-name=1.0.0 \
             --build-number="$BUILD_NUMBER" \
+            --dart-define=GOOGLE_SERVER_CLIENT_ID="$GOOGLE_SERVER_CLIENT_ID" \
             --export-options-plist=/Users/builder/export_options.plist
 
       - name: Verify NO legacy ML models ship in the IPA (build gate)
