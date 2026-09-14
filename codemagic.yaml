@@ -18,7 +18,6 @@ workflows:
         #   GOOGLE_SERVER_CLIENT_ID — the OAuth *web* client ID
         #   (xxx.apps.googleusercontent.com), passed to the app as a
         #   dart-define for Google Sign-In on Android.
-        - firebase-config
 
       vars:
         # App Store Connect → App Information → Apple ID
