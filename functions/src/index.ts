@@ -32,10 +32,19 @@ export const createLiveTranslateToken = onCall(
       throw new HttpsError("invalid-argument", "Unsupported target language.");
     }
     try {
-      return await issueLiveTranslateToken(target, {
+      const issued = await issueLiveTranslateToken(target, {
         fetchFn: fetch,
         apiKey: geminiApiKey.value(),
       });
+      // Safe telemetry only: NEVER log the ephemeral token or the API key.
+      logger.info("createLiveTranslateToken issued", {
+        uid: request.auth.uid,
+        target,
+        model: issued.model,
+        expireTime: issued.expireTime,
+        tokenLength: issued.token.length,
+      });
+      return issued;
     } catch (error) {
       if (error instanceof TokenError && error.kind === "quota") {
         throw new HttpsError(

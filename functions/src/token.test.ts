@@ -25,28 +25,51 @@ function fakeFetch(
 }
 
 describe("tokenRequestBody", () => {
-  // Pins the exact preview-API request shape — if Google changes the
+  // Pins the exact v1beta AuthToken request shape, verified against the
+  // live discovery document and a real 200 mint — if Google changes the
   // auth_tokens contract, this fails loudly instead of silently drifting.
-  it("locks the full Live Translate config server-side", () => {
+  it("locks the full Live Translate setup server-side", () => {
     const body = tokenRequestBody("ar", NOW);
     expect(body).toEqual({
       uses: 1,
       expireTime: "2026-09-14T10:30:00.000Z",
       newSessionExpireTime: "2026-09-14T10:01:00.000Z",
-      liveConnectConstraints: {
+      bidiGenerateContentSetup: {
         model: "models/gemini-3.5-live-translate-preview",
-        config: {
+        generationConfig: {
           responseModalities: ["AUDIO"],
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-          sessionResumption: {},
           translationConfig: {
             targetLanguageCode: "ar",
             echoTargetLanguage: true,
           },
         },
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        sessionResumption: {},
       },
     });
+  });
+
+  it("sends no fields the auth_tokens API rejects", () => {
+    const body = tokenRequestBody("ar", NOW);
+    // The API has no `liveConnectConstraints` and no `authToken` wrapper —
+    // both produce 400 INVALID_ARGUMENT "Unknown name ... at 'auth_token'".
+    expect(body).not.toHaveProperty("authToken");
+    expect(body).not.toHaveProperty("liveConnectConstraints");
+    expect(Object.keys(body).sort()).toEqual([
+      "bidiGenerateContentSetup",
+      "expireTime",
+      "newSessionExpireTime",
+      "uses",
+    ]);
+    // Placement pins: translationConfig belongs INSIDE generationConfig;
+    // transcription configs at setup level (not in generationConfig).
+    const setup = body.bidiGenerateContentSetup as Record<string, unknown>;
+    const generation = setup.generationConfig as Record<string, unknown>;
+    expect(generation).toHaveProperty("translationConfig");
+    expect(generation).not.toHaveProperty("inputAudioTranscription");
+    expect(setup).toHaveProperty("inputAudioTranscription");
+    expect(setup).toHaveProperty("outputAudioTranscription");
   });
 });
 
@@ -68,7 +91,9 @@ describe("issueLiveTranslateToken", () => {
     const headers = calls[0].init.headers as Record<string, string>;
     expect(headers["x-goog-api-key"]).toBe("SECRET");
     const sent = JSON.parse(String(calls[0].init.body));
-    expect(sent.liveConnectConstraints.config.translationConfig).toEqual({
+    expect(
+      sent.bidiGenerateContentSetup.generationConfig.translationConfig,
+    ).toEqual({
       targetLanguageCode: "th",
       echoTargetLanguage: true,
     });

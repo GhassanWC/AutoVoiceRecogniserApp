@@ -41,7 +41,22 @@ export interface LiveTranslateToken {
   expireTime: string;
 }
 
-/** The exact constraint payload sent to auth_tokens (exported for tests). */
+/**
+ * The exact payload sent to auth_tokens (exported for tests).
+ *
+ * Shape verified against the live v1beta discovery document (AuthToken
+ * schema) and a real 200 mint on 2026-09-15: the API has NO
+ * `liveConnectConstraints` field — the locked configuration goes in
+ * `bidiGenerateContentSetup` (the same message as the WebSocket `setup`
+ * frame), flat in the body (never wrapped in `{"authToken": ...}`).
+ * With no fieldMask and this setup present, the effective setup comes
+ * entirely from the token — the client's own setup frame cannot loosen it.
+ *
+ * Placement matters: `translationConfig` and `responseModalities` live in
+ * `generationConfig`; the transcription configs and `sessionResumption`
+ * sit at the setup level. Unknown or misplaced fields are rejected with
+ * 400 INVALID_ARGUMENT "Unknown name ... at 'auth_token'".
+ */
 export function tokenRequestBody(
   targetLanguageCode: string,
   nowMs: number,
@@ -52,19 +67,19 @@ export function tokenRequestBody(
     newSessionExpireTime: new Date(
       nowMs + NEW_SESSION_TTL_SECONDS * 1_000,
     ).toISOString(),
-    liveConnectConstraints: {
+    bidiGenerateContentSetup: {
       model: MODEL,
-      config: {
+      generationConfig: {
         responseModalities: ["AUDIO"],
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        // Lets a dropped connection resume the same session on this token.
-        sessionResumption: {},
         translationConfig: {
           targetLanguageCode,
           echoTargetLanguage: true,
         },
       },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {},
+      // Lets a dropped connection resume the same session on this token.
+      sessionResumption: {},
     },
   };
 }
