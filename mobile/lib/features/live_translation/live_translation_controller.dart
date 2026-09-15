@@ -218,6 +218,10 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
         unawaited(_persistFinalized(event));
       case ServiceError():
         _wasReconnecting = false;
+        // The banner may be friendly copy; the log always carries the
+        // exact failure for debugging.
+        developer.log('live session error [${event.kind.name}]: ${event.message}',
+            name: 'live');
         errorBanner = switch (event.kind) {
           LiveErrorKind.quota =>
             'Free translation capacity is currently reached. Please try again later.',

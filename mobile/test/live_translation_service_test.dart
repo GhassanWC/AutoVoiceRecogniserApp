@@ -85,9 +85,11 @@ class Harness {
   Harness({
     List<TokenRequestException?> tokenErrors = const [],
     DateTime? tokenExpiry,
+    bool online = false,
   }) {
     var call = 0;
     service = LiveTranslationService(
+      isOnline: () async => online,
       tokenProvider: (target) async {
         tokenRequests.add(target);
         final error = call < tokenErrors.length ? tokenErrors[call] : null;
@@ -353,7 +355,8 @@ void main() {
     expect(h.uris.last.toString(), contains('access_token=tok-2'));
   });
 
-  test('exhausted reconnect attempts end in a recoverable network error', () async {
+  test('exhausted reconnect attempts while OFFLINE end in a recoverable network error',
+      () async {
     final h = Harness();
     await h.startListening();
 
@@ -373,6 +376,24 @@ void main() {
     h.socket.serverSends({'setupComplete': {}});
     await h.pump();
     expect(h.service.state, LiveServiceState.listening);
+  });
+
+  test('exhausted reconnect attempts while ONLINE surface a fatal error, not "no internet"',
+      () async {
+    final h = Harness(online: true);
+    await h.startListening();
+
+    for (var i = 0; i < 4; i++) {
+      await h.socket.dropConnection();
+      await h.pump();
+      await h.pump();
+    }
+
+    expect(h.service.state, LiveServiceState.error);
+    final error = h.events.whereType<ServiceError>().single;
+    expect(error.kind, LiveErrorKind.fatal,
+        reason: 'a reachable internet means the failure is NOT connectivity');
+    expect(error.message, contains('translation service'));
   });
 
   test('stop() during a session returns cleanly to idle and stops the mic first', () async {

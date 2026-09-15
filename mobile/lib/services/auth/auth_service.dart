@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
@@ -23,10 +24,13 @@ class AuthService {
   final FirebaseAuth _auth;
   bool _googleInitialized = false;
 
-  /// Android needs the OAuth *web* client ID to obtain a Firebase-compatible
+  /// The OAuth *web/server* client ID, needed to obtain a Firebase-compatible
   /// idToken. Pass it at build time:
   ///   --dart-define=GOOGLE_SERVER_CLIENT_ID=xxx.apps.googleusercontent.com
-  /// iOS reads its client ID from GoogleService-Info.plist automatically.
+  /// iOS additionally needs its own iOS client ID: the google_sign_in plugin
+  /// reads CLIENT_ID from GoogleService-Info.plist, which must be bundled in
+  /// the Runner target (it is — see ios/Runner.xcodeproj) or sign-in fails
+  /// before any dialog appears.
   static const String _serverClientId = String.fromEnvironment('GOOGLE_SERVER_CLIENT_ID');
 
   Stream<User?> authStateChanges() => _auth.authStateChanges();
@@ -87,6 +91,12 @@ class AuthService {
       if (e.code == GoogleSignInExceptionCode.canceled) {
         throw const AuthException('canceled', 'Sign-in was canceled.');
       }
+      developer.log(
+        'GoogleSignInException code=${e.code.name} '
+        'description=${e.description} details=${e.details}',
+        name: 'auth',
+        error: e,
+      );
       throw AuthException('google', 'Google Sign-In failed: ${e.description ?? e.code.name}');
     }
     final idToken = account.authentication.idToken;
@@ -217,7 +227,13 @@ class AuthService {
     return List.generate(length, (_) => charset[random.nextInt(charset.length)]).join();
   }
 
-  static AuthException _friendly(FirebaseAuthException e) => AuthException(
+  static AuthException _friendly(FirebaseAuthException e) {
+    developer.log(
+      'FirebaseAuthException code=${e.code} message=${e.message}',
+      name: 'auth',
+      error: e,
+    );
+    return AuthException(
         e.code,
         switch (e.code) {
           'invalid-email' => 'That email address looks invalid.',
@@ -233,4 +249,5 @@ class AuthService {
           _ => e.message ?? 'Something went wrong (${e.code}). Please try again.',
         },
       );
+  }
 }

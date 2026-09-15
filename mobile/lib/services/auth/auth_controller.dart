@@ -103,10 +103,15 @@ class AuthController extends ChangeNotifier {
       return true;
     } on AuthException catch (e) {
       _errorMessage = e.code == 'canceled' ? null : e.message;
+      if (e.code != 'canceled') {
+        developer.log('auth flow failed [${e.code}]: ${e.message}', name: 'auth');
+      }
       return false;
-    } catch (e) {
+    } catch (e, stackTrace) {
+      // The UI stays generic; the log carries the real error for debugging.
       _errorMessage = 'Something went wrong. Please try again.';
-      developer.log('auth flow failed: $e', name: 'auth');
+      developer.log('auth flow failed: ${e.runtimeType}: $e',
+          name: 'auth', error: e, stackTrace: stackTrace);
       return false;
     } finally {
       _busy = false;

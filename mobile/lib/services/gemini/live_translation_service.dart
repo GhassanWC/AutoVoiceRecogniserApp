@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'dart:typed_data';
 
 import 'package:uuid/uuid.dart';
@@ -8,6 +9,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import '../../utils/mic_level.dart';
 import '../audio/audio_capture_service.dart';
 import '../audio/audio_playback_service.dart';
+import '../network/connectivity_probe.dart';
 
 /// Connection lifecycle of one live translation session.
 enum LiveServiceState { idle, connecting, listening, reconnecting, stopping, error }
@@ -129,7 +131,9 @@ class LiveTranslationService {
     this.playbackGateTail = const Duration(milliseconds: 300),
     String Function()? utteranceIdFactory,
     DateTime Function()? now,
+    Future<bool> Function()? isOnline,
   })  : _tokenProvider = tokenProvider,
+        _isOnline = isOnline ?? hasInternetConnection,
         _connect = connect ?? defaultSocketConnector,
         capture = capture ?? AudioCaptureService(),
         playback = playback ?? AudioPlaybackService(),
@@ -146,6 +150,7 @@ class LiveTranslationService {
   static const int _sendChunkBytes = 3200;
 
   final TokenProvider _tokenProvider;
+  final Future<bool> Function() _isOnline;
   final SocketConnector _connect;
   final AudioCaptureService capture;
   final AudioPlaybackService playback;
@@ -190,6 +195,7 @@ class LiveTranslationService {
   bool _captureRunning = false;
   int _reconnectAttempts = 0;
   String? _resumeHandle;
+  String? _lastSocketError;
 
   // Current-utterance aggregation.
   String? _utteranceId;
@@ -216,6 +222,7 @@ class LiveTranslationService {
     _playAudio = playAudio;
     _reconnectAttempts = 0;
     _resumeHandle = null;
+    _lastSocketError = null;
     _resetUtterance();
     _setState(LiveServiceState.connecting);
 
@@ -226,9 +233,12 @@ class LiveTranslationService {
       if (generation != _generation) return;
       _failSession(e.kind, e.message);
       return;
-    } catch (e) {
+    } catch (e, stackTrace) {
       if (generation != _generation) return;
-      _failSession(LiveErrorKind.network, '$e');
+      // An unmapped error is NOT a connectivity problem — surface it as-is.
+      developer.log('token provider threw unexpectedly: ${e.runtimeType}: $e',
+          name: 'live.session', error: e, stackTrace: stackTrace);
+      _failSession(LiveErrorKind.fatal, 'Could not start a translation session: $e');
       return;
     }
     if (generation != _generation) return;
@@ -279,7 +289,12 @@ class LiveTranslationService {
       _socket = socket;
       _socketSubscription = socket.messages.listen(
         (dynamic frame) => _onFrame(generation, frame),
-        onError: (Object _) => _onSocketClosed(generation),
+        onError: (Object error) {
+          _lastSocketError = '$error';
+          developer.log('WebSocket stream error: $error',
+              name: 'live.socket', error: error);
+          _onSocketClosed(generation);
+        },
         onDone: () => _onSocketClosed(generation),
         cancelOnError: true,
       );
@@ -289,7 +304,11 @@ class LiveTranslationService {
         if (generation != _generation || _setupDone) return;
         _onSocketClosed(generation);
       });
-    } catch (_) {
+    } catch (e) {
+      // Handshake failure: DNS/TLS errors, or the Gemini endpoint refusing
+      // the upgrade (e.g. an invalid/expired ephemeral token → HTTP 4xx).
+      _lastSocketError = '$e';
+      developer.log('WebSocket connect failed: $e', name: 'live.socket', error: e);
       if (generation != _generation) return;
       await _handleConnectionLoss(generation);
     }
@@ -353,8 +372,23 @@ class LiveTranslationService {
     }
     await playback.stop();
     if (_reconnectAttempts >= backoffDelays.length) {
-      _failSession(LiveErrorKind.network,
-          'Connection to the translation service was lost. Check your internet connection and try again.');
+      // "Internet required" ONLY when the device is genuinely offline;
+      // otherwise the service is rejecting us and the real error must show.
+      final online = await _isOnline();
+      if (generation != _generation) return;
+      developer.log(
+          'reconnect attempts exhausted (online=$online, '
+          'last socket error: ${_lastSocketError ?? 'none'})',
+          name: 'live.session');
+      if (online) {
+        _failSession(
+            LiveErrorKind.fatal,
+            'Could not stay connected to the translation service.'
+            '${_lastSocketError == null ? '' : ' Last error: $_lastSocketError'}');
+      } else {
+        _failSession(LiveErrorKind.network,
+            'Connection to the translation service was lost. Check your internet connection and try again.');
+      }
       return;
     }
     final delay = backoffDelays[_reconnectAttempts];
@@ -381,7 +415,9 @@ class LiveTranslationService {
         }
         await _handleConnectionLoss(generation); // burns another attempt
         return;
-      } catch (_) {
+      } catch (e) {
+        developer.log('token refresh during reconnect failed: $e',
+            name: 'live.session', error: e);
         if (generation != _generation) return;
         await _handleConnectionLoss(generation);
         return;
