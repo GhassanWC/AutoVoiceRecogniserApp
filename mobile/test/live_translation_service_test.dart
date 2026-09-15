@@ -15,6 +15,11 @@ class FakeSocket implements GeminiSocket {
   bool closed = false;
 
   @override
+  int? closeCode;
+  @override
+  String? closeReason;
+
+  @override
   Stream<dynamic> get messages => incoming.stream;
 
   @override
@@ -86,10 +91,13 @@ class Harness {
     List<TokenRequestException?> tokenErrors = const [],
     DateTime? tokenExpiry,
     bool online = false,
+    Duration setupTimeout = const Duration(seconds: 15),
+    Future<GeminiSocket> Function(Uri uri)? connectOverride,
   }) {
     var call = 0;
     service = LiveTranslationService(
       isOnline: () async => online,
+      setupTimeout: setupTimeout,
       tokenProvider: (target) async {
         tokenRequests.add(target);
         final error = call < tokenErrors.length ? tokenErrors[call] : null;
@@ -103,6 +111,7 @@ class Harness {
       },
       connect: (uri) async {
         uris.add(uri);
+        if (connectOverride != null) return connectOverride(uri);
         final socket = FakeSocket();
         sockets.add(socket);
         return socket;
@@ -156,21 +165,99 @@ void main() {
 
     expect(h.tokenRequests, ['ar']);
     expect(h.uris.single.toString(), contains('access_token=tok-1'));
-    expect(h.uris.single.toString(),
-        startsWith('wss://generativelanguage.googleapis.com/ws/'));
+    // Ephemeral tokens with a server-locked setup must use the CONSTRAINED
+    // endpoint.
+    expect(
+        h.uris.single.toString(),
+        startsWith('wss://generativelanguage.googleapis.com/ws/'
+            'google.ai.generativelanguage.v1beta.GenerativeService.'
+            'BidiGenerateContentConstrained?'));
 
     final setup = jsonDecode(h.socket.sent.first) as Map<String, dynamic>;
-    expect(setup['setup']['model'], 'models/gemini-3.5-live-translate-preview');
-    final config = setup['setup']['generationConfig'] as Map<String, dynamic>;
+    final setupBody = setup['setup'] as Map<String, dynamic>;
+    expect(setupBody['model'], 'models/gemini-3.5-live-translate-preview');
+    final config = setupBody['generationConfig'] as Map<String, dynamic>;
     expect(config['responseModalities'], ['AUDIO']);
-    expect(config['inputAudioTranscription'], isEmpty);
-    expect(config['outputAudioTranscription'], isEmpty);
     expect(config['translationConfig'],
         {'targetLanguageCode': 'ar', 'echoTargetLanguage': true});
+    // Transcription configs live at the SETUP level, not in generationConfig —
+    // the API closes the session right after setup when they are misplaced.
+    expect(config.containsKey('inputAudioTranscription'), isFalse);
+    expect(config.containsKey('outputAudioTranscription'), isFalse);
+    expect(setupBody['inputAudioTranscription'], isEmpty);
+    expect(setupBody['outputAudioTranscription'], isEmpty);
+    // Present-but-empty on a fresh start; carries the handle on resume.
+    expect(setupBody['sessionResumption'], isEmpty);
 
     expect(h.service.state, LiveServiceState.listening);
     expect(h.capture.startCalls, 1);
     expect(h.playback.startCalls, 1);
+  });
+
+  test('no microphone chunks are sent before setupComplete arrives', () async {
+    final h = Harness();
+    await h.service.start(targetLanguageCode: 'ar', playAudio: true);
+    // Connected, setup frame sent — but setupComplete has NOT arrived, so
+    // capture is not running yet and nothing may reach the uplink.
+    expect(h.capture.startCalls, 0);
+    expect(h.socket.sent, hasLength(1),
+        reason: 'only the setup frame may be sent before setupComplete');
+    expect(jsonDecode(h.socket.sent.single), contains('setup'));
+
+    h.socket.serverSends({'setupComplete': {}});
+    await h.pump();
+    h.mic();
+    expect(h.sentAudio(h.socket), hasLength(1),
+        reason: 'audio flows only after setupComplete');
+
+    // The reconnect window is where premature audio is physically possible:
+    // capture KEEPS running while the new socket exists and its
+    // setupComplete has not yet arrived — the _onMicChunk guard is the only
+    // barrier. (Deleting that guard must fail this test.)
+    await h.socket.dropConnection();
+    await h.pump();
+    await h.pump();
+    final reconnected = h.sockets.last;
+    expect(reconnected, isNot(same(h.sockets.first)));
+    h.mic();
+    h.mic();
+    expect(h.sentAudio(reconnected), isEmpty,
+        reason: 'mic chunks must be dropped until the NEW connection has '
+            'received setupComplete');
+    reconnected.serverSends({'setupComplete': {}});
+    await h.pump();
+    h.mic();
+    expect(h.sentAudio(reconnected), hasLength(1));
+  });
+
+  test('setup timeout really closes the stalled socket before reconnecting', () async {
+    final h = Harness(setupTimeout: Duration.zero);
+    await h.service.start(targetLanguageCode: 'ar', playAudio: true);
+    // setupComplete never arrives; the timeout must actually CLOSE the old
+    // socket (not just abandon it) and then retry on a fresh connection.
+    for (var i = 0; i < 4; i++) {
+      await h.pump();
+    }
+    expect(h.sockets.first.closed, isTrue,
+        reason: 'a stalled connection must be closed, not leaked');
+    expect(h.sockets.length, greaterThan(1), reason: 'a reconnect follows');
+  });
+
+  test('handshake errors never leak the access token', () async {
+    final h = Harness(
+      online: true,
+      connectOverride: (uri) async =>
+          throw Exception("Connection to '$uri' was not upgraded to websocket"),
+    );
+    await h.service.start(targetLanguageCode: 'ar', playAudio: true);
+    for (var i = 0; i < 12; i++) {
+      await h.pump();
+    }
+    final error = h.events.whereType<ServiceError>().single;
+    expect(error.kind, LiveErrorKind.fatal);
+    expect(error.message, isNot(contains('tok-')),
+        reason: 'the ephemeral token must never reach user-facing messages');
+    expect(error.message, contains('access_token=<redacted>'));
   });
 
   test('microphone chunks are coalesced to ~100 ms and base64-encoded', () async {

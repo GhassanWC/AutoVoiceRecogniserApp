@@ -18,6 +18,10 @@ class FakeSocket implements GeminiSocket {
   final StreamController<dynamic> incoming = StreamController<dynamic>.broadcast();
   final List<String> sent = [];
   @override
+  int? closeCode;
+  @override
+  String? closeReason;
+  @override
   Stream<dynamic> get messages => incoming.stream;
   @override
   void send(String data) => sent.add(data);

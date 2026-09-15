@@ -41,6 +41,11 @@ abstract class GeminiSocket {
   Stream<dynamic> get messages;
   void send(String data);
   Future<void> close();
+
+  /// WebSocket close code/reason, available once the connection has closed
+  /// (null before that, and for test fakes that never set them).
+  int? get closeCode;
+  String? get closeReason;
 }
 
 typedef SocketConnector = Future<GeminiSocket> Function(Uri uri);
@@ -54,6 +59,10 @@ class _ChannelSocket implements GeminiSocket {
   void send(String data) => _channel.sink.add(data);
   @override
   Future<void> close() => _channel.sink.close();
+  @override
+  int? get closeCode => _channel.closeCode;
+  @override
+  String? get closeReason => _channel.closeReason;
 }
 
 Future<GeminiSocket> defaultSocketConnector(Uri uri) async {
@@ -142,9 +151,11 @@ class LiveTranslationService {
     _playbackSubscription = this.playback.playbackActive.listen(_onPlaybackActive);
   }
 
+  /// The CONSTRAINED endpoint: sessions opened with an ephemeral token whose
+  /// bidiGenerateContentSetup is locked server-side must connect here.
   static const String websocketBase =
       'wss://generativelanguage.googleapis.com/ws/'
-      'google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+      'google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
 
   /// ~100 ms of 16 kHz mono PCM16.
   static const int _sendChunkBytes = 3200;
@@ -196,6 +207,8 @@ class LiveTranslationService {
   int _reconnectAttempts = 0;
   String? _resumeHandle;
   String? _lastSocketError;
+  bool _firstFrameLogged = false;
+  bool _socketErrorRecorded = false;
 
   // Current-utterance aggregation.
   String? _utteranceId;
@@ -280,52 +293,91 @@ class LiveTranslationService {
     final token = _token;
     if (token == null) return;
     _setupDone = false;
+    _firstFrameLogged = false;
+    _socketErrorRecorded = false;
+    // Cancel any timer from a previous connection BEFORE the connect await:
+    // a stale timer firing mid-connect would start a second reconnect flow
+    // for the same generation (two live sockets, duplicated frames).
+    _setupTimer?.cancel();
     try {
       final socket = await _connect(Uri.parse('$websocketBase?access_token=${token.token}'));
       if (generation != _generation) {
         await socket.close();
         return;
       }
+      // Log the endpoint only — the access_token must never reach the logs.
+      developer.log('WebSocket opened: $websocketBase (resuming=$resuming)',
+          name: 'live.socket');
       _socket = socket;
       _socketSubscription = socket.messages.listen(
         (dynamic frame) => _onFrame(generation, frame),
         onError: (Object error) {
-          _lastSocketError = '$error';
-          developer.log('WebSocket stream error: $error',
-              name: 'live.socket', error: error);
+          _socketErrorRecorded = true;
+          _lastSocketError = _sanitizeError(error);
+          developer.log('WebSocket stream error: $_lastSocketError',
+              name: 'live.socket');
           _onSocketClosed(generation);
         },
         onDone: () => _onSocketClosed(generation),
         cancelOnError: true,
       );
       socket.send(jsonEncode(_setupMessage(token.model, resuming: resuming)));
+      developer.log(
+          'setup sent (model=${token.model}, target=$_targetLanguageCode, '
+          'resumeHandle=${resuming && _resumeHandle != null})',
+          name: 'live.socket');
       _setupTimer?.cancel();
       _setupTimer = Timer(setupTimeout, () {
         if (generation != _generation || _setupDone) return;
+        developer.log(
+            'setupComplete NOT received within ${setupTimeout.inSeconds}s — '
+            'closing this connection',
+            name: 'live.socket');
         _onSocketClosed(generation);
       });
     } catch (e) {
       // Handshake failure: DNS/TLS errors, or the Gemini endpoint refusing
       // the upgrade (e.g. an invalid/expired ephemeral token → HTTP 4xx).
-      _lastSocketError = '$e';
-      developer.log('WebSocket connect failed: $e', name: 'live.socket', error: e);
+      // dart:io puts the FULL request URI — access token included — into
+      // WebSocketException messages, so sanitize before storing or logging.
+      _lastSocketError = _sanitizeError(e);
+      developer.log('WebSocket connect failed: $_lastSocketError',
+          name: 'live.socket');
       if (generation != _generation) return;
       await _handleConnectionLoss(generation);
     }
   }
 
+  /// Strips the ephemeral access token from error text before it can reach
+  /// logs, [_lastSocketError], or user-facing messages. dart:io embeds the
+  /// full request URI (including ?access_token=...) in handshake errors.
+  String _sanitizeError(Object error) {
+    var text = '$error';
+    final token = _token?.token;
+    if (token != null && token.isNotEmpty) {
+      text = text.replaceAll(token, '<redacted>');
+    }
+    return text.replaceAll(
+        RegExp(r"access_token=[^&'\s]+"), 'access_token=<redacted>');
+  }
+
+  /// A valid BidiGenerateContentSetup, mirroring the server-locked token
+  /// constraints: translationConfig and responseModalities live INSIDE
+  /// generationConfig; the transcription configs and sessionResumption sit
+  /// at the setup level. Misplaced fields get the session closed right
+  /// after setup.
   Map<String, dynamic> _setupMessage(String model, {required bool resuming}) => {
         'setup': {
           'model': model,
           'generationConfig': {
             'responseModalities': ['AUDIO'],
-            'inputAudioTranscription': <String, dynamic>{},
-            'outputAudioTranscription': <String, dynamic>{},
             'translationConfig': {
               'targetLanguageCode': _targetLanguageCode,
               'echoTargetLanguage': true,
             },
           },
+          'inputAudioTranscription': <String, dynamic>{},
+          'outputAudioTranscription': <String, dynamic>{},
           'sessionResumption': {
             if (resuming && _resumeHandle != null) 'handle': _resumeHandle,
           },
@@ -357,9 +409,29 @@ class LiveTranslationService {
 
   void _onSocketClosed(int generation) {
     if (generation != _generation) return;
+    final socket = _socket;
+    developer.log(
+        'WebSocket closed: code=${socket?.closeCode} '
+        'reason=${socket?.closeReason} setupComplete=$_setupDone',
+        name: 'live.socket');
+    // The close-frame fallback must not clobber a more specific error the
+    // stream onError handler recorded moments earlier.
+    if (socket != null && !_setupDone && !_socketErrorRecorded) {
+      _lastSocketError =
+          'closed during setup (code=${socket.closeCode}, reason=${socket.closeReason})';
+    }
+    // A connection that died during setup leaves its 15s timer armed; kill
+    // it so it cannot fire into a later reconnect of the same generation.
+    _setupTimer?.cancel();
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _socket = null;
+    if (socket != null) {
+      // Really close it. Cancelling the stream subscription alone leaves the
+      // underlying WebSocket (and its server-side session) open — on the
+      // setup-timeout path this is the ONLY close. Idempotent on dead sockets.
+      socket.close().ignore();
+    }
     unawaited(_handleConnectionLoss(generation));
   }
 
@@ -440,6 +512,14 @@ class LiveTranslationService {
     } else {
       return;
     }
+    if (!_firstFrameLogged) {
+      _firstFrameLogged = true;
+      // First frame per connection tells us how the server answered setup.
+      developer.log(
+          'first server message (${text.length} chars): '
+          '${text.length > 500 ? '${text.substring(0, 500)}…' : text}',
+          name: 'live.socket');
+    }
     final Map<String, dynamic> message;
     try {
       message = jsonDecode(text) as Map<String, dynamic>;
@@ -448,6 +528,7 @@ class LiveTranslationService {
     }
 
     if (message.containsKey('setupComplete')) {
+      developer.log('setupComplete received', name: 'live.socket');
       unawaited(_onSetupComplete(generation));
       return;
     }
