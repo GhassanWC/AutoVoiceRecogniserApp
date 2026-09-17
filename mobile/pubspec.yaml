@@ -30,6 +30,29 @@ dev_dependencies:
     sdk: flutter
   flutter_lints: ^4.0.0
   fake_cloud_firestore: ^4.2.0
+  # App-icon pipeline: `image` powers tool/generate_app_icons.dart, which
+  # derives the icon layers from ONE source file; flutter_launcher_icons then
+  # writes every platform size. See tool/generate_app_icons.dart.
+  image: ^4.2.0
+  flutter_launcher_icons: ^0.14.1
 
 flutter:
   uses-material-design: true
+
+# Launcher icons. To change the icon, replace
+# assets/branding/app_icon_source.png and run:
+#   dart run tool/generate_app_icons.dart
+# (that rebuilds the layers below, then invokes flutter_launcher_icons)
+flutter_launcher_icons:
+  image_path: "assets/icon/app_icon.png"
+  # iOS: square, full-bleed, no alpha (Apple rejects transparent app icons and
+  # applies its own corner mask).
+  ios: true
+  remove_alpha_ios: true
+  background_color_ios: "#1560FF"
+  # Android: legacy bitmap icon plus a true adaptive icon (separate backdrop
+  # and mark layers so launcher masking/parallax behave correctly).
+  android: "ic_launcher"
+  adaptive_icon_background: "assets/icon/app_icon_background.png"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+  min_sdk_android: 21
