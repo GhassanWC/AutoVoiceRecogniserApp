@@ -1,4 +1,4 @@
-# Live Translator — Architecture
+# Sayvo — Architecture
 
 Final production architecture (September 2026). This replaces every previous
 speech/translation experiment: the Node backend (OpenAI Realtime / Deepgram),

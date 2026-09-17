@@ -1,4 +1,4 @@
-# Live Translator — Flutter app
+# Sayvo — Flutter app
 
 See the root `README.md` for project setup and `docs/ARCHITECTURE.md` for the
 full architecture. Short version: Firebase Auth/Firestore/App Check, and live

@@ -73,7 +73,7 @@ class AuthScaffold extends StatelessWidget {
   }
 }
 
-/// The Live Translator mark: a glowing gradient disc with the translate glyph.
+/// The Sayvo mark: a glowing gradient disc with the translate glyph.
 class BrandMark extends StatelessWidget {
   const BrandMark({super.key, this.size = 74});
 

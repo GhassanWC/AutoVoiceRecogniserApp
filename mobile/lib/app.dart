@@ -6,14 +6,14 @@ import 'models/app_settings.dart';
 import 'services/storage/settings_store.dart';
 import 'theme/app_theme.dart';
 
-class LiveTranslatorApp extends StatelessWidget {
-  const LiveTranslatorApp({super.key});
+class SayvoApp extends StatelessWidget {
+  const SayvoApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     final settings = context.watch<SettingsController>().settings;
     return MaterialApp(
-      title: 'Live Translator',
+      title: 'Sayvo',
       debugShowCheckedModeBanner: false,
       // One midnight identity — the design language is deliberately dark-only.
       theme: AppTheme.midnight(),

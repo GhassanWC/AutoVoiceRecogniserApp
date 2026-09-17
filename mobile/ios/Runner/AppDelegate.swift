@@ -2,7 +2,7 @@ import AVFoundation
 import Flutter
 import UIKit
 
-/// Native audio for Live Translator: environmental microphone capture
+/// Native audio for Sayvo: environmental microphone capture
 /// (16 kHz mono PCM16 chunks streamed to Dart) and streamed PCM playback
 /// (Gemini's 24 kHz translated speech).
 ///

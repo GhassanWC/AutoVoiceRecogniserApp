@@ -1,4 +1,4 @@
-# Live Translator
+# Sayvo
 
 Flutter iOS/Android app that listens to speech around you, auto-detects the
 spoken language, and shows + speaks live translations into your chosen

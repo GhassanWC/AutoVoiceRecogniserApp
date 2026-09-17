@@ -123,7 +123,7 @@ workflows:
           set -e
 
           echo "========================================"
-          echo "Building Live Translator"
+          echo "Building Sayvo"
           echo "Version: 1.0.0"
           echo "Build: $BUILD_NUMBER"
           echo "========================================"

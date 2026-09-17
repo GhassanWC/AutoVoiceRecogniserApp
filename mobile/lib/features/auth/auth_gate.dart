@@ -42,7 +42,7 @@ class _Splash extends StatelessWidget {
             children: [
               const BrandMark(size: 88),
               const SizedBox(height: 20),
-              Text('Live Translator',
+              Text('Sayvo',
                   style: theme.textTheme.headlineSmall
                       ?.copyWith(fontWeight: FontWeight.w800)),
               const SizedBox(height: 6),

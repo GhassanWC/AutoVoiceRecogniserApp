@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-/// The Live Translator design language: deep midnight navy, electric
+/// The Sayvo design language: deep midnight navy, electric
 /// blue→violet gradients, glass surfaces. One identity — the app is
 /// deliberately dark-first; there is no separate light theme.
 abstract final class AppColors {

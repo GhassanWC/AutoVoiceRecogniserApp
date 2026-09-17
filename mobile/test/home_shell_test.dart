@@ -240,7 +240,7 @@ void main() {
     await _pumpFrames(tester);
 
     expect(tester.takeException(), isNull);
-    expect(find.text('Live Translator'), findsOneWidget);
+    expect(find.text('Sayvo'), findsOneWidget);
     expect(find.text('Tap to start listening'), findsOneWidget);
     expect(find.bySemanticsLabel('Start listening'), findsOneWidget);
 

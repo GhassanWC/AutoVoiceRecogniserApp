@@ -53,7 +53,7 @@ class PrivacyPolicyScreen extends StatelessWidget {
     (
       'Local laws',
       'Laws about recording or transcribing conversations around you vary by country '
-          'and region. You are responsible for using Live Translator in a lawful and '
+          'and region. You are responsible for using Sayvo in a lawful and '
           'respectful way — when in doubt, tell people nearby that translation is running.'
     ),
   ];
@@ -85,7 +85,7 @@ class PrivacyPolicyScreen extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
           children: [
             Text(
-              'Privacy is a core feature of Live Translator, not an afterthought.',
+              'Privacy is a core feature of Sayvo, not an afterthought.',
               style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 16),

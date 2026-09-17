@@ -57,7 +57,7 @@ Future<void> main() async {
           ),
         ),
       ],
-      child: const LiveTranslatorApp(),
+      child: const SayvoApp(),
     ),
   );
 }

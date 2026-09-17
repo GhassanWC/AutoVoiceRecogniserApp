@@ -64,7 +64,7 @@ void main() {
   testWidgets('unknown auth state shows the splash', (tester) async {
     await pumpGate(tester);
     expect(find.byType(CircularProgressIndicator), findsOneWidget);
-    expect(find.text('Live Translator'), findsOneWidget);
+    expect(find.text('Sayvo'), findsOneWidget);
   });
 
   testWidgets('signed-out shows the sign-in screen', (tester) async {

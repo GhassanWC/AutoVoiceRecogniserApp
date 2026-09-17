@@ -305,7 +305,7 @@ class _Header extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('Live Translator',
+                Text('Sayvo',
                     style: theme.textTheme.headlineSmall
                         ?.copyWith(fontWeight: FontWeight.w800)),
                 Text(

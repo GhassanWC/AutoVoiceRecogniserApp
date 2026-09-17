@@ -158,7 +158,7 @@ class ProfileScreen extends StatelessWidget {
           padding: EdgeInsets.symmetric(horizontal: 12, vertical: 4),
           child: ProfileMenuTile(
             icon: Icons.info_outline_rounded,
-            title: 'Live Translator',
+            title: 'Sayvo',
             subtitle: 'Different languages. A closer world.',
           ),
         ),

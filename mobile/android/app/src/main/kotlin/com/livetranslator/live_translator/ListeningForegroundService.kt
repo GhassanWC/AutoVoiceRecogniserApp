@@ -60,7 +60,7 @@ class ListeningForegroundService : Service() {
         )
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Live Translator is listening")
+            .setContentTitle("Sayvo is listening")
             .setContentText("Translating nearby speech. Audio is not saved.")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(openPending)

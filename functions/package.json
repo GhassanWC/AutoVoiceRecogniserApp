@@ -1,7 +1,7 @@
 {
   "name": "live-translator-functions",
   "private": true,
-  "description": "Firebase Cloud Functions for Live Translator (Gemini ephemeral token minting).",
+  "description": "Firebase Cloud Functions for Sayvo (Gemini ephemeral token minting).",
   "engines": {
     "node": "22"
   },
