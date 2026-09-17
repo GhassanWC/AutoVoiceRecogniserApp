@@ -7,6 +7,36 @@ import '../../../theme/app_colors.dart';
 import '../../../theme/app_theme.dart';
 import '../../../utils/languages.dart';
 
+/// Speaker affordance on a finalized translation — the only way translated
+/// audio is ever heard now.
+class _SpeakerButton extends StatelessWidget {
+  const _SpeakerButton({required this.onPressed, required this.isPlaying});
+
+  final Future<void> Function() onPressed;
+  final bool isPlaying;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: isPlaying ? 'Playing translation' : 'Play translation',
+      child: InkResponse(
+        onTap: () => onPressed(),
+        radius: 22,
+        child: Padding(
+          // Keeps the tap target comfortable without enlarging the row.
+          padding: const EdgeInsets.all(6),
+          child: Icon(
+            isPlaying ? Icons.volume_up_rounded : Icons.volume_up_outlined,
+            size: 18,
+            color: isPlaying ? AppColors.electricCyan : AppColors.textSecondary,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// One translated utterance. The translation is the hero; the original is a
 /// quiet second line. Both use proper bidirectional text handling — the
 /// translation follows the target language's direction, the original follows
@@ -21,14 +51,22 @@ class MessageBubble extends StatelessWidget {
     this.onReplay,
     this.onReport,
     this.onRetry,
+    this.isPlaying = false,
   });
 
   final TranslationMessage message;
   final bool showOriginal;
   final bool showTimestamp;
   final bool showLanguageLabels;
+
+  /// Plays this translation out loud. Null when no audio was kept for it
+  /// (older messages, history, or translated-audio retention turned off), and
+  /// the speaker button is then hidden rather than shown doing nothing.
   final Future<void> Function()? onReplay;
   final VoidCallback? onReport;
+
+  /// This message's translation is currently playing.
+  final bool isPlaying;
 
   /// Resubmits a failed translation (same text, no re-recording).
   final VoidCallback? onRetry;
@@ -86,6 +124,11 @@ class MessageBubble extends StatelessWidget {
                         style: theme.textTheme.labelSmall
                             ?.copyWith(color: AppColors.textTertiary),
                       ),
+                    if (onReplay != null &&
+                        message.status == TranslationStatus.done) ...[
+                      const SizedBox(width: 4),
+                      _SpeakerButton(onPressed: onReplay!, isPlaying: isPlaying),
+                    ],
                   ],
                 ),
                 const SizedBox(height: 8),
@@ -208,7 +251,7 @@ class MessageBubble extends StatelessWidget {
             if (onReplay != null)
               ListTile(
                 leading: const Icon(Icons.volume_up_rounded),
-                title: const Text('Replay'),
+                title: const Text('Play translation'),
                 onTap: () {
                   Navigator.pop(sheetContext);
                   onReplay!();

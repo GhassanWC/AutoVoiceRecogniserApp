@@ -578,6 +578,11 @@ class _TranscriptView extends StatelessWidget {
               showTimestamp: showTimestamps,
               showLanguageLabels: showLanguageLabels,
               onReport: () => controller.reportBadTranslation(message),
+              // Translated audio plays only when the user taps this.
+              onReplay: controller.hasTranslationAudio(message.id)
+                  ? () => controller.playTranslation(message.id)
+                  : null,
+              isPlaying: controller.playingMessageId == message.id,
             );
           },
         ),

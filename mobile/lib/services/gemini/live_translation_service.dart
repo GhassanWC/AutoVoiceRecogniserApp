@@ -93,7 +93,7 @@ class TranscriptUpdate extends LiveTranslateEvent {
   final String? sourceLanguageCode;
 }
 
-/// The utterance is complete — this is what gets persisted.
+/// The utterance is complete — the TEXT here is what gets persisted.
 class UtteranceFinalized extends LiveTranslateEvent {
   const UtteranceFinalized({
     required this.utteranceId,
@@ -101,12 +101,18 @@ class UtteranceFinalized extends LiveTranslateEvent {
     required this.translatedText,
     required this.at,
     this.sourceLanguageCode,
+    this.audio,
   });
   final String utteranceId;
   final String sourceText;
   final String translatedText;
   final DateTime at;
   final String? sourceLanguageCode;
+
+  /// Gemini's spoken translation for this utterance (24 kHz mono PCM16), kept
+  /// so the user can replay it on demand. It is NEVER played automatically and
+  /// NEVER persisted — it lives in memory for this session only.
+  final Uint8List? audio;
 }
 
 class ServiceError extends LiveTranslateEvent {
@@ -217,6 +223,14 @@ class LiveTranslationService {
   final StringBuffer _translationBuffer = StringBuffer();
   String? _sourceLanguageCode;
 
+  /// Gemini's spoken translation for the utterance in flight. Collected, never
+  /// auto-played — see [start]'s `playAudio`.
+  final BytesBuilder _utteranceAudio = BytesBuilder(copy: true);
+
+  /// Ceiling on the audio kept for a single utterance (~20 s at 24 kHz PCM16),
+  /// so one very long turn cannot balloon memory.
+  static const int _maxUtteranceAudioBytes = 960000;
+
   // Half-duplex gate.
   bool _playbackActive = false;
   DateTime _gateUntil = DateTime.fromMillisecondsSinceEpoch(0);
@@ -285,6 +299,13 @@ class LiveTranslationService {
   /// Starts a session translating into [targetLanguageCode] (BCP-47, already
   /// mapped through geminiCodeFor). Microphone capture must be permitted
   /// beforehand — permission UX is the controller's job.
+  ///
+  /// [playAudio] keeps Gemini's spoken translation for each utterance so the
+  /// user can replay it from that message. Translated audio is NEVER played
+  /// automatically: doing so put the device's own speaker into the room while
+  /// the microphone was live, which gated the uplink and stopped the session
+  /// translating anything after the first utterance. Playback now happens only
+  /// via [playTranslationAudio], on an explicit tap.
   Future<void> start({required String targetLanguageCode, required bool playAudio}) async {
     if (_state != LiveServiceState.idle && _state != LiveServiceState.error) return;
     final generation = ++_generation;
@@ -347,6 +368,27 @@ class LiveTranslationService {
     _token = null;
     _resumeHandle = null;
     _setState(LiveServiceState.idle);
+  }
+
+  /// Plays ONE finalized translation's audio through the speaker, on an
+  /// explicit user action.
+  ///
+  /// The session is untouched: state stays [LiveServiceState.listening], the
+  /// socket stays open and capture keeps running. The uplink is gated only
+  /// while this clip is audible — otherwise the speaker would feed straight
+  /// back into the live microphone and be re-translated — and that gate is
+  /// bounded by the clip's own length, so a session can never be left deaf.
+  Future<void> playTranslationAudio(Uint8List audio) async {
+    if (audio.isEmpty) return;
+    liveTrace('MANUAL_PLAYBACK', '${audio.length}B '
+        '(${(audio.length / _playbackBytesPerSecond).toStringAsFixed(1)}s) '
+        'state=${_state.name}');
+    // Restart the player so a clip tapped while another is draining replaces
+    // it instead of queueing behind it.
+    await playback.stop();
+    await playback.start();
+    _noteQueuedAudio(audio.length);
+    await playback.feed(audio);
   }
 
   Future<void> dispose() async {
@@ -474,8 +516,8 @@ class LiveTranslationService {
       }
     }
     if (generation != _generation) return;
-    if (_playAudio) await playback.start();
-    if (generation != _generation) return;
+    // Playback is NOT started here: nothing plays until the user taps a
+    // message's speaker button.
     _setState(LiveServiceState.listening);
     liveTrace('SETUP_COMPLETE',
         'capture=$_captureRunning playAudio=$_playAudio target=$_targetLanguageCode');
@@ -636,9 +678,11 @@ class LiveTranslationService {
     }
 
     if (content['interrupted'] == true) {
-      liveTrace('MODEL_INTERRUPTED', 'flushing queued translated audio');
-      _queuedAudioEndsAt = DateTime.fromMillisecondsSinceEpoch(0);
-      unawaited(playback.stop());
+      // The model's turn was cut short, so the audio collected for it is
+      // partial — drop it. Any playback the USER started is left alone.
+      liveTrace('MODEL_INTERRUPTED',
+          'dropping ${_utteranceAudio.length}B of partial translated audio');
+      _utteranceAudio.clear();
     }
 
     final input = content['inputTranscription'];
@@ -686,11 +730,12 @@ class LiveTranslationService {
           final data = inline['data'];
           if (data is String && (mime is! String || mime.startsWith('audio/pcm'))) {
             try {
-              final bytes = base64Decode(data);
-              // Track how much audio time is queued so a lost "finished"
-              // callback from the player cannot gate the microphone forever.
-              _noteQueuedAudio(bytes.length);
-              unawaited(playback.feed(bytes));
+              // KEPT, NOT PLAYED. Nothing here may touch the playback device
+              // or the uplink gate: translated audio arriving must never stop
+              // the microphone streaming to Gemini.
+              if (_utteranceAudio.length < _maxUtteranceAudioBytes) {
+                _utteranceAudio.add(base64Decode(data));
+              }
             } catch (_) {
               // Malformed audio chunk — skip; transcripts are unaffected.
             }
@@ -729,12 +774,14 @@ class LiveTranslationService {
     final source = _sourceBuffer.toString().trim();
     final translation = _translationBuffer.toString().trim();
     if (source.isNotEmpty || translation.isNotEmpty) {
+      final audio = _utteranceAudio.isEmpty ? null : _utteranceAudio.toBytes();
       _events.add(UtteranceFinalized(
         utteranceId: id,
         sourceText: source,
         translatedText: translation,
         sourceLanguageCode: _sourceLanguageCode,
         at: _now(),
+        audio: audio,
       ));
     }
     _resetUtterance();
@@ -745,6 +792,7 @@ class LiveTranslationService {
     _sourceBuffer.clear();
     _translationBuffer.clear();
     _sourceLanguageCode = null;
+    _utteranceAudio.clear();
   }
 
   // ── Microphone uplink ───────────────────────────────────────────────────────

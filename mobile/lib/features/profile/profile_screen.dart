@@ -80,8 +80,8 @@ class ProfileScreen extends StatelessWidget {
               ),
               _ToggleTile(
                 icon: Icons.volume_up_outlined,
-                title: 'Speak translations',
-                subtitle: 'Play the translated voice out loud',
+                title: 'Keep translated voice',
+                subtitle: 'Adds a play button to each translation',
                 value: settings.autoSpeak,
                 onChanged: (value) =>
                     controller.update((s) => s.copyWith(autoSpeak: value)),

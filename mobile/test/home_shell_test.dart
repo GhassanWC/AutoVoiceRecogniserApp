@@ -88,12 +88,16 @@ class _FakeCapture extends AudioCaptureService {
 class _FakePlayback extends AudioPlaybackService {
   final StreamController<bool> active = StreamController<bool>.broadcast();
   int fedChunks = 0;
+  int fedBytes = 0;
   @override
   Stream<bool> get playbackActive => active.stream;
   @override
   Future<void> start() async {}
   @override
-  Future<void> feed(Uint8List pcm) async => fedChunks++;
+  Future<void> feed(Uint8List pcm) async {
+    fedChunks++;
+    fedBytes += pcm.length;
+  }
   @override
   Future<void> stop() async {}
   @override
@@ -403,6 +407,79 @@ void main() {
     expect(tester.takeException(), isNull);
 
     // Release the session (and the diagnostics health timer) before teardown.
+    await h.live.stopListening();
+    await _pumpFrames(tester);
+  });
+
+  testWidgets('translated audio plays only when the speaker button is tapped',
+      (tester) async {
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final h = _ShellHarness();
+    await h.settings.setTargetLanguage('ar');
+    await h.pumpShell(tester);
+    await tester.tap(find.bySemanticsLabel('Start listening'));
+    await _pumpFrames(tester);
+    final socket = h.sockets.single;
+    socket.serverSends({'setupComplete': {}});
+    await _pumpFrames(tester);
+
+    socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'Where is the metro?', 'languageCode': 'en'}
+      }
+    });
+    socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'أين المترو؟'}
+      }
+    });
+    socket.serverSends({
+      'serverContent': {
+        'modelTurn': {
+          'parts': [
+            {
+              'inlineData': {
+                'mimeType': 'audio/pcm;rate=24000',
+                'data': base64Encode(List.filled(48000, 4)),
+              }
+            }
+          ]
+        }
+      }
+    });
+    socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await _pumpFrames(tester);
+
+    // Nothing played by itself, and the listening pill never claims to be
+    // speaking — the session just keeps listening.
+    expect(h.playback.fedChunks, 0);
+    expect(find.textContaining('Speaking translation'), findsNothing);
+    expect(find.text('Listening…'), findsOneWidget);
+    expect(h.live.state, ListeningState.listening);
+
+    // The speaker button is offered on the finalized translation, and only a
+    // tap produces sound. (The bubble's own Semantics merges child labels, so
+    // match the label loosely and tap the icon itself.)
+    final speaker = find.byIcon(Icons.volume_up_outlined);
+    expect(speaker, findsOneWidget);
+    expect(find.bySemanticsLabel(RegExp('Play translation')), findsWidgets);
+    await tester.tap(speaker);
+    await _pumpFrames(tester);
+    expect(h.playback.fedBytes, 48000);
+
+    // Replaying does not disturb the session.
+    expect(h.live.state, ListeningState.listening);
+    expect(h.capture.startCalls, 1);
+    expect(h.capture.stopCalls, 0);
+    expect(h.sockets, hasLength(1));
+    expect(tester.takeException(), isNull);
+
     await h.live.stopListening();
     await _pumpFrames(tester);
   });

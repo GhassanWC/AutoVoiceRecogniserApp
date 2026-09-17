@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:developer' as developer;
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
@@ -58,7 +59,8 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   /// Whole on-screen conversation (survives stop; cleared by the user).
   final List<TranslationMessage> messages = [];
 
-  /// "Speaking translation…" etc. under the Listening pill.
+  /// Transient status under the Listening pill. Translated audio no longer
+  /// plays by itself, so nothing here ever reports "Speaking translation…".
   String? activityLabel;
 
   /// 0..1 microphone level for the waveform animation.
@@ -71,6 +73,24 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   /// Set when a session just ended, so the UI can show the summary sheet.
   SessionSummary? lastSummary;
+
+  /// Gemini's spoken translation per message id, kept in memory for THIS
+  /// session so a message can be replayed on demand. Never persisted (audio
+  /// is never stored — see the privacy policy) and never played automatically.
+  final Map<String, Uint8List> _translationAudio = {};
+  int _translationAudioBytes = 0;
+
+  /// ~2 minutes of 24 kHz PCM16 across the whole conversation; the oldest
+  /// clips are dropped first so a long session cannot grow without bound.
+  static const int _maxRetainedAudioBytes = 6000000;
+
+  /// Message whose translation is playing right now (null when silent).
+  String? _playingMessageId;
+  String? get playingMessageId => _playingMessageId;
+
+  /// Whether [messageId] has audio available to replay.
+  bool hasTranslationAudio(String messageId) =>
+      _translationAudio.containsKey(messageId);
 
   final StreamController<String> _notices = StreamController.broadcast();
 
@@ -148,6 +168,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     await _service.stop();
     state = ListeningState.idle;
     activityLabel = null;
+    _playingMessageId = null;
     micLevel = 0;
     lastSummary = SessionSummary(
       translationCount: _persistedCount,
@@ -208,6 +229,10 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
           status: TranslationStatus.pending,
         );
       case UtteranceFinalized():
+        // Retain BEFORE applying the transcript: _applyTranscript notifies
+        // listeners, and the speaker button is only offered for messages that
+        // already have audio.
+        _retainAudio(event.utteranceId, event.audio);
         _applyTranscript(
           event.utteranceId,
           sourceText: event.sourceText,
@@ -336,9 +361,42 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     }
   }
 
+  /// Only a manual replay reaches this now; when it finishes, the message
+  /// stops showing its playing state. The listening pill is untouched.
   void _onSpeaking(bool speaking) {
-    activityLabel = speaking ? 'Speaking translation…' : null;
+    if (speaking || _playingMessageId == null) return;
+    _playingMessageId = null;
     notifyListeners();
+  }
+
+  // ── On-demand translation playback ──────────────────────────────────────────
+
+  void _retainAudio(String messageId, Uint8List? audio) {
+    if (audio == null || audio.isEmpty) return;
+    _translationAudio[messageId] = audio;
+    _translationAudioBytes += audio.length;
+    // Drop the oldest clips first (insertion-ordered map).
+    while (_translationAudioBytes > _maxRetainedAudioBytes &&
+        _translationAudio.length > 1) {
+      final oldest = _translationAudio.keys.first;
+      _translationAudioBytes -= _translationAudio.remove(oldest)!.length;
+    }
+  }
+
+  /// Plays one finalized translation out loud, on an explicit tap. Listening
+  /// keeps running throughout — this never stops or restarts the session.
+  Future<void> playTranslation(String messageId) async {
+    final audio = _translationAudio[messageId];
+    if (audio == null) return;
+    _playingMessageId = messageId;
+    notifyListeners();
+    try {
+      await _service.playTranslationAudio(audio);
+    } catch (e) {
+      developer.log('translation playback failed: $e', name: 'live');
+      _playingMessageId = null;
+      notifyListeners();
+    }
   }
 
   // ── Settings changes (target language switch restarts the session) ─────────
@@ -366,6 +424,9 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   void clearConversation() {
     messages.clear();
+    _translationAudio.clear();
+    _translationAudioBytes = 0;
+    _playingMessageId = null;
     lastSummary = null;
     notifyListeners();
   }
