@@ -7,6 +7,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:live_translator/features/live_translation/live_translation_controller.dart';
+import 'package:live_translator/features/live_translation/live_translation_screen.dart';
 import 'package:live_translator/features/profile/profile_screen.dart';
 import 'package:live_translator/features/shell/home_shell.dart';
 import 'package:live_translator/services/audio/audio_capture_service.dart';
@@ -38,8 +39,14 @@ class _FakeSocket implements GeminiSocket {
   String? closeReason;
   @override
   Stream<dynamic> get messages => incoming.stream;
+
+  /// Count of realtimeInput (microphone) frames actually sent upstream.
+  int audioFrames = 0;
+
   @override
-  void send(String data) {}
+  void send(String data) {
+    if (data.contains('realtimeInput')) audioFrames++;
+  }
   @override
   Future<void> close() async {
     // Not awaited for the same FakeAsync reason (close() after cancel also
@@ -52,26 +59,41 @@ class _FakeSocket implements GeminiSocket {
 
 class _FakeCapture extends AudioCaptureService {
   bool running = false;
+  int startCalls = 0;
+  int stopCalls = 0;
+  void Function(Uint8List pcm)? onAudio;
+
   @override
   bool get isCapturing => running;
   @override
   Future<void> start({
     required void Function(Uint8List pcm) onAudio,
     required void Function(String reason) onStopped,
-  }) async =>
-      running = true;
+  }) async {
+    startCalls++;
+    running = true;
+    this.onAudio = onAudio;
+  }
+
   @override
-  Future<void> stop() async => running = false;
+  Future<void> stop() async {
+    stopCalls++;
+    running = false;
+  }
+
+  /// ~100 ms of 16 kHz PCM16 — one full uplink chunk.
+  void emitChunk() => onAudio!(Uint8List.fromList(List.filled(3200, 7)));
 }
 
 class _FakePlayback extends AudioPlaybackService {
   final StreamController<bool> active = StreamController<bool>.broadcast();
+  int fedChunks = 0;
   @override
   Stream<bool> get playbackActive => active.stream;
   @override
   Future<void> start() async {}
   @override
-  Future<void> feed(Uint8List pcm) async {}
+  Future<void> feed(Uint8List pcm) async => fedChunks++;
   @override
   Future<void> stop() async {}
   @override
@@ -121,10 +143,11 @@ class _ShellHarness {
         sockets.add(socket);
         return socket;
       },
-      capture: _FakeCapture(),
-      playback: _FakePlayback(),
+      capture: capture,
+      playback: playback,
       backoffDelays: const [Duration.zero],
-      playbackGateTail: Duration.zero,
+      playbackGateTail: const Duration(milliseconds: 300),
+      now: () => clock,
       isOnline: () async => true,
     );
     live = LiveTranslationController(
@@ -144,6 +167,12 @@ class _ShellHarness {
   final FakeFirebaseFirestore firestore = FakeFirebaseFirestore();
   final _FakeFirebaseAuth firebaseAuth = _FakeFirebaseAuth();
   final List<_FakeSocket> sockets = [];
+  final _FakeCapture capture = _FakeCapture();
+  final _FakePlayback playback = _FakePlayback();
+
+  /// Drives the service's half-duplex gate clock (real 300 ms tail).
+  DateTime clock = DateTime.utc(2026, 9, 17, 12);
+
   late final SettingsController settings;
   late final LiveTranslationService service;
   late final LiveTranslationController live;
@@ -273,5 +302,108 @@ void main() {
     expect(h.live.state, ListeningState.idle);
     expect(find.text('Translation stopped'), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  // THE multi-turn regression guard at the UI level: one Start Listening,
+  // two utterances, both rendered — the redesigned widget tree must not
+  // dispose/recreate the controller or service after the first translation.
+  testWidgets('one listening session renders TWO consecutive translations',
+      (tester) async {
+    // Roomy viewport: this test is about behavior, not small-screen layout.
+    tester.view.physicalSize = const Size(390, 844);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final h = _ShellHarness();
+    await h.settings.setTargetLanguage('ar');
+    await h.pumpShell(tester);
+
+    await tester.tap(find.bySemanticsLabel('Start listening'));
+    await _pumpFrames(tester);
+    h.sockets.single.serverSends({'setupComplete': {}});
+    await _pumpFrames(tester);
+    expect(h.live.state, ListeningState.listening);
+
+    final screenState =
+        tester.state<State<LiveTranslationScreen>>(find.byType(LiveTranslationScreen));
+    final socket = h.sockets.single;
+
+    // ── Utterance 1 ──────────────────────────────────────────────────────
+    h.capture.emitChunk();
+    socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'Where is the metro?', 'languageCode': 'en'}
+      }
+    });
+    socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'أين المترو؟'}
+      }
+    });
+    // Translated speech plays, then finishes.
+    h.playback.active.add(true);
+    await _pumpFrames(tester);
+    socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await _pumpFrames(tester);
+
+    expect(find.text('أين المترو؟'), findsOneWidget);
+    expect(find.text('Where is the metro?'), findsOneWidget);
+    // The session must survive the first turn.
+    expect(h.live.state, ListeningState.listening);
+    expect(h.live.isListening, isTrue);
+    expect(h.capture.stopCalls, 0, reason: 'microphone must stay hot');
+    expect(h.capture.startCalls, 1, reason: 'capture started exactly once');
+    expect(socket.incoming.isClosed, isFalse, reason: 'WebSocket stays open');
+
+    // The screen (and thus its controller subscriptions) must NOT be rebuilt
+    // from scratch when the hero view is replaced by the transcript view.
+    expect(
+      tester.state<State<LiveTranslationScreen>>(find.byType(LiveTranslationScreen)),
+      same(screenState),
+      reason: 'the live screen must not be recreated after the first translation',
+    );
+
+    // Playback ended → the gate must reopen after the 300 ms tail so the
+    // next utterance can actually reach Gemini.
+    h.playback.active.add(false);
+    await _pumpFrames(tester);
+    h.clock = h.clock.add(const Duration(milliseconds: 301));
+    final sentBefore = socket.audioFrames;
+    h.capture.emitChunk();
+    expect(socket.audioFrames, sentBefore + 1,
+        reason: 'mic uplink must resume after the translated audio finishes');
+
+    // ── Utterance 2 (same session) ───────────────────────────────────────
+    socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'How much is the ticket?', 'languageCode': 'en'}
+      }
+    });
+    socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'كم سعر التذكرة؟'}
+      }
+    });
+    socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await _pumpFrames(tester);
+
+    // BOTH translations on screen, in their own bubbles.
+    expect(find.text('أين المترو؟'), findsOneWidget);
+    expect(find.text('كم سعر التذكرة؟'), findsOneWidget);
+    expect(h.live.messages, hasLength(2));
+    // Still one uninterrupted session.
+    expect(h.sockets, hasLength(1), reason: 'no reconnect');
+    expect(h.capture.startCalls, 1, reason: 'no capture restart');
+    expect(h.live.state, ListeningState.listening);
+    expect(tester.takeException(), isNull);
+
+    // Release the session (and the diagnostics health timer) before teardown.
+    await h.live.stopListening();
+    await _pumpFrames(tester);
   });
 }

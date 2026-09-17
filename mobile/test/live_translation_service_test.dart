@@ -93,11 +93,16 @@ class Harness {
     bool online = false,
     Duration setupTimeout = const Duration(seconds: 15),
     Future<GeminiSocket> Function(Uri uri)? connectOverride,
+    // Real production tail (300 ms) + a controllable clock let a test prove
+    // the half-duplex gate REOPENS instead of latching closed.
+    Duration playbackGateTail = Duration.zero,
+    DateTime Function()? now,
   }) {
     var call = 0;
     service = LiveTranslationService(
       isOnline: () async => online,
       setupTimeout: setupTimeout,
+      now: now,
       tokenProvider: (target) async {
         tokenRequests.add(target);
         final error = call < tokenErrors.length ? tokenErrors[call] : null;
@@ -119,11 +124,13 @@ class Harness {
       capture: capture,
       playback: playback,
       backoffDelays: const [Duration.zero, Duration.zero, Duration.zero],
-      playbackGateTail: Duration.zero,
+      playbackGateTail: playbackGateTail,
       utteranceIdFactory: () => 'utt-${++utteranceCounter}',
     );
     service.events.listen(events.add);
     service.stateChanges.listen(states.add);
+    // Releases the diagnostics health timer so it cannot leak between tests.
+    addTearDown(service.stop);
   }
 
   final FakeCapture capture = FakeCapture();
@@ -325,6 +332,139 @@ void main() {
     });
     await h.pump();
     expect(h.events.whereType<TranscriptUpdate>().last.utteranceId, 'utt-2');
+  });
+
+  // The multi-turn regression guard: ONE Start Listening must translate an
+  // unlimited number of utterances. Exercises the full lifecycle —
+  // setupComplete → mic → utterance 1 → translated audio → turnComplete →
+  // utterance 2 — with the REAL 300 ms playback tail.
+  test('ONE session translates TWO consecutive utterances (no restart)', () async {
+    var clock = DateTime.utc(2026, 9, 17, 12);
+    final h = Harness(
+      playbackGateTail: const Duration(milliseconds: 300),
+      now: () => clock,
+    );
+    await h.startListening();
+    final socket = h.socket;
+    expect(h.service.state, LiveServiceState.listening);
+
+    // ── Utterance 1 ──────────────────────────────────────────────────────
+    h.mic();
+    expect(h.sentAudio(socket), hasLength(1), reason: 'mic streams once listening');
+
+    socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'Where is the metro?', 'languageCode': 'en'}
+      }
+    });
+    socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'أين المترو؟'}
+      }
+    });
+    // Translated speech starts playing → the half-duplex gate closes so the
+    // speaker output cannot loop back in.
+    h.playback.active.add(true);
+    await h.pump();
+    h.mic();
+    expect(h.sentAudio(socket), hasLength(1), reason: 'gated while device speaks');
+
+    socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final first = h.events.whereType<UtteranceFinalized>().single;
+    expect(first.sourceText, 'Where is the metro?');
+    expect(first.translatedText, 'أين المترو؟');
+
+    // turnComplete finalizes the bubble ONLY — it must not end the session,
+    // stop capture, or close the socket.
+    expect(h.service.state, LiveServiceState.listening);
+    expect(h.capture.stopCalls, 0, reason: 'microphone must stay hot');
+    expect(h.capture.onAudio, isNotNull, reason: 'capture callback still wired');
+    expect(socket.closed, isFalse, reason: 'WebSocket must stay open');
+
+    // Translated audio finishes → the 300 ms tail must EXPIRE, never latch.
+    h.playback.active.add(false);
+    await h.pump();
+    h.mic();
+    expect(h.sentAudio(socket), hasLength(1), reason: 'still inside the 300ms tail');
+    clock = clock.add(const Duration(milliseconds: 301));
+    h.mic();
+    expect(h.sentAudio(socket), hasLength(2),
+        reason: 'the gate MUST reopen once the tail elapses');
+
+    // ── Utterance 2 (same session) ───────────────────────────────────────
+    socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'How much is the ticket?', 'languageCode': 'en'}
+      }
+    });
+    socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'كم سعر التذكرة؟'}
+      }
+    });
+    socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final finalized = h.events.whereType<UtteranceFinalized>().toList();
+    expect(finalized, hasLength(2), reason: 'the SECOND utterance must finalize too');
+    expect(finalized[1].sourceText, 'How much is the ticket?');
+    expect(finalized[1].translatedText, 'كم سعر التذكرة؟');
+    expect(finalized[1].utteranceId, isNot(finalized[0].utteranceId),
+        reason: 'buffers reset → utterance 2 gets its own bubble');
+
+    // One session start to finish: no new token, no new socket, no restart.
+    expect(h.tokenRequests, hasLength(1));
+    expect(h.sockets, hasLength(1));
+    expect(h.service.state, LiveServiceState.listening);
+  });
+
+  test('a latched "still speaking" claim cannot gate the microphone forever',
+      () async {
+    var clock = DateTime.utc(2026, 9, 17, 12);
+    final h = Harness(
+      playbackGateTail: const Duration(milliseconds: 300),
+      now: () => clock,
+    );
+    await h.startListening();
+    final socket = h.socket;
+
+    // The model sends 1 second of translated audio (24 kHz PCM16 = 48 000 B).
+    socket.serverSends({
+      'serverContent': {
+        'modelTurn': {
+          'parts': [
+            {
+              'inlineData': {
+                'mimeType': 'audio/pcm;rate=24000',
+                'data': base64Encode(List.filled(48000, 1)),
+              }
+            }
+          ]
+        }
+      }
+    });
+    await h.pump();
+
+    // The native player reports "speaking" and then NEVER reports the end —
+    // a lost completion callback (engine reconfiguration / route change).
+    h.playback.active.add(true);
+    await h.pump();
+    h.mic();
+    expect(h.sentAudio(socket), isEmpty,
+        reason: 'gated while the queued audio can still be playing');
+
+    // Past the hard ceiling the claim is stale and the microphone MUST
+    // resume even though playbackActive is still true.
+    clock = clock.add(const Duration(seconds: 12));
+    h.mic();
+    expect(h.sentAudio(socket), hasLength(1),
+        reason: 'a stuck playback claim must never latch the microphone off');
   });
 
   test('a generationComplete followed by turnComplete finalizes only once', () async {

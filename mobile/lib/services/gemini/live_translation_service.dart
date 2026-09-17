@@ -9,6 +9,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import '../../utils/mic_level.dart';
 import '../audio/audio_capture_service.dart';
 import '../audio/audio_playback_service.dart';
+import '../diagnostics/live_diagnostics.dart';
 import '../network/connectivity_probe.dart';
 
 /// Connection lifecycle of one live translation session.
@@ -219,9 +220,65 @@ class LiveTranslationService {
   // Half-duplex gate.
   bool _playbackActive = false;
   DateTime _gateUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// When the audio we have handed to the player can, at the earliest, have
+  /// finished playing (derived from the PCM byte count we fed).
+  DateTime _queuedAudioEndsAt = DateTime.fromMillisecondsSinceEpoch(0);
   final BytesBuilder _pendingAudio = BytesBuilder(copy: true);
 
-  bool get _uplinkGated => _playbackActive || _now().isBefore(_gateUntil);
+  /// Gemini Live output: 24 kHz mono PCM16 → 48 000 bytes per second.
+  static const int _playbackBytesPerSecond =
+      AudioPlaybackService.sampleRate * 2;
+
+  /// Slack for device-side buffering before a "still speaking" claim from the
+  /// native player is treated as stale.
+  static const Duration _playbackClaimSlack = Duration(seconds: 2);
+
+  /// Hard ceiling on how long ONE uninterrupted "still speaking" claim may
+  /// gate the microphone. A single translated utterance is far shorter, and
+  /// the queued-audio horizon already covers legitimately longer queues — this
+  /// exists only so a lost completion callback from the native player (engine
+  /// reconfiguration, route change, flushed buffer) can never latch the uplink
+  /// off for the rest of the session.
+  static const Duration _maxContinuousGate = Duration(seconds: 10);
+
+  DateTime? _playbackActiveSince;
+
+  // Diagnostics only (see live_diagnostics.dart).
+  Timer? _healthTimer;
+  int _chunksSent = 0;
+  int _chunksDropped = 0;
+  DateTime? _lastChunkAt;
+  bool? _lastGateState;
+  String? _lastServerKeys;
+
+  bool get _uplinkGated {
+    final now = _now();
+    if (now.isBefore(_gateUntil)) return true;
+    if (!_playbackActive) return false;
+    // The player says it is still speaking — believe it (that is what keeps
+    // speaker output from looping back in), but never indefinitely.
+    final byQueuedAudio = _queuedAudioEndsAt.add(_playbackClaimSlack);
+    final byCeiling = (_playbackActiveSince ?? now).add(_maxContinuousGate);
+    final deadline = byQueuedAudio.isAfter(byCeiling) ? byQueuedAudio : byCeiling;
+    return now.isBefore(deadline);
+  }
+
+  /// Diagnostics: how much queued translated audio is still due to play.
+  String get _queuedAudioLabel {
+    final remaining = _queuedAudioEndsAt.difference(_now());
+    return remaining.isNegative ? 'none' : '${remaining.inMilliseconds}ms';
+  }
+
+  /// Extends the queued-audio horizon by the play time of [byteLength] bytes.
+  void _noteQueuedAudio(int byteLength) {
+    final now = _now();
+    final start = _queuedAudioEndsAt.isAfter(now) ? _queuedAudioEndsAt : now;
+    _queuedAudioEndsAt = start.add(Duration(
+        microseconds:
+            (byteLength * Duration.microsecondsPerSecond / _playbackBytesPerSecond)
+                .round()));
+  }
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -236,6 +293,17 @@ class LiveTranslationService {
     _reconnectAttempts = 0;
     _resumeHandle = null;
     _lastSocketError = null;
+    _playbackActive = false;
+    _playbackActiveSince = null;
+    _gateUntil = DateTime.fromMillisecondsSinceEpoch(0);
+    _queuedAudioEndsAt = DateTime.fromMillisecondsSinceEpoch(0);
+    _chunksSent = 0;
+    _chunksDropped = 0;
+    _lastChunkAt = null;
+    _lastGateState = null;
+    _lastServerKeys = null;
+    resetLiveTraceThrottles();
+    liveTrace('SESSION_START', 'target=$targetLanguageCode playAudio=$playAudio');
     _resetUtterance();
     _setState(LiveServiceState.connecting);
 
@@ -263,7 +331,11 @@ class LiveTranslationService {
   /// never throw — Start Listening has to become usable again.
   Future<void> stop() async {
     _generation++;
+    _healthTimer?.cancel();
+    _healthTimer = null;
     if (_state == LiveServiceState.idle) return;
+    liveTrace('SESSION_STOP',
+        'sent=$_chunksSent dropped=$_chunksDropped state=${_state.name}');
     _setState(LiveServiceState.stopping);
     _setupTimer?.cancel();
     _reconnectTimer?.cancel();
@@ -405,6 +477,9 @@ class LiveTranslationService {
     if (_playAudio) await playback.start();
     if (generation != _generation) return;
     _setState(LiveServiceState.listening);
+    liveTrace('SETUP_COMPLETE',
+        'capture=$_captureRunning playAudio=$_playAudio target=$_targetLanguageCode');
+    _startHealthTrace();
   }
 
   void _onSocketClosed(int generation) {
@@ -548,9 +623,21 @@ class LiveTranslationService {
     }
 
     final content = message['serverContent'];
-    if (content is! Map) return;
+    if (content is! Map) {
+      liveTrace('SERVER_MESSAGE', 'keys=${message.keys.toList()} (no serverContent)');
+      return;
+    }
+    // Log when the FRAME SHAPE changes (new kind of server message) rather
+    // than on a timer — audio bursts repeat the same shape many times/second.
+    final keys = (content.keys.map((k) => '$k').toList()..sort()).join(',');
+    if (keys != _lastServerKeys) {
+      _lastServerKeys = keys;
+      liveTrace('SERVER_MESSAGE', 'serverContent=[$keys]');
+    }
 
     if (content['interrupted'] == true) {
+      liveTrace('MODEL_INTERRUPTED', 'flushing queued translated audio');
+      _queuedAudioEndsAt = DateTime.fromMillisecondsSinceEpoch(0);
       unawaited(playback.stop());
     }
 
@@ -564,6 +651,11 @@ class LiveTranslationService {
         if (language is String && language.isNotEmpty) {
           _sourceLanguageCode ??= language;
         }
+        // Content is user speech — log shape only, never the words.
+        liveTrace(
+            'INPUT_TRANSCRIPTION',
+            'utterance=$_utteranceId +${text.length}ch '
+                'total=${_sourceBuffer.length}ch lang=$_sourceLanguageCode');
         _emitUpdate();
       }
     }
@@ -574,6 +666,10 @@ class LiveTranslationService {
       if (text is String && text.isNotEmpty) {
         _utteranceId ??= _newUtteranceId();
         _translationBuffer.write(text);
+        liveTrace(
+            'OUTPUT_TRANSCRIPTION',
+            'utterance=$_utteranceId +${text.length}ch '
+                'total=${_translationBuffer.length}ch');
         _emitUpdate();
       }
     }
@@ -590,7 +686,11 @@ class LiveTranslationService {
           final data = inline['data'];
           if (data is String && (mime is! String || mime.startsWith('audio/pcm'))) {
             try {
-              unawaited(playback.feed(base64Decode(data)));
+              final bytes = base64Decode(data);
+              // Track how much audio time is queued so a lost "finished"
+              // callback from the player cannot gate the microphone forever.
+              _noteQueuedAudio(bytes.length);
+              unawaited(playback.feed(bytes));
             } catch (_) {
               // Malformed audio chunk — skip; transcripts are unaffected.
             }
@@ -600,6 +700,11 @@ class LiveTranslationService {
     }
 
     if (content['turnComplete'] == true || content['generationComplete'] == true) {
+      liveTrace(
+          content['turnComplete'] == true ? 'TURN_COMPLETE' : 'GENERATION_COMPLETE',
+          'utterance=$_utteranceId source=${_sourceBuffer.length}ch '
+              'translation=${_translationBuffer.length}ch '
+              'state=${_state.name} capture=$_captureRunning');
       // generationComplete arrives before turnComplete for the same turn;
       // finalizing on the first of the two and resetting makes the second
       // a no-op (buffers empty).
@@ -645,11 +750,24 @@ class LiveTranslationService {
   // ── Microphone uplink ───────────────────────────────────────────────────────
 
   void _onMicChunk(Uint8List pcm) {
+    _lastChunkAt = _now();
     _micLevel.add(micUiLevel(pcm16Rms(pcm)));
     if (_state != LiveServiceState.listening || !_setupDone) return;
-    if (_uplinkGated) {
+    final gated = _uplinkGated;
+    if (gated != _lastGateState) {
+      _lastGateState = gated;
+      liveTrace(
+          gated ? 'MIC_GATE_CLOSED' : 'MIC_GATE_OPEN',
+          'playbackActive=$_playbackActive '
+          'queuedAudio=$_queuedAudioLabel '
+          'sent=$_chunksSent dropped=$_chunksDropped');
+    }
+    if (gated) {
       // The device is speaking a translation: DROP room audio so the speaker
       // output can't be re-ingested and re-translated in a feedback loop.
+      _chunksDropped++;
+      liveTraceThrottled('MIC_CHUNK_DROPPED',
+          () => 'total=$_chunksDropped (device is speaking)');
       _pendingAudio.clear();
       return;
     }
@@ -657,21 +775,51 @@ class LiveTranslationService {
     if (_pendingAudio.length < _sendChunkBytes) return;
     final chunk = _pendingAudio.takeBytes();
     final socket = _socket;
-    if (socket == null) return;
+    if (socket == null) {
+      liveTrace('MIC_CHUNK_DROPPED', 'socket is null');
+      return;
+    }
     socket.send(jsonEncode({
       'realtimeInput': {
         'audio': {'data': base64Encode(chunk), 'mimeType': 'audio/pcm;rate=16000'},
       },
     }));
+    _chunksSent++;
+    liveTraceThrottled(
+        'MIC_CHUNK_SENT', () => 'total=$_chunksSent bytes=${chunk.length}');
   }
 
   void _onPlaybackActive(bool active) {
+    if (active && !_playbackActive) _playbackActiveSince = _now();
+    if (!active) _playbackActiveSince = null;
     _playbackActive = active;
     if (!active) _gateUntil = _now().add(playbackGateTail);
+    liveTrace(active ? 'AUDIO_PLAYBACK_START' : 'AUDIO_PLAYBACK_END',
+        'queuedAudio=$_queuedAudioLabel');
     _speaking.add(active);
   }
 
+  /// Diagnostics: a periodic health line so a dead native microphone tap (no
+  /// chunks arriving at all) is distinguishable from a latched gate or a
+  /// silent server.
+  void _startHealthTrace() {
+    if (!kLiveDiagnostics) return;
+    _healthTimer?.cancel();
+    _healthTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      final since = _lastChunkAt == null
+          ? 'never'
+          : '${_now().difference(_lastChunkAt!).inMilliseconds}ms ago';
+      liveTrace(
+          'HEALTH',
+          'state=${_state.name} setupDone=$_setupDone capture=$_captureRunning '
+              'socket=${_socket == null ? 'null' : 'open'} lastMicChunk=$since '
+              'sent=$_chunksSent dropped=$_chunksDropped '
+              'gated=$_uplinkGated playbackActive=$_playbackActive');
+    });
+  }
+
   void _onCaptureStopped(String reason) {
+    liveTrace('CAPTURE_STOPPED', 'reason=$reason state=${_state.name}');
     _captureRunning = false;
     if (_state == LiveServiceState.idle || _state == LiveServiceState.stopping) return;
     final generation = _generation;
@@ -702,6 +850,9 @@ class LiveTranslationService {
 
   void _failSession(LiveErrorKind kind, String message) {
     _generation++;
+    liveTrace('SESSION_FAILED', 'kind=${kind.name} sent=$_chunksSent');
+    _healthTimer?.cancel();
+    _healthTimer = null;
     _setupTimer?.cancel();
     _reconnectTimer?.cancel();
     unawaited(_stopCapture());
