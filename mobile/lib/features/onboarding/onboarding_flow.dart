@@ -3,7 +3,12 @@ import 'package:provider/provider.dart';
 
 import '../../services/permissions/mic_permission_service.dart';
 import '../../services/storage/settings_store.dart';
+import '../../theme/app_colors.dart';
 import '../../utils/languages.dart';
+import '../../widgets/components/app_background.dart';
+import '../../widgets/components/gradient_button.dart';
+import '../../widgets/components/language_selector_sheet.dart' show LanguageRow;
+import '../auth/auth_widgets.dart' show BrandMark;
 
 /// First-launch flow: pick your language, understand microphone access.
 /// Deliberately minimal — no accounts, no source-language configuration.
@@ -20,12 +25,14 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: SafeArea(
-        child: AnimatedSwitcher(
-          duration: const Duration(milliseconds: 250),
-          child: _step == 0
-              ? _LanguageStep(onSelected: () => setState(() => _step = 1))
-              : const _MicrophoneStep(),
+      body: AppBackground(
+        child: SafeArea(
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 250),
+            child: _step == 0
+                ? _LanguageStep(onSelected: () => setState(() => _step = 1))
+                : const _MicrophoneStep(),
+          ),
         ),
       ),
     );
@@ -45,51 +52,38 @@ class _LanguageStep extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(24, 32, 24, 8),
+          padding: const EdgeInsets.fromLTRB(24, 28, 24, 8),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text('What language do you understand?',
-                  style: theme.textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800)),
+                  style: theme.textTheme.headlineSmall
+                      ?.copyWith(fontWeight: FontWeight.w800)),
               const SizedBox(height: 8),
               Text(
-                'Everything spoken around you will be translated into this language. '
-                'You can change it later in Settings.',
-                style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.outline),
+                'Everything spoken around you will be translated into this '
+                'language. You can change it later in your Profile.',
+                style: theme.textTheme.bodyMedium
+                    ?.copyWith(color: AppColors.textSecondary),
               ),
             ],
           ),
         ),
         Expanded(
           child: ListView.builder(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             itemCount: kTargetLanguages.length,
             itemBuilder: (context, index) {
               final language = kTargetLanguages[index];
-              final isSelected = language.code == selected;
-              return Padding(
-                padding: const EdgeInsets.symmetric(vertical: 3),
-                child: ListTile(
-                  onTap: () async {
-                    await context.read<SettingsController>().setTargetLanguage(language.code);
-                    onSelected();
-                  },
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                    side: BorderSide(
-                      color: isSelected
-                          ? Theme.of(context).colorScheme.primary
-                          : Colors.transparent,
-                      width: 2,
-                    ),
-                  ),
-                  tileColor: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.4),
-                  leading: Text(language.flag, style: const TextStyle(fontSize: 28)),
-                  title: Text(language.nativeName,
-                      style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 17)),
-                  subtitle: language.nativeName == language.name ? null : Text(language.name),
-                  trailing: isSelected ? const Icon(Icons.check_circle) : null,
-                ),
+              return LanguageRow(
+                language: language,
+                selected: language.code == selected,
+                onTap: () async {
+                  await context
+                      .read<SettingsController>()
+                      .setTargetLanguage(language.code);
+                  onSelected();
+                },
               );
             },
           ),
@@ -121,23 +115,26 @@ class _MicrophoneStep extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           const Spacer(),
-          Icon(Icons.mic_none_rounded, size: 96, color: theme.colorScheme.primary),
-          const SizedBox(height: 24),
+          const Center(child: BrandMark(size: 96)),
+          const SizedBox(height: 28),
           Text('Microphone Access',
               textAlign: TextAlign.center,
-              style: theme.textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800)),
+              style: theme.textTheme.headlineSmall
+                  ?.copyWith(fontWeight: FontWeight.w800)),
           const SizedBox(height: 12),
           Text(
             'This app uses your microphone only while Live Translation is active, '
             'so it can hear speech around you and translate it into your language.\n\n'
-            'Listening starts only when you press “Start Listening” — never on its own.',
+            'Listening starts only when you tap the microphone — never on its own.',
             textAlign: TextAlign.center,
-            style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.outline),
+            style: theme.textTheme.bodyMedium
+                ?.copyWith(color: AppColors.textSecondary, height: 1.55),
           ),
           const Spacer(),
-          FilledButton(
+          GradientButton(
+            label: 'Allow Microphone',
+            icon: Icons.mic_rounded,
             onPressed: () => _finish(context, requestPermission: true),
-            child: const Text('Allow Microphone'),
           ),
           const SizedBox(height: 8),
           TextButton(

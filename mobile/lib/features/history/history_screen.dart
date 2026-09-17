@@ -4,12 +4,53 @@ import 'package:provider/provider.dart';
 
 import '../../services/auth/auth_controller.dart';
 import '../../services/firestore/session_repository.dart';
+import '../../theme/app_colors.dart';
 import '../../utils/languages.dart';
+import '../../widgets/components/app_bottom_nav.dart' show bottomNavClearance;
+import '../../widgets/components/empty_state.dart';
+import '../../widgets/components/history_card.dart';
 import 'session_detail_screen.dart';
 
 /// Translation history from the signed-in user's private Firestore space.
-class HistoryScreen extends StatelessWidget {
+/// Search is purely local: it filters the already-streamed session list by
+/// target language and date text — no backend changes.
+class HistoryScreen extends StatefulWidget {
   const HistoryScreen({super.key});
+
+  @override
+  State<HistoryScreen> createState() => _HistoryScreenState();
+}
+
+class _HistoryScreenState extends State<HistoryScreen> {
+  String _query = '';
+
+  // One Firestore listener per signed-in user, NOT one per rebuild: search
+  // keystrokes call setState, and recreating the stream there would flicker
+  // the list back to "loading" on every character.
+  Stream<List<SessionSummaryDoc>>? _stream;
+  String? _streamUid;
+
+  Stream<List<SessionSummaryDoc>> _sessionsFor(SessionRepository sessions, String uid) {
+    if (_streamUid != uid || _stream == null) {
+      _streamUid = uid;
+      _stream = sessions.watchSessions(uid);
+    }
+    return _stream!;
+  }
+
+  bool _matches(SessionSummaryDoc session) {
+    final query = _query.trim().toLowerCase();
+    if (query.isEmpty) return true;
+    final language = languageForCode(session.targetLanguageCode);
+    final haystack = [
+      language?.name ?? '',
+      language?.nativeName ?? '',
+      session.targetLanguageCode,
+      HistoryCard.friendlyDate(session.startedAt),
+      DateFormat.yMMMMd().format(session.startedAt),
+    ].join(' ').toLowerCase();
+    return haystack.contains(query);
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -17,99 +58,118 @@ class HistoryScreen extends StatelessWidget {
     final uid = context.watch<AuthController>().uid;
     final sessions = context.read<SessionRepository>();
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('History'),
-        actions: [
-          IconButton(
-            tooltip: 'Delete All History',
-            icon: const Icon(Icons.delete_sweep_outlined),
-            onPressed: uid == null ? null : () => _deleteAll(context, sessions, uid),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(24, 14, 12, 0),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('History',
+                        style: theme.textTheme.headlineSmall
+                            ?.copyWith(fontWeight: FontWeight.w800)),
+                    Text('Your conversations, always with you.',
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: AppColors.textSecondary)),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: 'Delete All History',
+                icon: const Icon(Icons.delete_sweep_outlined,
+                    color: AppColors.textSecondary),
+                onPressed: uid == null ? null : () => _deleteAll(context, sessions, uid),
+              ),
+            ],
           ),
-        ],
-      ),
-      body: uid == null
-          ? const Center(child: Text('Sign in to see your history.'))
-          : StreamBuilder<List<SessionSummaryDoc>>(
-              stream: sessions.watchSessions(uid),
-              builder: (context, snapshot) {
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-                if (snapshot.hasError) {
-                  return Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(32),
-                      child: Text(
-                        'Could not load history.\nCheck your connection and try again.',
-                        textAlign: TextAlign.center,
-                        style: theme.textTheme.bodyLarge
-                            ?.copyWith(color: theme.colorScheme.outline),
-                      ),
-                    ),
-                  );
-                }
-                final docs = snapshot.data ?? const <SessionSummaryDoc>[];
-                if (docs.isEmpty) {
-                  return Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(32),
-                      child: Text(
-                        'No saved conversations yet.\nFinished translations are saved here automatically.',
-                        textAlign: TextAlign.center,
-                        style: theme.textTheme.bodyLarge
-                            ?.copyWith(color: theme.colorScheme.outline),
-                      ),
-                    ),
-                  );
-                }
-                return ListView.builder(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: docs.length,
-                  itemBuilder: (context, index) {
-                    final session = docs[index];
-                    final language = languageForCode(session.targetLanguageCode);
-                    final count = session.messageCount;
-                    return Card(
-                      margin: const EdgeInsets.symmetric(vertical: 5),
-                      child: ListTile(
-                        onTap: () => Navigator.push(
-                          context,
-                          MaterialPageRoute<void>(
-                              builder: (_) => SessionDetailScreen(session: session)),
-                        ),
-                        leading:
-                            Text(language?.flag ?? '💬', style: const TextStyle(fontSize: 26)),
-                        title: Text(
-                          DateFormat.yMMMd().add_Hm().format(session.startedAt),
-                          style: const TextStyle(fontWeight: FontWeight.w700),
-                        ),
-                        subtitle: Text([
-                          if (count != null)
-                            '$count translation${count == 1 ? '' : 's'}',
-                          if (language != null) '→ ${language.name}',
-                        ].join(' ')),
-                        trailing: IconButton(
-                          icon: const Icon(Icons.delete_outline_rounded),
-                          onPressed: () => _deleteSession(context, sessions, uid, session),
-                        ),
-                      ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 4),
+          child: TextField(
+            onChanged: (value) => setState(() => _query = value),
+            decoration: const InputDecoration(
+              // Sessions store language + date, not transcript text — the
+              // hint says exactly what can be searched.
+              hintText: 'Search by language or date',
+              prefixIcon: Icon(Icons.search_rounded),
+            ),
+          ),
+        ),
+        Expanded(
+          child: uid == null
+              ? const AppEmptyState(
+                  icon: Icons.lock_outline_rounded,
+                  title: 'Sign in required',
+                  subtitle: 'Sign in to see your saved conversations.',
+                )
+              : StreamBuilder<List<SessionSummaryDoc>>(
+                  stream: _sessionsFor(sessions, uid),
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
+                    if (snapshot.hasError) {
+                      return const AppEmptyState(
+                        icon: Icons.cloud_off_rounded,
+                        title: 'Could not load history',
+                        subtitle: 'Check your connection and try again.',
+                      );
+                    }
+                    final docs = snapshot.data ?? const <SessionSummaryDoc>[];
+                    if (docs.isEmpty) {
+                      return const AppEmptyState(
+                        icon: Icons.forum_outlined,
+                        title: 'No conversations yet',
+                        subtitle: 'Your translated conversations will appear here.',
+                      );
+                    }
+                    final filtered = docs.where(_matches).toList();
+                    if (filtered.isEmpty) {
+                      return AppEmptyState(
+                        icon: Icons.search_off_rounded,
+                        title: 'No matches',
+                        subtitle: 'No session language or date matches "$_query".',
+                      );
+                    }
+                    return ListView.builder(
+                      padding: EdgeInsets.fromLTRB(
+                          20, 10, 20, bottomNavClearance(context)),
+                      itemCount: filtered.length,
+                      itemBuilder: (context, index) {
+                        final session = filtered[index];
+                        return HistoryCard(
+                          session: session,
+                          onTap: () => Navigator.push(
+                            context,
+                            MaterialPageRoute<void>(
+                                builder: (_) =>
+                                    SessionDetailScreen(session: session)),
+                          ),
+                          onDelete: () =>
+                              _deleteSession(context, sessions, uid, session),
+                        );
+                      },
                     );
                   },
-                );
-              },
-            ),
+                ),
+        ),
+      ],
     );
   }
 
-  Future<void> _deleteSession(BuildContext context, SessionRepository sessions, String uid,
-      SessionSummaryDoc session) async {
+  Future<void> _deleteSession(BuildContext context, SessionRepository sessions,
+      String uid, SessionSummaryDoc session) async {
     if (await _confirm(context, 'Delete this translation session?')) {
       await sessions.deleteSession(uid, session.id);
     }
   }
 
-  Future<void> _deleteAll(BuildContext context, SessionRepository sessions, String uid) async {
+  Future<void> _deleteAll(
+      BuildContext context, SessionRepository sessions, String uid) async {
     if (await _confirm(context, 'Delete all saved translation history?')) {
       await sessions.deleteAllSessions(uid);
     }
@@ -122,9 +182,11 @@ class HistoryScreen extends StatelessWidget {
         title: Text(title),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel')),
           FilledButton(
-              onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Delete')),
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Delete')),
         ],
       ),
     );

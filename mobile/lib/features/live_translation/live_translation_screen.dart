@@ -4,14 +4,21 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../../services/storage/settings_store.dart';
+import '../../theme/app_colors.dart';
 import '../../utils/languages.dart';
-import '../history/history_screen.dart';
-import '../settings/settings_screen.dart';
+import '../../widgets/components/app_bottom_nav.dart' show bottomNavClearance;
+import '../../widgets/components/app_error_banner.dart';
+import '../../widgets/components/audio_waveform.dart';
+import '../../widgets/components/glass_card.dart';
+import '../../widgets/components/language_selector_sheet.dart';
+import '../../widgets/components/listening_orb.dart';
 import 'live_translation_controller.dart';
-import 'widgets/listen_language_bar.dart';
-import 'widgets/listening_indicator.dart';
 import 'widgets/message_bubble.dart';
 
+/// Home: the live translation experience. The microphone orb is the hero;
+/// the transcript grows into a conversation timeline beneath it. All session
+/// behavior (start/stop, restart-on-language-change, error copy) lives in
+/// [LiveTranslationController] — this screen is presentation only.
 class LiveTranslationScreen extends StatefulWidget {
   const LiveTranslationScreen({super.key});
 
@@ -25,7 +32,10 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
   int _renderedMessageCount = 0;
   bool _showNewMessagePill = false;
 
-  LiveTranslationController get _controller => context.read<LiveTranslationController>();
+  // Resolved once: dispose() runs after this element is deactivated, when a
+  // context lookup is no longer allowed.
+  late final LiveTranslationController _controller =
+      context.read<LiveTranslationController>();
 
   @override
   void initState() {
@@ -43,8 +53,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
     });
   }
 
-  bool get _isNearBottom =>
-      !_scroll.hasClients || _scroll.position.extentAfter < 120;
+  bool get _isNearBottom => !_scroll.hasClients || _scroll.position.extentAfter < 120;
 
   void _handleControllerChanged() {
     final count = _controller.messages.length;
@@ -80,6 +89,9 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
       controller.consumeSummary();
       if (mounted && summary != null) _showSummarySheet(summary);
     }
+    // While starting, a tap is deliberately a no-op: stopping mid-connect
+    // would race the in-flight start (the controller does not cancel it)
+    // and could leave the microphone on after a "stopped" summary.
   }
 
   void _showSummarySheet(SessionSummary summary) {
@@ -87,7 +99,6 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
     final seconds = summary.duration.inSeconds % 60;
     showModalBottomSheet<void>(
       context: context,
-      showDragHandle: true,
       builder: (sheetContext) => SafeArea(
         child: Padding(
           padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
@@ -106,7 +117,10 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
                 '${summary.translationCount} translation${summary.translationCount == 1 ? '' : 's'}'
                 ' · ${minutes > 0 ? '$minutes min ' : ''}$seconds sec',
                 textAlign: TextAlign.center,
-                style: Theme.of(sheetContext).textTheme.bodyLarge,
+                style: Theme.of(sheetContext)
+                    .textTheme
+                    .bodyLarge
+                    ?.copyWith(color: AppColors.textSecondary),
               ),
               const SizedBox(height: 20),
               FilledButton.icon(
@@ -153,6 +167,41 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
     if (confirmed == true) _controller.clearConversation();
   }
 
+  /// Privacy affordance: while the microphone is live, the status pill opens
+  /// an explanation sheet with an explicit Stop.
+  void _showMicActiveSheet() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Icon(Icons.mic_rounded, size: 44, color: AppColors.electricCyan),
+              const SizedBox(height: 12),
+              Text(
+                'Microphone is currently active because Live Translation is running.',
+                textAlign: TextAlign.center,
+                style: Theme.of(sheetContext).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 20),
+              FilledButton.icon(
+                onPressed: () {
+                  Navigator.pop(sheetContext);
+                  _toggleListening();
+                },
+                icon: const Icon(Icons.stop_rounded),
+                label: const Text('Stop Listening'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _noticeSubscription?.cancel();
@@ -161,238 +210,464 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
     super.dispose();
   }
 
+  OrbState get _orbState => switch (_controller.state) {
+        ListeningState.idle => OrbState.idle,
+        ListeningState.starting => OrbState.connecting,
+        ListeningState.listening => OrbState.listening,
+      };
+
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<LiveTranslationController>();
     final settings = context.watch<SettingsController>().settings;
+    final hasMessages = controller.messages.isNotEmpty;
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Live Translator'),
-        actions: [
-          if (controller.messages.isNotEmpty && !controller.isListening)
-            IconButton(
-              tooltip: 'Clear Conversation',
-              icon: const Icon(Icons.delete_outline_rounded),
-              onPressed: _confirmClear,
-            ),
-          IconButton(
-            tooltip: 'History',
-            icon: const Icon(Icons.history_rounded),
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute<void>(builder: (_) => const HistoryScreen()),
-            ),
-          ),
-          IconButton(
-            tooltip: 'Settings',
-            icon: const Icon(Icons.settings_outlined),
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute<void>(builder: (_) => const SettingsScreen()),
-            ),
-          ),
-        ],
-      ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            if (controller.errorBanner != null)
-              _ErrorBanner(
-                message: controller.errorBanner!,
-                showOpenSettings: controller.permissionPermanentlyDenied,
-                onOpenSettings: controller.openSystemSettings,
+    return Column(
+      children: [
+        // Chrome (header, selector, dock) keeps a bounded text scale so the
+        // fixed blocks can't outgrow a small screen; transcript text below
+        // honors the user's full text-size setting.
+        MediaQuery.withClampedTextScaling(
+          maxScaleFactor: 1.3,
+          child: Column(
+            children: [
+              _Header(
+                showClear: hasMessages && !controller.isListening,
+                onClear: _confirmClear,
               ),
-            if (controller.isListening)
-              Padding(
-                padding: const EdgeInsets.only(top: 10),
-                child: ListeningIndicator(
-                  micLevel: controller.micLevel,
-                  activityLabel: controller.activityLabel,
-                  onStop: _toggleListening,
-                ),
-              ),
-            Expanded(
-              child: Stack(
-                children: [
-                  controller.messages.isEmpty
-                      ? _EmptyState(
-                          isListening: controller.isListening,
-                          targetLanguage: settings.targetLanguage,
-                        )
-                      : ListView.separated(
-                          controller: _scroll,
-                          padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-                          itemCount: controller.messages.length,
-                          separatorBuilder: (_, __) => const SizedBox(height: 10),
-                          itemBuilder: (context, index) {
-                            final message = controller.messages[index];
-                            return MessageBubble(
-                              message: message,
-                              showOriginal: settings.showOriginalText,
-                              showTimestamp: settings.showTimestamps,
-                              showLanguageLabels: settings.showLanguageLabels,
-                              onReport: () => controller.reportBadTranslation(message),
-                            );
-                          },
-                        ),
-                  if (_showNewMessagePill)
-                    Positioned(
-                      bottom: 12,
-                      left: 0,
-                      right: 0,
-                      child: Center(
-                        child: ActionChip(
-                          avatar: const Icon(Icons.arrow_downward_rounded, size: 18),
-                          label: const Text('New translation'),
-                          onPressed: _scrollToBottom,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-            const ListenLanguageBar(),
-            _BottomControl(
-              state: controller.state,
-              onPressed: _toggleListening,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _ErrorBanner extends StatelessWidget {
-  const _ErrorBanner({
-    required this.message,
-    required this.showOpenSettings,
-    required this.onOpenSettings,
-  });
-
-  final String message;
-  final bool showOpenSettings;
-  final Future<void> Function() onOpenSettings;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Container(
-      width: double.infinity,
-      color: theme.colorScheme.errorContainer,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      child: Row(
-        children: [
-          Icon(Icons.info_outline_rounded, color: theme.colorScheme.onErrorContainer),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              message,
-              style: theme.textTheme.bodyMedium
-                  ?.copyWith(color: theme.colorScheme.onErrorContainer),
-            ),
-          ),
-          if (showOpenSettings)
-            TextButton(
-              onPressed: onOpenSettings,
-              child: const Text('Open Settings'),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-class _EmptyState extends StatelessWidget {
-  const _EmptyState({required this.isListening, required this.targetLanguage});
-
-  final bool isListening;
-  final String targetLanguage;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final language = languageForCode(targetLanguage);
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              isListening ? '…' : '🎙️',
-              style: const TextStyle(fontSize: 56),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              isListening
-                  ? 'Waiting for someone to speak…'
-                  : 'Understand anyone,\nin your language.',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              isListening
-                  ? 'Speech will appear here, translated automatically.'
-                  : 'Languages are detected automatically.',
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.outline),
-            ),
-            if (!isListening && language != null) ...[
-              const SizedBox(height: 20),
-              Chip(
-                avatar: Text(language.flag),
-                label: Text('Your language: ${language.name}'),
+              _TargetLanguageCard(
+                targetLanguage: settings.targetLanguage,
+                onTap: () => showLanguageSelectorSheet(context),
               ),
             ],
-          ],
+          ),
         ),
-      ),
+        if (controller.errorBanner != null)
+          AppErrorBanner(
+            message: controller.errorBanner!,
+            margin: const EdgeInsets.fromLTRB(20, 10, 20, 0),
+            actionLabel: controller.permissionPermanentlyDenied ? 'Open Settings' : null,
+            onAction: controller.permissionPermanentlyDenied
+                ? () => controller.openSystemSettings()
+                : null,
+          ),
+        Expanded(
+          child: hasMessages
+              ? _TranscriptView(
+                  controller: controller,
+                  scroll: _scroll,
+                  showNewMessagePill: _showNewMessagePill,
+                  onNewMessageTap: _scrollToBottom,
+                  showOriginal: settings.showOriginalText,
+                  showTimestamps: settings.showTimestamps,
+                  showLanguageLabels: settings.showLanguageLabels,
+                )
+              : _HeroIdleView(
+                  state: _orbState,
+                  micLevel: controller.micLevel,
+                  onOrbTap: _toggleListening,
+                  isListening: controller.isListening,
+                  onListeningPillTap: _showMicActiveSheet,
+                ),
+        ),
+        if (hasMessages)
+          MediaQuery.withClampedTextScaling(
+            maxScaleFactor: 1.3,
+            child: _CompactControlDock(
+              state: _orbState,
+              micLevel: controller.micLevel,
+              activityLabel: controller.activityLabel,
+              onOrbTap: _toggleListening,
+              onStatusTap: controller.isListening ? _showMicActiveSheet : null,
+            ),
+          ),
+      ],
     );
   }
 }
 
-class _BottomControl extends StatelessWidget {
-  const _BottomControl({
-    required this.state,
-    required this.onPressed,
-  });
+// ── Header ────────────────────────────────────────────────────────────────────
 
-  final ListeningState state;
-  final Future<void> Function() onPressed;
+class _Header extends StatelessWidget {
+  const _Header({required this.showClear, required this.onClear});
+
+  final bool showClear;
+  final VoidCallback onClear;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
-      child: switch (state) {
-        ListeningState.idle => FilledButton.icon(
-            onPressed: onPressed,
-            icon: const Icon(Icons.mic_rounded, size: 26),
-            label: const Text('Start Listening'),
-          ),
-        ListeningState.starting => FilledButton.icon(
-            onPressed: null,
-            icon: const SizedBox(
-              width: 20,
-              height: 20,
-              child: CircularProgressIndicator(strokeWidth: 2.5),
+      padding: const EdgeInsets.fromLTRB(24, 14, 12, 0),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Live Translator',
+                    style: theme.textTheme.headlineSmall
+                        ?.copyWith(fontWeight: FontWeight.w800)),
+                Text(
+                  'Speak freely. Understand instantly.',
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: AppColors.textSecondary),
+                ),
+              ],
             ),
-            label: const Text('Starting…'),
           ),
-        ListeningState.listening => FilledButton.icon(
-            style: FilledButton.styleFrom(
-              backgroundColor: theme.colorScheme.error,
-              foregroundColor: theme.colorScheme.onError,
+          if (showClear)
+            IconButton(
+              tooltip: 'Clear Conversation',
+              icon: const Icon(Icons.delete_outline_rounded,
+                  color: AppColors.textSecondary),
+              onPressed: onClear,
             ),
-            onPressed: onPressed,
-            icon: const Icon(Icons.stop_rounded, size: 26),
-            label: const Text('Stop Listening'),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Target language card ─────────────────────────────────────────────────────
+
+class _TargetLanguageCard extends StatelessWidget {
+  const _TargetLanguageCard({required this.targetLanguage, required this.onTap});
+
+  final String targetLanguage;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final language = languageForCode(targetLanguage);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 0),
+      child: Semantics(
+        button: true,
+        label: 'Translate to ${language?.name ?? targetLanguage}. Change target language',
+        child: AppGlassCard(
+          onTap: onTap,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(12),
+                  color: AppColors.primaryBlue.withValues(alpha: 0.18),
+                ),
+                child: const Icon(Icons.language_rounded,
+                    size: 20, color: AppColors.electricCyan),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Translate to',
+                        style: theme.textTheme.labelSmall
+                            ?.copyWith(color: AppColors.textSecondary)),
+                    Row(
+                      children: [
+                        Text(language?.flag ?? '🌐',
+                            style: const TextStyle(fontSize: 17)),
+                        const SizedBox(width: 7),
+                        Flexible(
+                          child: Text(
+                            language?.name ?? targetLanguage,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.titleMedium
+                                ?.copyWith(fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(Icons.keyboard_arrow_down_rounded,
+                  color: AppColors.textSecondary),
+            ],
           ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Hero (empty conversation) ────────────────────────────────────────────────
+
+class _HeroIdleView extends StatelessWidget {
+  const _HeroIdleView({
+    required this.state,
+    required this.micLevel,
+    required this.onOrbTap,
+    required this.isListening,
+    required this.onListeningPillTap,
+  });
+
+  final OrbState state;
+  final double micLevel;
+  final VoidCallback onOrbTap;
+  final bool isListening;
+  final VoidCallback onListeningPillTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final (title, subtitle) = switch (state) {
+      OrbState.idle => ('Tap to start listening', 'Languages are detected automatically.'),
+      OrbState.connecting => ('Connecting…', 'Securing your private translation session.'),
+      OrbState.listening => ('Listening…', "Speak naturally, we'll handle the rest."),
+    };
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact = constraints.maxHeight < 420;
+        final orbSize = compact ? 128.0 : 168.0;
+        return SingleChildScrollView(
+          physics: const ClampingScrollPhysics(),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: constraints.maxHeight),
+            child: Padding(
+              padding: EdgeInsets.only(bottom: bottomNavClearance(context)),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  // The waveforms share whatever width is left beside the
+                  // orb and scale down on narrow phones — never overflow.
+                  Row(
+                    children: [
+                      Expanded(
+                        child: state == OrbState.listening
+                            ? Center(
+                                child: FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: AudioWaveform(level: micLevel, maxBarHeight: 22),
+                                ),
+                              )
+                            : const SizedBox.shrink(),
+                      ),
+                      ListeningOrb(
+                        state: state,
+                        micLevel: micLevel,
+                        onTap: onOrbTap,
+                        size: orbSize,
+                      ),
+                      Expanded(
+                        child: state == OrbState.listening
+                            ? Center(
+                                child: FittedBox(
+                                  fit: BoxFit.scaleDown,
+                                  child: AudioWaveform(level: micLevel, maxBarHeight: 22),
+                                ),
+                              )
+                            : const SizedBox.shrink(),
+                      ),
+                    ],
+                  ),
+                  SizedBox(height: compact ? 12 : 22),
+                  if (isListening)
+                    _ListeningPill(onTap: onListeningPillTap)
+                  else
+                    Text(title,
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.titleLarge
+                            ?.copyWith(fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 6),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 40),
+                    child: Text(
+                      subtitle,
+                      textAlign: TextAlign.center,
+                      style: theme.textTheme.bodyMedium
+                          ?.copyWith(color: AppColors.textSecondary),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
       },
+    );
+  }
+}
+
+/// "● Listening…" — text plus color, never color alone. Tapping opens the
+/// microphone privacy sheet.
+class _ListeningPill extends StatelessWidget {
+  const _ListeningPill({required this.onTap, this.label = 'Listening…'});
+
+  final VoidCallback onTap;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Semantics(
+      button: true,
+      label: 'Microphone active. $label Tap for details and stop.',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(22),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          decoration: BoxDecoration(
+            color: AppColors.glassFill,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(color: AppColors.glassBorder),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.circle, size: 9, color: AppColors.danger),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: theme.textTheme.titleSmall
+                        ?.copyWith(fontWeight: FontWeight.w800)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Transcript ───────────────────────────────────────────────────────────────
+
+class _TranscriptView extends StatelessWidget {
+  const _TranscriptView({
+    required this.controller,
+    required this.scroll,
+    required this.showNewMessagePill,
+    required this.onNewMessageTap,
+    required this.showOriginal,
+    required this.showTimestamps,
+    required this.showLanguageLabels,
+  });
+
+  final LiveTranslationController controller;
+  final ScrollController scroll;
+  final bool showNewMessagePill;
+  final VoidCallback onNewMessageTap;
+  final bool showOriginal;
+  final bool showTimestamps;
+  final bool showLanguageLabels;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        ListView.separated(
+          controller: scroll,
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+          itemCount: controller.messages.length,
+          separatorBuilder: (_, __) => const SizedBox(height: 10),
+          itemBuilder: (context, index) {
+            final message = controller.messages[index];
+            return MessageBubble(
+              message: message,
+              showOriginal: showOriginal,
+              showTimestamp: showTimestamps,
+              showLanguageLabels: showLanguageLabels,
+              onReport: () => controller.reportBadTranslation(message),
+            );
+          },
+        ),
+        if (showNewMessagePill)
+          Positioned(
+            bottom: 12,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: ActionChip(
+                avatar: const Icon(Icons.arrow_downward_rounded,
+                    size: 18, color: AppColors.electricCyan),
+                label: const Text('New translation'),
+                onPressed: onNewMessageTap,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+// ── Compact control dock (conversation in progress) ──────────────────────────
+
+class _CompactControlDock extends StatelessWidget {
+  const _CompactControlDock({
+    required this.state,
+    required this.micLevel,
+    required this.activityLabel,
+    required this.onOrbTap,
+    required this.onStatusTap,
+  });
+
+  final OrbState state;
+  final double micLevel;
+  final String? activityLabel;
+  final VoidCallback onOrbTap;
+  final VoidCallback? onStatusTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final listening = state == OrbState.listening;
+    return Padding(
+      padding: EdgeInsets.only(bottom: bottomNavClearance(context)),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: listening
+                    ? Center(
+                        child: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: AudioWaveform(level: micLevel, maxBarHeight: 16),
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+              ListeningOrb(
+                state: state,
+                micLevel: micLevel,
+                onTap: onOrbTap,
+                size: 84,
+              ),
+              Expanded(
+                child: listening
+                    ? Center(
+                        child: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: AudioWaveform(level: micLevel, maxBarHeight: 16),
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+            ],
+          ),
+          if (listening && onStatusTap != null)
+            _ListeningPill(onTap: onStatusTap!, label: activityLabel ?? 'Listening…')
+          else if (state == OrbState.connecting)
+            Text('Connecting…',
+                style: theme.textTheme.labelMedium
+                    ?.copyWith(color: AppColors.textSecondary))
+          else
+            Text('Tap to start listening',
+                style: theme.textTheme.labelMedium
+                    ?.copyWith(color: AppColors.textSecondary)),
+        ],
+      ),
     );
   }
 }

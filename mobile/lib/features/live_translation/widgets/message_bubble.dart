@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:intl/intl.dart' show DateFormat;
 
 import '../../../models/translation_message.dart';
+import '../../../theme/app_colors.dart';
 import '../../../theme/app_theme.dart';
 import '../../../utils/languages.dart';
 
@@ -83,7 +84,7 @@ class MessageBubble extends StatelessWidget {
                       Text(
                         DateFormat.Hm().format(message.timestamp),
                         style: theme.textTheme.labelSmall
-                            ?.copyWith(color: theme.colorScheme.outline),
+                            ?.copyWith(color: AppColors.textTertiary),
                       ),
                   ],
                 ),
@@ -98,8 +99,8 @@ class MessageBubble extends StatelessWidget {
                         textDirection: targetRtl ? TextDirection.rtl : TextDirection.ltr,
                         textAlign: TextAlign.start,
                         style: theme.textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w600,
-                          height: 1.45,
+                          fontWeight: FontWeight.w700,
+                          height: 1.5,
                         ),
                       ),
                     ),
@@ -154,7 +155,7 @@ class MessageBubble extends StatelessWidget {
                     ),
                 },
                 if (showOriginal && message.originalText.isNotEmpty) ...[
-                  const SizedBox(height: 6),
+                  const SizedBox(height: 8),
                   SizedBox(
                     width: double.infinity,
                     child: Text(
@@ -162,9 +163,8 @@ class MessageBubble extends StatelessWidget {
                       textDirection: sourceRtl ? TextDirection.rtl : TextDirection.ltr,
                       textAlign: TextAlign.start,
                       style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.outline,
-                        fontStyle: FontStyle.italic,
-                        height: 1.4,
+                        color: AppColors.textSecondary,
+                        height: 1.45,
                       ),
                     ),
                   ),

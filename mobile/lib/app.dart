@@ -15,9 +15,8 @@ class LiveTranslatorApp extends StatelessWidget {
     return MaterialApp(
       title: 'Live Translator',
       debugShowCheckedModeBanner: false,
-      theme: AppTheme.light(),
-      darkTheme: AppTheme.dark(),
-      themeMode: settings.themeMode,
+      // One midnight identity — the design language is deliberately dark-only.
+      theme: AppTheme.midnight(),
       builder: (context, child) {
         // User-selected text size stacks with the system's dynamic type,
         // clamped so the layout stays usable at the extremes.

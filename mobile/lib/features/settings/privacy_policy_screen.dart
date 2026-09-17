@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
 
+import '../../theme/app_colors.dart';
+import '../../widgets/components/app_background.dart';
+import '../../widgets/components/glass_card.dart';
+
 class PrivacyPolicyScreen extends StatelessWidget {
   const PrivacyPolicyScreen({super.key});
 
@@ -58,25 +62,59 @@ class PrivacyPolicyScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Privacy Policy')),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
-          Text(
-            'Privacy is a core feature of Live Translator, not an afterthought.',
-            style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-          ),
-          const SizedBox(height: 16),
-          for (final (title, body) in _sections) ...[
-            Text(title, style: theme.textTheme.titleSmall?.copyWith(
-              color: theme.colorScheme.primary,
-              fontWeight: FontWeight.w800,
-            )),
-            const SizedBox(height: 6),
-            Text(body, style: theme.textTheme.bodyMedium?.copyWith(height: 1.5)),
-            const SizedBox(height: 18),
+      body: AppBackground(
+        child: SafeArea(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 6, 20, 0),
+                child: Row(
+                  children: [
+                    const BackButton(color: AppColors.textPrimary),
+                    Expanded(
+                      child: Text('Privacy Policy',
+                          style: theme.textTheme.titleLarge
+                              ?.copyWith(fontWeight: FontWeight.w800)),
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+          children: [
+            Text(
+              'Privacy is a core feature of Live Translator, not an afterthought.',
+              style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 16),
+            for (final (title, body) in _sections)
+              AppGlassCard(
+                margin: const EdgeInsets.only(bottom: 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: theme.textTheme.titleSmall?.copyWith(
+                          color: AppColors.electricCyan,
+                          fontWeight: FontWeight.w800,
+                        )),
+                    const SizedBox(height: 6),
+                    Text(body,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          height: 1.55,
+                          color: AppColors.textSecondary,
+                        )),
+                  ],
+                ),
+              ),
           ],
-        ],
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

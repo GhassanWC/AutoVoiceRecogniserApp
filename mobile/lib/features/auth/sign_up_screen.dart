@@ -47,6 +47,14 @@ class _SignUpScreenState extends State<SignUpScreen> {
       subtitle: 'Your translation history stays private to you.',
       children: [
         AuthErrorText(auth.errorMessage),
+        SocialSignInButtons(
+          busy: auth.busy,
+          onGoogle: () => context.read<AuthController>().signInWithGoogle(),
+          onApple: () => context.read<AuthController>().signInWithApple(),
+        ),
+        const SizedBox(height: 18),
+        const OrDivider(),
+        const SizedBox(height: 18),
         Form(
           key: _formKey,
           child: Column(
@@ -100,12 +108,6 @@ class _SignUpScreenState extends State<SignUpScreen> {
               BusyFilledButton(busy: auth.busy, onPressed: _submit, label: 'Create Account'),
             ],
           ),
-        ),
-        const SizedBox(height: 16),
-        SocialSignInButtons(
-          busy: auth.busy,
-          onGoogle: () => context.read<AuthController>().signInWithGoogle(),
-          onApple: () => context.read<AuthController>().signInWithApple(),
         ),
       ],
     );

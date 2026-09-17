@@ -41,6 +41,14 @@ class _SignInScreenState extends State<SignInScreen> {
       subtitle: 'Sign in to translate the world around you.',
       children: [
         AuthErrorText(auth.errorMessage),
+        SocialSignInButtons(
+          busy: auth.busy,
+          onGoogle: () => context.read<AuthController>().signInWithGoogle(),
+          onApple: () => context.read<AuthController>().signInWithApple(),
+        ),
+        const SizedBox(height: 18),
+        const OrDivider(),
+        const SizedBox(height: 18),
         Form(
           key: _formKey,
           child: Column(
@@ -91,12 +99,6 @@ class _SignInScreenState extends State<SignInScreen> {
               BusyFilledButton(busy: auth.busy, onPressed: _submit, label: 'Sign In'),
             ],
           ),
-        ),
-        const SizedBox(height: 16),
-        SocialSignInButtons(
-          busy: auth.busy,
-          onGoogle: () => context.read<AuthController>().signInWithGoogle(),
-          onApple: () => context.read<AuthController>().signInWithApple(),
         ),
         const SizedBox(height: 16),
         TextButton(
