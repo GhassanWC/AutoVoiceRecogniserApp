@@ -34,6 +34,11 @@ const String kOutDir = 'assets/icon';
 /// Master icon edge in px (1024 is what the App Store and Play Store want).
 const int kMasterSize = 1024;
 
+/// Mark size relative to the finished square icon (iOS + Android legacy),
+/// matching the proportion the mark has in the source artwork (~67% of the
+/// tile) so its padding is preserved.
+const double kMasterMarkFraction = 0.68;
+
 /// Android adaptive icons guarantee only the middle 72/108 (66.7%) of the
 /// canvas is visible; anything outside can be clipped by a launcher mask.
 /// flutter_launcher_icons ALSO wraps the foreground drawable in a 16%-per-edge
@@ -70,22 +75,27 @@ Future<void> main(List<String> args) async {
   stdout.writeln('icon tile ${tile.width}x${tile.height} (white page trimmed)');
 
   final gradient = _sampleGradient(tile);
+  final mark = _extractMark(tile);
 
-  // ── Full-bleed master: artwork over its own sampled gradient, so the
-  // rounded corner slivers become opaque blue instead of white/transparent.
-  final master = Image(width: tile.width, height: tile.height, numChannels: 4);
+  // ── Full-bleed master (iOS + Android legacy): the sampled backdrop with
+  // the untouched mark centred on it. Building it this way is what removes
+  // the artwork's outer glossy bevel — it is cropped away with the tile's
+  // rounded edge rather than scaled into frame — and it leaves ONE uniform
+  // backdrop, so there is no seam where real artwork would meet fill.
+  final master = Image(width: kMasterSize, height: kMasterSize, numChannels: 4);
   _paintGradient(master, gradient);
-  compositeImage(master, tile);
-  _write('app_icon.png', _resizeSquare(master, kMasterSize), alpha: false);
+  _placeCentered(master, mark, kMasterMarkFraction);
+  _write('app_icon.png', master, alpha: false);
 
-  // ── Android adaptive background: the gradient alone, full bleed.
+  // ── Android adaptive background: the same backdrop, full bleed.
   final background = Image(width: kMasterSize, height: kMasterSize, numChannels: 4);
   _paintGradient(background, gradient);
   _write('app_icon_background.png', background, alpha: false);
 
-  // ── Android adaptive foreground: the white mark on transparency, inset
-  // into the safe zone.
-  _write('app_icon_foreground.png', _buildForeground(tile), alpha: true);
+  // ── Android adaptive foreground: the same mark, sized for the safe zone.
+  final foreground = Image(width: kMasterSize, height: kMasterSize, numChannels: 4);
+  _placeCentered(foreground, mark, kForegroundMarkFraction);
+  _write('app_icon_foreground.png', foreground, alpha: true);
 
   if (args.contains('--layers-only')) {
     stdout.writeln('\nLayers only. Next: dart run flutter_launcher_icons');
@@ -212,6 +222,19 @@ Image _cropTile(Image source) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Full-bleed master
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Scales [mark] to [fraction] of [target]'s width and centres it.
+void _placeCentered(Image target, Image mark, double fraction) {
+  final size = (target.width * fraction).round();
+  final scaled = copyResize(mark,
+      width: size, height: size, interpolation: Interpolation.cubic);
+  compositeImage(target, scaled,
+      dstX: (target.width - size) ~/ 2, dstY: (target.height - size) ~/ 2);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Backdrop gradient, sampled from the artwork itself
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -285,13 +308,16 @@ void _paintGradient(Image target, _Gradient gradient) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Adaptive foreground: the white mark alone
+// The white mark, isolated from the backdrop
 // ─────────────────────────────────────────────────────────────────────────────
 
-Image _buildForeground(Image tile) {
+/// Returns the logo mark alone — original pixels, soft alpha, cropped square
+/// and tight to its bounds. Used unchanged for both the square master icon and
+/// the Android adaptive foreground.
+Image _extractMark(Image tile) {
   final size = tile.width;
-  // Ignore a border band so the tile's glossy rim highlight (also unsaturated)
-  // is never mistaken for part of the mark.
+  // Ignore a border band: the tile's glossy bevel/rim is also unsaturated, and
+  // excluding it here is what keeps it out of every generated icon.
   final border = (size * 0.07).round();
 
   // Soft alpha across the saturation ramp keeps anti-aliased edges smooth.
@@ -332,26 +358,19 @@ Image _buildForeground(Image tile) {
     throw StateError('Could not isolate the logo mark in $kSource');
   }
 
-  // Square crop around the mark, then inset it into the adaptive safe zone.
+  // Square crop centred on the mark so it is never stretched.
   final side = math.max(maxX - minX + 1, maxY - minY + 1);
   final cx = (minX + maxX) ~/ 2;
   final cy = (minY + maxY) ~/ 2;
-  final cropped = copyCrop(
+  stdout.writeln('mark ${side}x$side at ($cx,$cy) '
+      '= ${(side / size * 100).round()}% of the tile');
+  return copyCrop(
     mark,
     x: cx - side ~/ 2,
     y: cy - side ~/ 2,
     width: side,
     height: side,
   );
-  stdout.writeln('mark ${side}x$side at ($cx,$cy)');
-
-  final target = (kMasterSize * kForegroundMarkFraction).round();
-  final scaled = copyResize(cropped,
-      width: target, height: target, interpolation: Interpolation.cubic);
-  final foreground = Image(width: kMasterSize, height: kMasterSize, numChannels: 4);
-  compositeImage(foreground, scaled,
-      dstX: (kMasterSize - target) ~/ 2, dstY: (kMasterSize - target) ~/ 2);
-  return foreground;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -428,9 +447,6 @@ String _hex(List<int> rgb) => '#'
     '${rgb[0].toRadixString(16).padLeft(2, '0')}'
     '${rgb[1].toRadixString(16).padLeft(2, '0')}'
     '${rgb[2].toRadixString(16).padLeft(2, '0')}';
-
-Image _resizeSquare(Image image, int size) => copyResize(image,
-    width: size, height: size, interpolation: Interpolation.cubic);
 
 void _write(String name, Image image, {required bool alpha}) {
   final out = alpha ? image : image.convert(numChannels: 3);
