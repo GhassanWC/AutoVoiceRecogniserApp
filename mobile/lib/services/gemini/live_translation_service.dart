@@ -217,6 +217,14 @@ class LiveTranslationService {
   final StringBuffer _translationBuffer = StringBuffer();
   String? _sourceLanguageCode;
 
+  /// A segment closed by a LANGUAGE SWITCH whose translation had not arrived
+  /// yet. It keeps ownership of the next translation chunk, so a lagging
+  /// translation lands in the bubble that produced it rather than the next
+  /// speaker's.
+  String? _tailId;
+  String? _tailLanguage;
+  final StringBuffer _tailSource = StringBuffer();
+
   /// Bytes of Gemini audio received and discarded this session (diagnostics).
   int _discardedAudioBytes = 0;
 
@@ -296,6 +304,7 @@ class LiveTranslationService {
     _lastChunkAt = null;
     _lastGateState = null;
     _lastServerKeys = null;
+    _clearTail();
     resetLiveTraceThrottles();
     liveTrace('SESSION_START', 'target=$targetLanguageCode');
     _resetUtterance();
@@ -678,9 +687,14 @@ class LiveTranslationService {
     if (output is Map) {
       final text = output['text'];
       if (text is String && text.isNotEmpty) {
-        // Translation belongs to whichever utterance is open. A language
-        // switch has already closed the previous one, so a new speaker's
-        // translation cannot extend the previous speaker's bubble.
+        // Ownership, not "whoever is open": a segment closed by a language
+        // switch before its translation arrived still owns that translation,
+        // so a lagging translation lands in the bubble that produced it
+        // instead of the next speaker's.
+        if (_tailId != null) {
+          _finalizeTailWithTranslation(text);
+          return;
+        }
         if (_utteranceId == null) _openUtterance(null);
         _translationBuffer.write(text);
         liveTrace(
@@ -766,7 +780,25 @@ class LiveTranslationService {
 
     liveTrace('LANGUAGE_SWITCH',
         'from=$current to=$incoming — closing utterance=$_utteranceId');
-    _finalizePendingUtterance();
+
+    if (_translationBuffer.isEmpty && _sourceBuffer.isNotEmpty) {
+      // Its translation has not arrived yet. Gemini's translation LAGS its
+      // input, so this segment's translation can land after the next
+      // speaker's source text. Closing it now would finalize it with an empty
+      // translation AND push its words into the next speaker's bubble, so it
+      // keeps ownership of the translation until that translation arrives.
+      _finalizeTail(); // at most one segment ever waits
+      _tailId = _utteranceId;
+      _tailLanguage = _sourceLanguageCode;
+      _tailSource
+        ..clear()
+        ..write(_sourceBuffer.toString());
+      liveTrace('TRANSLATION_TAIL',
+          'utterance=$_tailId holds the next translation chunk');
+      _resetUtterance();
+    } else {
+      _finalizePendingUtterance();
+    }
     _openUtterance(incoming);
   }
 
@@ -790,7 +822,51 @@ class LiveTranslationService {
     ));
   }
 
+  /// Closes the waiting segment with the translation it was holding out for.
+  void _finalizeTailWithTranslation(String translation) {
+    final id = _tailId;
+    if (id == null) return;
+    liveTrace('TRANSLATION_TAIL',
+        'utterance=$id claimed its ${translation.length}ch translation');
+    _events.add(UtteranceFinalized(
+      utteranceId: id,
+      sourceText: _tailSource.toString().trim(),
+      translatedText: translation.trim(),
+      sourceLanguageCode: _tailLanguage,
+      at: _now(),
+    ));
+    _clearTail();
+  }
+
+  /// Closes the waiting segment without a translation — its translation never
+  /// came (the turn ended, or another speaker switched first).
+  void _finalizeTail() {
+    final id = _tailId;
+    if (id == null) return;
+    final source = _tailSource.toString().trim();
+    if (source.isNotEmpty) {
+      liveTrace('TRANSLATION_TAIL', 'utterance=$id closed with no translation');
+      _events.add(UtteranceFinalized(
+        utteranceId: id,
+        sourceText: source,
+        translatedText: '',
+        sourceLanguageCode: _tailLanguage,
+        at: _now(),
+      ));
+    }
+    _clearTail();
+  }
+
+  void _clearTail() {
+    _tailId = null;
+    _tailLanguage = null;
+    _tailSource.clear();
+  }
+
   void _finalizePendingUtterance() {
+    // The waiting segment is older, so it closes first and keeps its place in
+    // the conversation.
+    _finalizeTail();
     final id = _utteranceId;
     if (id == null) return;
     final source = _sourceBuffer.toString().trim();

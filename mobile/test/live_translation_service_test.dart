@@ -759,30 +759,172 @@ void main() {
         reason: 'each language segment owns its own bubble');
   });
 
-  test('a late event cannot relabel an already-closed bubble', () async {
+  // THE race: Gemini's translation lags its input, so a segment's translation
+  // can arrive AFTER the next speaker's source text has already opened a new
+  // segment. Routing translation to "whichever utterance is open" put the
+  // first speaker's words into the second speaker's bubble — and finalized the
+  // first bubble with an empty translation.
+  test('a delayed translation goes to the speaker who produced it, not to the '
+      'speaker who is talking now', () async {
     final h = Harness();
     await h.startListening();
 
-    sendSource(h, 'नमस्ते', 'hi-IN');
-    sendSource(h, 'สวัสดี', 'th-TH'); // closes the Hindi utterance
+    // 1. Hindi source.
+    sendSource(h, 'मेट्रो कहाँ है', 'hi-IN');
     await h.pump();
-    final hindi = h.events.whereType<UtteranceFinalized>().single;
-    expect(hindi.sourceLanguageCode, 'hi');
-
-    // A delayed frame for the same speech arrives afterwards. It may extend
-    // the open Thai utterance, but the closed Hindi bubble keeps its identity.
-    sendSource(h, ' more', 'th-TH');
+    // 2. Thai source arrives BEFORE Hindi's translation.
+    sendSource(h, 'รถไฟฟ้าอยู่ที่ไหน', 'th-TH');
+    await h.pump();
+    // 3. Hindi's translation finally arrives — while Thai is the open segment.
+    sendTranslation(h, 'أين المترو؟');
+    await h.pump();
+    // 4. Thai's own translation.
+    sendTranslation(h, 'أين القطار؟');
     h.socket.serverSends({
       'serverContent': {'turnComplete': true}
     });
     await h.pump();
 
-    final closedAgain = h.events
-        .whereType<UtteranceFinalized>()
-        .firstWhere((e) => e.utteranceId == hindi.utteranceId);
-    expect(closedAgain.sourceLanguageCode, 'hi',
-        reason: 'a finalized bubble is immutable');
-    expect(closedAgain.sourceText, 'नमस्ते');
+    final finalized = h.events.whereType<UtteranceFinalized>().toList();
+    expect(finalized, hasLength(2));
+
+    final hindi = finalized[0];
+    final thai = finalized[1];
+
+    // The Hindi bubble keeps its own source AND its own translation.
+    expect(hindi.sourceLanguageCode, 'hi');
+    expect(hindi.sourceText, 'मेट्रो कहाँ है');
+    expect(hindi.translatedText, 'أين المترو؟',
+        reason: 'the delayed translation belongs to the Hindi speaker');
+
+    // The Thai bubble has ONLY Thai content.
+    expect(thai.sourceLanguageCode, 'th');
+    expect(thai.sourceText, 'รถไฟฟ้าอยู่ที่ไหน');
+    expect(thai.translatedText, 'أين القطار؟');
+    expect(thai.translatedText, isNot(contains('المترو')),
+        reason: "the Hindi speaker's translation must never land in Thai");
+
+    // Two distinct bubbles, neither relabelled.
+    expect(hindi.utteranceId, isNot(thai.utteranceId));
+  });
+
+  test('a delayed translation does not steal the next speaker\'s translation '
+      'when the first speaker was already translated', () async {
+    final h = Harness();
+    await h.startListening();
+
+    // The common clean case: Hindi is fully translated before Thai starts.
+    sendSource(h, 'नमस्ते', 'hi-IN');
+    sendTranslation(h, 'مرحبا');
+    await h.pump();
+    sendSource(h, 'สวัสดี', 'th-TH');
+    sendTranslation(h, 'أهلا');
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final finalized = h.events.whereType<UtteranceFinalized>().toList();
+    expect(finalized, hasLength(2));
+    // Neither bubble borrows the other's translation.
+    expect(finalized[0].translatedText, 'مرحبا');
+    expect(finalized[1].translatedText, 'أهلا');
+  });
+
+  // KNOWN LIMITATION, pinned deliberately.
+  //
+  // When the first speaker's translation had ALREADY started before the
+  // switch, the remainder of it is indistinguishable from the start of the
+  // next speaker's translation: both appear as "one translation chunk right
+  // after a language switch", and Live Translate attaches no segment marker
+  // to outputTranscription. Claiming that chunk for the previous speaker
+  // would break the far more common clean case (first speaker fully
+  // translated, then the next speaks) by stealing the NEW speaker's first
+  // words — see the test above. So the remainder goes to the open segment.
+  //
+  // The source text is still correctly split, and both flags stay right; only
+  // the tail of an already-started translation can land one bubble late.
+  test('LIMITATION: the tail of an already-started translation follows the '
+      'open segment', () async {
+    final h = Harness();
+    await h.startListening();
+
+    sendSource(h, 'मेट्रो कहाँ है', 'hi-IN');
+    sendTranslation(h, 'أين '); // Hindi translation STARTS
+    await h.pump();
+    sendSource(h, 'รถไฟฟ้าอยู่ที่ไหน', 'th-TH'); // switch
+    sendTranslation(h, 'المترو؟'); // remainder of the HINDI translation
+    sendTranslation(h, 'أين القطار؟'); // Thai's own translation
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final finalized = h.events.whereType<UtteranceFinalized>().toList();
+    expect(finalized, hasLength(2));
+
+    // The split of SOURCE speech and the flags are still exactly right.
+    expect(finalized[0].sourceLanguageCode, 'hi');
+    expect(finalized[0].sourceText, 'मेट्रो कहाँ है');
+    expect(finalized[1].sourceLanguageCode, 'th');
+    expect(finalized[1].sourceText, 'รถไฟฟ้าอยู่ที่ไหน');
+
+    // But the Hindi bubble keeps only the part translated before the switch,
+    // and the remainder is attributed to the open (Thai) segment.
+    expect(finalized[0].translatedText, 'أين');
+    expect(finalized[1].translatedText, 'المترو؟أين القطار؟');
+  });
+
+  test('a speaker who never gets a translation still closes as their own '
+      'bubble', () async {
+    final h = Harness();
+    await h.startListening();
+
+    sendSource(h, 'नमस्ते', 'hi-IN');
+    await h.pump();
+    sendSource(h, 'สวัสดี', 'th-TH'); // Hindi still has no translation
+    await h.pump();
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final finalized = h.events.whereType<UtteranceFinalized>().toList();
+    expect(finalized, hasLength(2));
+    expect(finalized[0].sourceLanguageCode, 'hi');
+    expect(finalized[0].sourceText, 'नमस्ते');
+    expect(finalized[0].translatedText, isEmpty);
+    expect(finalized[1].sourceLanguageCode, 'th');
+    expect(finalized[1].sourceText, 'สวัสดี');
+  });
+
+  test('a late event cannot relabel an already-closed bubble', () async {
+    final h = Harness();
+    await h.startListening();
+
+    sendSource(h, 'नमस्ते', 'hi-IN');
+    sendSource(h, 'สวัสดี', 'th-TH'); // closes the Hindi segment for source
+    await h.pump();
+
+    // More Thai keeps arriving, and then the turn ends.
+    sendSource(h, ' ครับ', 'th-TH');
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final finalized = h.events.whereType<UtteranceFinalized>().toList();
+    expect(finalized, hasLength(2));
+    final hindi = finalized.firstWhere((e) => e.sourceLanguageCode == 'hi');
+    final thai = finalized.firstWhere((e) => e.sourceLanguageCode == 'th');
+
+    // Nothing that arrived after the switch changed the Hindi bubble's
+    // language or text — its language is assigned once, at creation.
+    expect(hindi.sourceLanguageCode, 'hi',
+        reason: 'a closed bubble is immutable');
+    expect(hindi.sourceText, 'नमस्ते');
+    expect(hindi.sourceText, isNot(contains('สวัสดี')));
+    expect(thai.sourceText, 'สวัสดี ครับ');
   });
 
   test('an utterance opened by translation adopts the first language reported',
