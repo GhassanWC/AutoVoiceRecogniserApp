@@ -55,6 +55,10 @@ import UIKit
         let text = args?["text"] as? String ?? ""
         let language = args?["languageCode"] as? String ?? "en"
         result(self.speech.speak(text: text, languageCode: language))
+      case "prepare":
+        let args = call.arguments as? [String: Any]
+        self.speech.prepare(languageCode: args?["languageCode"] as? String ?? "en-US")
+        result(nil)
       case "stop":
         self.speech.stop()
         result(nil)

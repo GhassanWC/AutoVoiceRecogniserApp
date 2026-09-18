@@ -124,8 +124,9 @@ class MessageBubble extends StatelessWidget {
                         style: theme.textTheme.labelSmall
                             ?.copyWith(color: AppColors.textTertiary),
                       ),
-                    if (onReplay != null &&
-                        message.status == TranslationStatus.done) ...[
+                    // Available as soon as there is translated TEXT to read —
+                    // it never waits for turnComplete or for audio.
+                    if (onReplay != null) ...[
                       const SizedBox(width: 4),
                       _SpeakerButton(onPressed: onReplay!, isPlaying: isPlaying),
                     ],

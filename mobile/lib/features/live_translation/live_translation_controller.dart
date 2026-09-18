@@ -87,13 +87,14 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   String? _playingMessageId;
   String? get playingMessageId => _playingMessageId;
 
-  /// Whether [message] can be spoken aloud. The device synthesizer needs only
-  /// the finalized TEXT, so this is true the moment a translation lands — and
-  /// stays true for history, with nothing held in memory.
+  /// Whether [message] can be spoken aloud.
+  ///
+  /// Derived from the translated TEXT alone: the device synthesizer needs
+  /// nothing else, so the speaker appears the instant the first translated
+  /// words stream in. It deliberately does NOT wait for turnComplete, and it
+  /// has no relationship to Gemini's generated audio (which is discarded).
   bool canSpeak(TranslationMessage message) =>
-      settings.settings.autoSpeak &&
-      message.status == TranslationStatus.done &&
-      message.translatedText.trim().isNotEmpty;
+      settings.settings.autoSpeak && message.translatedText.trim().isNotEmpty;
 
   final StreamController<String> _notices = StreamController.broadcast();
 
@@ -117,6 +118,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   int _persistedCount = 0;
   bool _wasReconnecting = false;
   bool _restarting = false;
+  String? _lastPreparedVoice;
   DateTime _lastLevelNotify = DateTime.fromMillisecondsSinceEpoch(0);
 
   // ── Start / stop ────────────────────────────────────────────────────────────
@@ -157,10 +159,13 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     _persistedCount = 0;
     _sessionTargetLanguage = settings.settings.targetLanguage;
 
-    // 3. Token + WebSocket + microphone — all inside the service.
+    // 3. Warm the speech synthesizer for this target language now, so the
+    //    first speaker tap is instant instead of paying engine startup.
+    unawaited(_speech.prepare(ttsLocaleFor(_sessionTargetLanguage)));
+
+    // 4. Token + WebSocket + microphone — all inside the service.
     await _service.start(
       targetLanguageCode: geminiCodeFor(_sessionTargetLanguage),
-      playAudio: settings.settings.autoSpeak,
     );
     // State transitions arrive via _onServiceState; a failure lands here as
     // an error state + ServiceError event.
@@ -393,27 +398,38 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     _playingMessageId = message.id;
     notifyListeners();
 
-    // Roughly how long the speech will last (~14 characters/second), used to
-    // quiet the uplink. It is only an upper bound: the synthesizer's "stopped"
-    // event releases the gate as soon as it really finishes.
-    if (isListening) {
-      final estimate = Duration(
-          milliseconds: (text.length * 1000 / 14).round().clamp(1000, 20000));
-      _service.gateUplinkForSpeech(estimate);
+    // Quiet the uplink only while the phone is actually talking. The duration
+    // is an upper bound (~14 characters/second, hard-capped): the
+    // synthesizer's "stopped" event — which fires on completion, cancel AND
+    // error — releases it as soon as speech really ends, and the bound itself
+    // guarantees the microphone reopens even if that event never arrives.
+    var started = false;
+    try {
+      if (isListening) {
+        final estimate = Duration(
+            milliseconds: (text.length * 1000 / 14).round().clamp(1000, 20000));
+        _service.gateUplinkForSpeech(estimate);
+      }
+      started = await _speech.speak(
+        text,
+        languageCode: ttsLocaleFor(message.targetLanguage),
+      );
+    } catch (e) {
+      developer.log('speech synthesis threw: $e', name: 'live');
+      started = false;
+    } finally {
+      if (!started) {
+        // Never started (no voice, or it threw): reopen the microphone at
+        // once and drop the row's playing state rather than waiting for an
+        // event that will not come.
+        _service.releaseSpeechGate();
+        _playingMessageId = null;
+        notifyListeners();
+      }
     }
-
-    final spoken = await _speech.speak(
-      text,
-      languageCode: geminiCodeFor(message.targetLanguage),
-    );
-    if (!spoken) {
-      // No synthesizer or no voice for this language — don't leave the row
-      // showing a playing state, and let the microphone straight back in.
+    if (!started) {
       developer.log('no speech synthesis for ${message.targetLanguage}',
           name: 'live');
-      _service.releaseSpeechGate();
-      _playingMessageId = null;
-      notifyListeners();
       _notices.add('No installed voice for '
           '${languageForCode(message.targetLanguage)?.name ?? message.targetLanguage}.');
     }
@@ -423,6 +439,12 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   void _onSettingsChanged() {
     final target = settings.settings.targetLanguage;
+    if (target != _lastPreparedVoice) {
+      // Follow the target language with the voice, so a tap right after
+      // switching reads the new language rather than the old one.
+      _lastPreparedVoice = target;
+      unawaited(_speech.prepare(ttsLocaleFor(target)));
+    }
     if (!isListening || target == _sessionTargetLanguage || _restarting) return;
     _restarting = true;
     _notices.add(

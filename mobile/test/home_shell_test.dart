@@ -506,9 +506,10 @@ void main() {
 
     await tester.tap(speaker);
     await _pumpFrames(tester);
-    // Spoken with the device voice, in the message's target language.
+    // Spoken with the device voice, using a real BCP-47 voice locale for the
+    // message's target language.
     expect(h.speech.spoken.single.text, 'أين المترو؟');
-    expect(h.speech.spoken.single.languageCode, 'ar');
+    expect(h.speech.spoken.single.languageCode, 'ar-SA');
     expect(h.playback.fedChunks, 0, reason: 'no Gemini PCM is ever played');
 
     // The uplink is quiet while it speaks, then resumes the moment it ends.

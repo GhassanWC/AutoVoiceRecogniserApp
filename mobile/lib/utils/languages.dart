@@ -104,6 +104,40 @@ String geminiCodeFor(String iso639) => switch (iso639.toLowerCase()) {
       final other => other,
     };
 
+/// BCP-47 locale for the device speech synthesizer. Gemini's own codes are
+/// not always usable voice locales ("zh-Hans" is a script tag, not a locale),
+/// and bare language tags leave the picked voice up to the platform — so each
+/// catalog language names the region whose voice ships on both platforms.
+/// Unknown codes fall through unchanged and the synthesizer decides.
+String ttsLocaleFor(String iso639) => switch (iso639.toLowerCase()) {
+      'ar' => 'ar-SA',
+      'en' => 'en-US',
+      'es' => 'es-ES',
+      'fr' => 'fr-FR',
+      'de' => 'de-DE',
+      'hi' => 'hi-IN',
+      'zh' => 'zh-CN',
+      'ja' => 'ja-JP',
+      'ko' => 'ko-KR',
+      'tr' => 'tr-TR',
+      'pt' => 'pt-BR',
+      'ru' => 'ru-RU',
+      'th' => 'th-TH',
+      'id' => 'id-ID',
+      'ms' => 'ms-MY',
+      'it' => 'it-IT',
+      'nl' => 'nl-NL',
+      'ur' => 'ur-PK',
+      'fa' => 'fa-IR',
+      'he' => 'he-IL',
+      'vi' => 'vi-VN',
+      'pl' => 'pl-PL',
+      'uk' => 'uk-UA',
+      'el' => 'el-GR',
+      'sv' => 'sv-SE',
+      final other => other,
+    };
+
 /// Normalizes a language code reported by Gemini (BCP-47, e.g. "pt-BR",
 /// "zh-Hans", "en-US") back to the catalog's primary subtag for display
 /// lookup. Unknown codes pass through unchanged.

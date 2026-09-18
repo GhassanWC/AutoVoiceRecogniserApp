@@ -12,11 +12,16 @@ import 'package:live_translator/services/audio/audio_playback_service.dart';
 import 'package:live_translator/services/firestore/session_repository.dart';
 import 'package:live_translator/services/gemini/live_translation_service.dart';
 import 'package:live_translator/services/permissions/mic_permission_service.dart';
+import 'package:live_translator/services/speech/speech_service.dart';
 import 'package:live_translator/services/storage/settings_store.dart';
+import 'package:live_translator/utils/languages.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class FakeSocket implements GeminiSocket {
   final StreamController<dynamic> incoming = StreamController<dynamic>.broadcast();
+
+  /// Count of realtimeInput (microphone) frames actually sent upstream.
+  int audioFrames = 0;
   final List<String> sent = [];
   @override
   int? closeCode;
@@ -25,7 +30,11 @@ class FakeSocket implements GeminiSocket {
   @override
   Stream<dynamic> get messages => incoming.stream;
   @override
-  void send(String data) => sent.add(data);
+  void send(String data) {
+    sent.add(data);
+    if (data.contains('realtimeInput')) audioFrames++;
+  }
+
   @override
   Future<void> close() async {
     if (!incoming.isClosed) await incoming.close();
@@ -36,6 +45,8 @@ class FakeSocket implements GeminiSocket {
 
 class FakeCapture extends AudioCaptureService {
   bool running = false;
+  void Function(Uint8List pcm)? onAudio;
+
   @override
   bool get isCapturing => running;
   @override
@@ -44,12 +55,16 @@ class FakeCapture extends AudioCaptureService {
     required void Function(String reason) onStopped,
   }) async {
     running = true;
+    this.onAudio = onAudio;
   }
 
   @override
   Future<void> stop() async {
     running = false;
   }
+
+  /// ~100 ms of 16 kHz PCM16 — one full uplink chunk.
+  void emitChunk() => onAudio!(Uint8List.fromList(List.filled(3200, 7)));
 }
 
 class FakePlayback extends AudioPlaybackService {
@@ -64,6 +79,45 @@ class FakePlayback extends AudioPlaybackService {
   Future<void> stop() async {}
   @override
   Future<void> dispose() async => active.close();
+}
+
+/// Stands in for the device synthesizer so tests can drive completion,
+/// cancellation and failure deterministically.
+class FakeSpeech extends SpeechService {
+  final List<({String text, String languageCode})> spoken = [];
+  final List<String> prepared = [];
+  final StreamController<bool> _speaking = StreamController<bool>.broadcast();
+  int stopCalls = 0;
+
+  /// false = no installed voice for that language (speak fails up front).
+  bool available = true;
+
+  /// true = speak() throws instead of returning.
+  bool throwOnSpeak = false;
+
+  @override
+  Stream<bool> get speaking => _speaking.stream;
+
+  @override
+  Future<void> prepare(String languageCode) async => prepared.add(languageCode);
+
+  @override
+  Future<bool> speak(String text, {required String languageCode}) async {
+    if (throwOnSpeak) throw StateError('synthesizer exploded');
+    spoken.add((text: text, languageCode: languageCode));
+    if (available) _speaking.add(true);
+    return available;
+  }
+
+  /// The synthesizer finished, was cancelled, or errored after starting —
+  /// natively all three surface as "no longer speaking".
+  void endSpeech() => _speaking.add(false);
+
+  @override
+  Future<void> stop() async => stopCalls++;
+
+  @override
+  Future<void> dispose() async => _speaking.close();
 }
 
 class GrantedPermissions extends MicPermissionService {
@@ -105,10 +159,11 @@ class Harness {
         sockets.add(socket);
         return socket;
       },
-      capture: FakeCapture(),
+      capture: capture,
       playback: FakePlayback(),
       backoffDelays: const [Duration.zero],
       playbackGateTail: Duration.zero,
+      now: () => clock,
     );
     controller = LiveTranslationController(
       settings: settings,
@@ -116,12 +171,18 @@ class Harness {
       permissions: permissions ?? GrantedPermissions(),
       sessionRepository: SessionRepository(firestore: firestore),
       uidProvider: () => 'user-1',
+      speech: speech,
     );
   }
 
   final FakeFirebaseFirestore firestore = FakeFirebaseFirestore();
   final List<FakeSocket> sockets = [];
   final List<String> tokenTargets = [];
+  final FakeCapture capture = FakeCapture();
+  final FakeSpeech speech = FakeSpeech();
+
+  /// Drives the service's speech gate clock.
+  DateTime clock = DateTime.utc(2026, 9, 18, 12);
   late final SettingsController settings;
   late final LiveTranslationService service;
   late final LiveTranslationController controller;
@@ -158,6 +219,264 @@ Future<void> _utterance(Harness h, String source, String translation) async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() => SharedPreferences.setMockInitialValues({}));
+
+  // ── Source-language ownership in the UI model ───────────────────────────────
+
+  test('a Thai speaker after a Hindi speaker gets a SEPARATE bubble with its '
+      'own flag, and the Hindi bubble is untouched', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'मेट्रो कहाँ है', 'languageCode': 'hi-IN'},
+      }
+    });
+    h.socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'أين المترو؟'}
+      }
+    });
+    await h.pump();
+    expect(h.controller.messages, hasLength(1));
+    final hindiId = h.controller.messages.single.id;
+
+    // Person B starts speaking Thai — mid-turn, no turnComplete.
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'รถไฟฟ้าอยู่ที่ไหน', 'languageCode': 'th-TH'},
+      }
+    });
+    h.socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'أين القطار؟'}
+      }
+    });
+    await h.pump();
+
+    expect(h.controller.messages, hasLength(2),
+        reason: 'different source languages must not share a bubble');
+
+    final hindi = h.controller.messages.firstWhere((m) => m.id == hindiId);
+    final thai = h.controller.messages.firstWhere((m) => m.id != hindiId);
+
+    // Each bubble owns its language — flags come from the message itself.
+    expect(hindi.sourceLanguage, 'hi');
+    expect(thai.sourceLanguage, 'th');
+    expect(detectedLanguageFlag(hindi.sourceLanguage, hindi.languageConfidence),
+        languageForCode('hi')!.flag);
+    expect(detectedLanguageFlag(thai.sourceLanguage, thai.languageConfidence),
+        languageForCode('th')!.flag);
+
+    // No cross-contamination in either direction.
+    expect(hindi.originalText, 'मेट्रो कहाँ है');
+    expect(hindi.translatedText, 'أين المترو؟');
+    expect(thai.originalText, 'รถไฟฟ้าอยู่ที่ไหน');
+    expect(thai.translatedText, 'أين القطار؟');
+  });
+
+  test('the Hindi bubble keeps its flag after Thai and English follow', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+
+    for (final (text, language) in [
+      ('नमस्ते', 'hi-IN'),
+      ('สวัสดี', 'th-TH'),
+      ('Good morning', 'en-US'),
+    ]) {
+      h.socket.serverSends({
+        'serverContent': {
+          'inputTranscription': {'text': text, 'languageCode': language},
+        }
+      });
+      await h.pump();
+    }
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    expect(h.controller.messages, hasLength(3));
+    expect(h.controller.messages.map((m) => m.sourceLanguage),
+        ['hi', 'th', 'en']);
+    expect(h.controller.messages.map((m) => m.originalText),
+        ['नमस्ते', 'สวัสดี', 'Good morning']);
+  });
+
+  // ── Speaker availability + TTS microphone gating ────────────────────────────
+
+  test('the speaker button is available as soon as translated TEXT exists, '
+      'without waiting for turnComplete', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'Where is the metro?', 'languageCode': 'en'},
+      }
+    });
+    await h.pump();
+    // Transcript only: nothing to read aloud yet.
+    expect(h.controller.canSpeak(h.controller.messages.single), isFalse);
+
+    // The first streamed translation word arrives — still PENDING, no
+    // turnComplete, and no Gemini audio of any kind.
+    h.socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'أين'}
+      }
+    });
+    await h.pump();
+    final message = h.controller.messages.single;
+    expect(message.status, TranslationStatus.pending);
+    expect(h.controller.canSpeak(message), isTrue,
+        reason: 'speaker availability comes from translated text alone');
+  });
+
+  test('speaking reads the current translated text, gates the mic, and the '
+      'gate reopens on completion', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    // Warmed when the session started, so the first tap is instant.
+    expect(h.speech.prepared, contains('ar-SA'));
+
+    await _utterance(h, 'Where is the metro?', 'أين المترو؟');
+    final message = h.controller.messages.single;
+
+    await h.controller.speakTranslation(message);
+    // Reads exactly what is on screen, with a real BCP-47 voice locale.
+    expect(h.speech.spoken.single.text, 'أين المترو؟');
+    expect(h.speech.spoken.single.languageCode, 'ar-SA');
+    expect(h.controller.playingMessageId, message.id);
+
+    // Microphone is quiet while the phone talks...
+    final before = h.socket.audioFrames;
+    h.capture.emitChunk();
+    expect(h.socket.audioFrames, before, reason: 'gated during speech');
+    // ...and the session is never disturbed.
+    expect(h.controller.state, ListeningState.listening);
+    expect(h.sockets, hasLength(1));
+
+    // Completion reopens it immediately.
+    h.speech.endSpeech();
+    await h.pump();
+    expect(h.controller.playingMessageId, isNull);
+    h.capture.emitChunk();
+    expect(h.socket.audioFrames, before + 1,
+        reason: 'microphone resumes the moment speech ends');
+  });
+
+  test('a cancelled replay reopens the microphone', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    await _utterance(h, 'Where is the metro?', 'أين المترو؟');
+
+    await h.controller.speakTranslation(h.controller.messages.single);
+    final before = h.socket.audioFrames;
+    h.capture.emitChunk();
+    expect(h.socket.audioFrames, before);
+
+    // Cancelled (e.g. the user tapped another message): natively this is the
+    // same "no longer speaking" signal as completion.
+    h.speech.endSpeech();
+    await h.pump();
+    h.capture.emitChunk();
+    expect(h.socket.audioFrames, before + 1);
+    expect(h.controller.playingMessageId, isNull);
+  });
+
+  test('a synthesizer with no voice reopens the microphone at once', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    await _utterance(h, 'Where is the metro?', 'أين المترو؟');
+    h.speech.available = false;
+
+    await h.controller.speakTranslation(h.controller.messages.single);
+
+    // No speech started, so nothing may stay gated or stuck "playing".
+    expect(h.controller.playingMessageId, isNull);
+    final before = h.socket.audioFrames;
+    h.capture.emitChunk();
+    expect(h.socket.audioFrames, before + 1,
+        reason: 'a failed replay must not gate the microphone');
+    expect(h.controller.state, ListeningState.listening);
+  });
+
+  test('a synthesizer that throws reopens the microphone at once', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    await _utterance(h, 'Where is the metro?', 'أين المترو؟');
+    h.speech.throwOnSpeak = true;
+
+    // The error is contained — speaking must never take the session down.
+    await h.controller.speakTranslation(h.controller.messages.single);
+
+    expect(h.controller.playingMessageId, isNull);
+    final before = h.socket.audioFrames;
+    h.capture.emitChunk();
+    expect(h.socket.audioFrames, before + 1,
+        reason: 'an error must not leave the microphone gated');
+    expect(h.controller.state, ListeningState.listening);
+  });
+
+  test('the speech gate expires even if the synthesizer never reports back',
+      () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    await _utterance(h, 'Where is the metro?', 'أين المترو؟');
+
+    await h.controller.speakTranslation(h.controller.messages.single);
+    final before = h.socket.audioFrames;
+    h.capture.emitChunk();
+    expect(h.socket.audioFrames, before, reason: 'gated');
+
+    // No completion event ever arrives. The bound alone must free the mic.
+    h.clock = h.clock.add(const Duration(seconds: 25));
+    h.capture.emitChunk();
+    expect(h.socket.audioFrames, before + 1,
+        reason: 'the microphone can NEVER stay permanently gated');
+  });
+
+  test('switching target language re-points the voice', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    expect(h.speech.prepared, contains('ar-SA'));
+
+    await h.settings.setTargetLanguage('th');
+    await h.pump();
+    expect(h.speech.prepared, contains('th-TH'),
+        reason: 'the voice follows the target language');
+  });
+
+  test('five consecutive translations are all immediately speakable', () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+
+    for (final (source, translation) in [
+      ('Where is the metro?', 'أين المترو؟'),
+      ('How much is the ticket?', 'كم سعر التذكرة؟'),
+      ('Does it stop at the museum?', 'هل يتوقف عند المتحف؟'),
+      ('When is the last train?', 'متى آخر قطار؟'),
+      ('Thank you very much', 'شكرا جزيلا'),
+    ]) {
+      await _utterance(h, source, translation);
+    }
+
+    expect(h.controller.messages, hasLength(5));
+    for (final message in h.controller.messages) {
+      expect(h.controller.canSpeak(message), isTrue);
+    }
+  });
 
   // ── Background listening ────────────────────────────────────────────────────
 

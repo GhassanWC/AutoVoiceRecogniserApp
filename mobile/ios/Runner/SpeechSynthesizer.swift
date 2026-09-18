@@ -16,6 +16,7 @@ final class SpeechSynthesizer: NSObject, FlutterStreamHandler,
 {
   private let synthesizer = AVSpeechSynthesizer()
   private var eventSink: FlutterEventSink?
+  private var preparedVoice: AVSpeechSynthesisVoice?
 
   override init() {
     super.init()
@@ -38,13 +39,31 @@ final class SpeechSynthesizer: NSObject, FlutterStreamHandler,
 
   // MARK: - Speaking
 
+  /// Resolves (and caches) the voice for `languageCode` ahead of the first
+  /// tap. AVSpeechSynthesizer itself needs no warming, but looking the voice
+  /// up here keeps the first speak() off the voice-catalog path.
+  func prepare(languageCode: String) {
+    preparedVoice = Self.voice(for: languageCode)
+  }
+
   /// Speaks `text` in `languageCode` (BCP-47). Returns false when the device
   /// has no voice for that language, so the UI can say so instead of appearing
   /// to do nothing.
   func speak(text: String, languageCode: String) -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return false }
-    guard let voice = Self.voice(for: languageCode) else { return false }
+    // Use the warmed voice when it matches, otherwise resolve now.
+    let voice: AVSpeechSynthesisVoice
+    if let prepared = preparedVoice,
+      prepared.language.caseInsensitiveCompare(languageCode) == .orderedSame
+    {
+      voice = prepared
+    } else if let resolved = Self.voice(for: languageCode) {
+      voice = resolved
+      preparedVoice = resolved
+    } else {
+      return false
+    }
 
     // A new tap replaces whatever is being said rather than queueing behind it.
     if synthesizer.isSpeaking {

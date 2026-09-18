@@ -148,8 +148,8 @@ class Harness {
 
   FakeSocket get socket => sockets.last;
 
-  Future<void> startListening({bool playAudio = true}) async {
-    await service.start(targetLanguageCode: 'ar', playAudio: playAudio);
+  Future<void> startListening() async {
+    await service.start(targetLanguageCode: 'ar');
     socket.serverSends({'setupComplete': {}});
     await pump();
   }
@@ -208,7 +208,7 @@ void main() {
 
   test('no microphone chunks are sent before setupComplete arrives', () async {
     final h = Harness();
-    await h.service.start(targetLanguageCode: 'ar', playAudio: true);
+    await h.service.start(targetLanguageCode: 'ar');
     // Connected, setup frame sent — but setupComplete has NOT arrived, so
     // capture is not running yet and nothing may reach the uplink.
     expect(h.capture.startCalls, 0);
@@ -244,7 +244,7 @@ void main() {
 
   test('setup timeout really closes the stalled socket before reconnecting', () async {
     final h = Harness(setupTimeout: Duration.zero);
-    await h.service.start(targetLanguageCode: 'ar', playAudio: true);
+    await h.service.start(targetLanguageCode: 'ar');
     // setupComplete never arrives; the timeout must actually CLOSE the old
     // socket (not just abandon it) and then retry on a fresh connection.
     for (var i = 0; i < 4; i++) {
@@ -261,7 +261,7 @@ void main() {
       connectOverride: (uri) async =>
           throw Exception("Connection to '$uri' was not upgraded to websocket"),
     );
-    await h.service.start(targetLanguageCode: 'ar', playAudio: true);
+    await h.service.start(targetLanguageCode: 'ar');
     for (var i = 0; i < 12; i++) {
       await h.pump();
     }
@@ -640,6 +640,169 @@ void main() {
         reason: 'a stuck playback claim must never latch the microphone off');
   });
 
+  // ── Source-language segmentation ──────────────────────────────────────────
+  //
+  // Gemini reports the detected source language per input transcription. A
+  // change there means a different speaker, and must open a NEW bubble — even
+  // mid-turn, before any turnComplete. Previously the first language latched
+  // for the whole turn, so a Thai speaker's words were appended to the Hindi
+  // speaker's bubble and inherited the Hindi flag.
+
+  void sendSource(Harness h, String text, String? language) {
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {
+          'text': text,
+          if (language != null) 'languageCode': language,
+        }
+      }
+    });
+  }
+
+  void sendTranslation(Harness h, String text) {
+    h.socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': text}
+      }
+    });
+  }
+
+  test('a Hindi utterance produces ONE Hindi-owned bubble', () async {
+    final h = Harness();
+    await h.startListening();
+
+    sendSource(h, 'मेट्रो कहाँ है', 'hi-IN');
+    sendTranslation(h, 'أين المترو؟');
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final finalized = h.events.whereType<UtteranceFinalized>().single;
+    expect(finalized.sourceText, 'मेट्रो कहाँ है');
+    expect(finalized.translatedText, 'أين المترو؟');
+    expect(finalized.sourceLanguageCode, 'hi');
+  });
+
+  test('two chunks of the SAME language stay in one utterance', () async {
+    final h = Harness();
+    await h.startListening();
+
+    // Same language, once tagged regionally and once bare: normalized, these
+    // are the same speaker, so they must not split.
+    sendSource(h, 'मेट्रो ', 'hi-IN');
+    sendSource(h, 'कहाँ है', 'hi');
+    await h.pump();
+
+    final updates = h.events.whereType<TranscriptUpdate>().toList();
+    expect(updates.map((u) => u.utteranceId).toSet(), hasLength(1),
+        reason: 'hi and hi-IN are the same language');
+    expect(updates.last.sourceText, 'मेट्रो कहाँ है');
+    expect(h.events.whereType<UtteranceFinalized>(), isEmpty,
+        reason: 'no boundary was crossed');
+  });
+
+  test('Thai after Hindi opens a NEW bubble and never touches the Hindi one',
+      () async {
+    final h = Harness();
+    await h.startListening();
+
+    sendSource(h, 'मेट्रो कहाँ है', 'hi-IN');
+    sendTranslation(h, 'أين المترو؟');
+    await h.pump();
+
+    // A different source language mid-turn — no turnComplete in sight.
+    sendSource(h, 'รถไฟฟ้าอยู่ที่ไหน', 'th-TH');
+    sendTranslation(h, 'أين القطار؟');
+    await h.pump();
+
+    // The Hindi utterance was closed at the switch, with ONLY its own text.
+    final hindi = h.events.whereType<UtteranceFinalized>().single;
+    expect(hindi.sourceLanguageCode, 'hi');
+    expect(hindi.sourceText, 'मेट्रो कहाँ है');
+    expect(hindi.translatedText, 'أين المترو؟');
+    expect(hindi.sourceText, isNot(contains('รถไฟฟ้า')),
+        reason: 'Thai speech must never land in the Hindi bubble');
+    expect(hindi.translatedText, isNot(contains('القطار')),
+        reason: "Thai's translation must not extend the Hindi bubble");
+
+    // The Thai one is a different utterance carrying the Thai language.
+    final thai = h.events.whereType<TranscriptUpdate>().last;
+    expect(thai.utteranceId, isNot(hindi.utteranceId));
+    expect(thai.sourceLanguageCode, 'th');
+    expect(thai.sourceText, 'รถไฟฟ้าอยู่ที่ไหน');
+    expect(thai.translatedText, 'أين القطار؟');
+  });
+
+  test('Hindi → Thai → English produces three language-owned bubbles', () async {
+    final h = Harness();
+    await h.startListening();
+
+    sendSource(h, 'नमस्ते', 'hi-IN');
+    sendTranslation(h, 'مرحبا');
+    sendSource(h, 'สวัสดี', 'th-TH');
+    sendTranslation(h, 'أهلا');
+    sendSource(h, 'Good morning', 'en-US');
+    sendTranslation(h, 'صباح الخير');
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final finalized = h.events.whereType<UtteranceFinalized>().toList();
+    expect(finalized, hasLength(3));
+    expect(finalized.map((e) => e.sourceLanguageCode), ['hi', 'th', 'en']);
+    expect(finalized.map((e) => e.sourceText), ['नमस्ते', 'สวัสดี', 'Good morning']);
+    expect(finalized.map((e) => e.translatedText),
+        ['مرحبا', 'أهلا', 'صباح الخير']);
+    expect(finalized.map((e) => e.utteranceId).toSet(), hasLength(3),
+        reason: 'each language segment owns its own bubble');
+  });
+
+  test('a late event cannot relabel an already-closed bubble', () async {
+    final h = Harness();
+    await h.startListening();
+
+    sendSource(h, 'नमस्ते', 'hi-IN');
+    sendSource(h, 'สวัสดี', 'th-TH'); // closes the Hindi utterance
+    await h.pump();
+    final hindi = h.events.whereType<UtteranceFinalized>().single;
+    expect(hindi.sourceLanguageCode, 'hi');
+
+    // A delayed frame for the same speech arrives afterwards. It may extend
+    // the open Thai utterance, but the closed Hindi bubble keeps its identity.
+    sendSource(h, ' more', 'th-TH');
+    h.socket.serverSends({
+      'serverContent': {'turnComplete': true}
+    });
+    await h.pump();
+
+    final closedAgain = h.events
+        .whereType<UtteranceFinalized>()
+        .firstWhere((e) => e.utteranceId == hindi.utteranceId);
+    expect(closedAgain.sourceLanguageCode, 'hi',
+        reason: 'a finalized bubble is immutable');
+    expect(closedAgain.sourceText, 'नमस्ते');
+  });
+
+  test('an utterance opened by translation adopts the first language reported',
+      () async {
+    final h = Harness();
+    await h.startListening();
+
+    // Translation lands before any source transcription (wire order is not
+    // guaranteed) — this must NOT create a second bubble.
+    sendTranslation(h, 'مرحبا');
+    sendSource(h, 'नमस्ते', 'hi-IN');
+    await h.pump();
+
+    final updates = h.events.whereType<TranscriptUpdate>().toList();
+    expect(updates.map((u) => u.utteranceId).toSet(), hasLength(1));
+    expect(updates.last.sourceLanguageCode, 'hi');
+    expect(updates.last.translatedText, 'مرحبا');
+    expect(h.events.whereType<UtteranceFinalized>(), isEmpty);
+  });
+
   test('a generationComplete followed by turnComplete finalizes only once', () async {
     final h = Harness();
     await h.startListening();
@@ -733,7 +896,7 @@ void main() {
     final h = Harness(tokenErrors: [
       const TokenRequestException(LiveErrorKind.quota, 'quota'),
     ]);
-    await h.service.start(targetLanguageCode: 'ar', playAudio: true);
+    await h.service.start(targetLanguageCode: 'ar');
     await h.pump();
 
     expect(h.service.state, LiveServiceState.error);
@@ -797,7 +960,7 @@ void main() {
     expect(h.capture.stopCalls, greaterThan(0), reason: 'mic must not stay hot after failure');
 
     // Error state is recoverable: a fresh start() works.
-    await h.service.start(targetLanguageCode: 'ar', playAudio: true);
+    await h.service.start(targetLanguageCode: 'ar');
     h.socket.serverSends({'setupComplete': {}});
     await h.pump();
     expect(h.service.state, LiveServiceState.listening);

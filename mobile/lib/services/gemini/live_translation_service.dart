@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:uuid/uuid.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../../utils/languages.dart' show normalizeDetectedLanguage;
 import '../../utils/mic_level.dart';
 import '../audio/audio_capture_service.dart';
 import '../audio/audio_playback_service.dart';
@@ -202,7 +203,6 @@ class LiveTranslationService {
   Timer? _reconnectTimer;
   LiveSessionToken? _token;
   String _targetLanguageCode = 'en';
-  bool _playAudio = true;
   bool _setupDone = false;
   bool _captureRunning = false;
   int _reconnectAttempts = 0;
@@ -275,17 +275,14 @@ class LiveTranslationService {
   /// mapped through geminiCodeFor). Microphone capture must be permitted
   /// beforehand — permission UX is the controller's job.
   ///
-  /// [playAudio] keeps Gemini's spoken translation for each utterance so the
-  /// user can replay it from that message. Translated audio is NEVER played
-  /// automatically: doing so put the device's own speaker into the room while
-  /// the microphone was live, which gated the uplink and stopped the session
-  /// translating anything after the first utterance. Playback now happens only
-  /// via [playTranslationAudio], on an explicit tap.
-  Future<void> start({required String targetLanguageCode, required bool playAudio}) async {
+  /// Gemini's generated speech is discarded — translations are read aloud on
+  /// demand by the device synthesizer instead (see SpeechService). Routing
+  /// Gemini's audio to the speaker while the microphone was live is what used
+  /// to gate the uplink and stop a session translating after one utterance.
+  Future<void> start({required String targetLanguageCode}) async {
     if (_state != LiveServiceState.idle && _state != LiveServiceState.error) return;
     final generation = ++_generation;
     _targetLanguageCode = targetLanguageCode;
-    _playAudio = playAudio;
     _reconnectAttempts = 0;
     _resumeHandle = null;
     _lastSocketError = null;
@@ -300,7 +297,7 @@ class LiveTranslationService {
     _lastGateState = null;
     _lastServerKeys = null;
     resetLiveTraceThrottles();
-    liveTrace('SESSION_START', 'target=$targetLanguageCode playAudio=$playAudio');
+    liveTrace('SESSION_START', 'target=$targetLanguageCode');
     _resetUtterance();
     _setState(LiveServiceState.connecting);
 
@@ -497,7 +494,7 @@ class LiveTranslationService {
     // message's speaker button.
     _setState(LiveServiceState.listening);
     liveTrace('SETUP_COMPLETE',
-        'capture=$_captureRunning playAudio=$_playAudio target=$_targetLanguageCode');
+        'capture=$_captureRunning target=$_targetLanguageCode');
     _startHealthTrace();
   }
 
@@ -662,12 +659,12 @@ class LiveTranslationService {
     if (input is Map) {
       final text = input['text'];
       if (text is String && text.isNotEmpty) {
-        _utteranceId ??= _newUtteranceId();
+        final raw = input['languageCode'];
+        // A language change opens a NEW utterance before this text is stored,
+        // so the incoming words can never land in the previous speaker's
+        // bubble (see _openOrContinueUtterance).
+        _openOrContinueUtterance(raw is String && raw.isNotEmpty ? raw : null);
         _sourceBuffer.write(text);
-        final language = input['languageCode'];
-        if (language is String && language.isNotEmpty) {
-          _sourceLanguageCode ??= language;
-        }
         // Content is user speech — log shape only, never the words.
         liveTrace(
             'INPUT_TRANSCRIPTION',
@@ -681,7 +678,10 @@ class LiveTranslationService {
     if (output is Map) {
       final text = output['text'];
       if (text is String && text.isNotEmpty) {
-        _utteranceId ??= _newUtteranceId();
+        // Translation belongs to whichever utterance is open. A language
+        // switch has already closed the previous one, so a new speaker's
+        // translation cannot extend the previous speaker's bubble.
+        if (_utteranceId == null) _openUtterance(null);
         _translationBuffer.write(text);
         liveTrace(
             'OUTPUT_TRANSCRIPTION',
@@ -692,7 +692,7 @@ class LiveTranslationService {
     }
 
     final modelTurn = content['modelTurn'];
-    if (_playAudio && modelTurn is Map) {
+    if (modelTurn is Map) {
       final parts = modelTurn['parts'];
       if (parts is List) {
         for (final part in parts) {
@@ -725,6 +725,58 @@ class LiveTranslationService {
       // a no-op (buffers empty).
       _finalizePendingUtterance();
     }
+  }
+
+  // ── Utterance segmentation ──────────────────────────────────────────────────
+  //
+  // One bubble = one speaker's continuous speech in ONE language. Gemini gives
+  // no speaker identity, but it does report the detected source language per
+  // input transcription, and a change there is a hard segment boundary: when
+  // a Hindi speaker is followed by a Thai speaker inside the same model turn,
+  // the Thai words must NOT extend the Hindi bubble or inherit its flag.
+  //
+  // Boundaries are therefore: turnComplete/generationComplete (as before) OR a
+  // source-language change (new). Each utterance's language is assigned once,
+  // at creation, and never mutated — so a late event can never relabel a
+  // bubble that has already been closed.
+
+  /// Opens a new utterance, or keeps the current one, for incoming source
+  /// speech tagged [rawLanguage].
+  void _openOrContinueUtterance(String? rawLanguage) {
+    final incoming =
+        rawLanguage == null ? null : normalizeDetectedLanguage(rawLanguage);
+
+    if (_utteranceId == null) {
+      _openUtterance(incoming);
+      return;
+    }
+    // No language reported: this is more of whatever is already open.
+    if (incoming == null) return;
+
+    final current = _sourceLanguageCode;
+    if (current == null) {
+      // The utterance was opened by a translation before any language was
+      // known — adopt the first one reported rather than splitting.
+      _sourceLanguageCode = incoming;
+      return;
+    }
+    // Compared normalized, so "hi" and "hi-IN" are the same speaker's
+    // language while "hi-IN" and "th-TH" are not.
+    if (current == incoming) return;
+
+    liveTrace('LANGUAGE_SWITCH',
+        'from=$current to=$incoming — closing utterance=$_utteranceId');
+    _finalizePendingUtterance();
+    _openUtterance(incoming);
+  }
+
+  void _openUtterance(String? normalizedLanguage) {
+    _utteranceId = _newUtteranceId();
+    _sourceLanguageCode = normalizedLanguage;
+    _sourceBuffer.clear();
+    _translationBuffer.clear();
+    liveTrace('UTTERANCE_OPEN',
+        'utterance=$_utteranceId lang=${normalizedLanguage ?? 'unknown'}');
   }
 
   void _emitUpdate() {

@@ -70,6 +70,12 @@ class MainActivity : FlutterActivity() {
                         val language = call.argument<String>("languageCode") ?: "en"
                         result.success(SpeechSynthesizer.speak(text, language))
                     }
+                    "prepare" -> {
+                        SpeechSynthesizer.prepare(
+                            call.argument<String>("languageCode") ?: "en-US"
+                        )
+                        result.success(null)
+                    }
                     "stop" -> {
                         SpeechSynthesizer.stop()
                         result.success(null)

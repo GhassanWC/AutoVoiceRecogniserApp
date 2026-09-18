@@ -43,7 +43,23 @@ class SpeechService {
     });
   }
 
-  /// Speaks [text] using the voice for [languageCode] (BCP-47, e.g. "ar",
+  /// Warms the synthesizer and pre-selects the voice for [languageCode], so
+  /// the first tap does not pay engine-initialization cost (Android's
+  /// TextToSpeech in particular binds to a service asynchronously). Called
+  /// when a session starts and whenever the target language changes; safe to
+  /// call repeatedly and safe to ignore failures.
+  Future<void> prepare(String languageCode) async {
+    _listen();
+    try {
+      await _control.invokeMethod<void>('prepare', {'languageCode': languageCode});
+    } on MissingPluginException {
+      // No synthesizer on this platform.
+    } on PlatformException {
+      // Warming is best effort; speak() reports real failures.
+    }
+  }
+
+  /// Speaks [text] using the voice for [languageCode] (BCP-47, e.g. "ar-SA",
   /// "pt-BR"). Returns false when the platform has no synthesizer (web/desktop
   /// preview) or no voice for that language, so the UI can stay honest instead
   /// of showing a control that does nothing.

@@ -52,7 +52,18 @@ object SpeechSynthesizer : EventChannel.StreamHandler {
     }
 
     /**
-     * Speaks [text] with the voice for [languageCode] (BCP-47, e.g. "ar",
+     * Warms the engine and pre-selects the voice for [languageCode]. Android's
+     * TextToSpeech binds to its engine service asynchronously, so doing this
+     * when a session starts is what keeps the FIRST speaker tap instant.
+     */
+    fun prepare(languageCode: String) {
+        val engine = tts ?: return
+        if (!ready) return
+        applyLanguage(engine, languageCode)
+    }
+
+    /**
+     * Speaks [text] with the voice for [languageCode] (BCP-47, e.g. "ar-SA",
      * "pt-BR"). Returns false when no voice is installed for that language, so
      * the UI can say so rather than appearing to do nothing.
      */
