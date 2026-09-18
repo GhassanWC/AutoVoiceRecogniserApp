@@ -59,5 +59,26 @@ class MainActivity : FlutterActivity() {
             flutterEngine.dartExecutor.binaryMessenger,
             "app.livetranslator/playback_events"
         ).setStreamHandler(AudioPlaybackManager)
+
+        // Device text-to-speech: reads a finalized translation aloud on demand.
+        SpeechSynthesizer.init(applicationContext)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "app.livetranslator/tts")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "speak" -> {
+                        val text = call.argument<String>("text").orEmpty()
+                        val language = call.argument<String>("languageCode") ?: "en"
+                        result.success(SpeechSynthesizer.speak(text, language))
+                    }
+                    "stop" -> {
+                        SpeechSynthesizer.stop()
+                        result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, "app.livetranslator/tts_events")
+            .setStreamHandler(SpeechSynthesizer)
     }
 }

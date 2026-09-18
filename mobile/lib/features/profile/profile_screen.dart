@@ -80,11 +80,20 @@ class ProfileScreen extends StatelessWidget {
               ),
               _ToggleTile(
                 icon: Icons.volume_up_outlined,
-                title: 'Keep translated voice',
-                subtitle: 'Adds a play button to each translation',
+                title: 'Read translations aloud',
+                subtitle: "Adds a speaker button using your device's voice",
                 value: settings.autoSpeak,
                 onChanged: (value) =>
                     controller.update((s) => s.copyWith(autoSpeak: value)),
+              ),
+              _ToggleTile(
+                icon: Icons.nightlight_outlined,
+                title: 'Continue listening in background',
+                subtitle: 'Keeps translating when the app is not on screen. '
+                    'A notification stays visible the whole time.',
+                value: settings.continueInBackground,
+                onChanged: (value) => controller
+                    .update((s) => s.copyWith(continueInBackground: value)),
               ),
               _ToggleTile(
                 icon: Icons.subtitles_outlined,

@@ -10,6 +10,7 @@ import '../../utils/languages.dart';
 import '../../widgets/components/app_background.dart';
 import '../../widgets/components/empty_state.dart';
 import '../../widgets/components/history_card.dart' show HistoryCard;
+import '../live_translation/live_translation_controller.dart';
 import '../live_translation/widgets/message_bubble.dart';
 
 /// One saved conversation, rendered with the same bubbles as the live view.
@@ -80,12 +81,22 @@ class SessionDetailScreen extends StatelessWidget {
                             padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
                             itemCount: messages.length,
                             separatorBuilder: (_, __) => const SizedBox(height: 10),
-                            itemBuilder: (context, index) => MessageBubble(
-                              message: messages[index],
-                              showOriginal: settings.showOriginalText,
-                              showTimestamp: true,
-                              showLanguageLabels: settings.showLanguageLabels,
-                            ),
+                            itemBuilder: (context, index) {
+                              final message = messages[index];
+                              final live = context.read<LiveTranslationController>();
+                              return MessageBubble(
+                                message: message,
+                                showOriginal: settings.showOriginalText,
+                                showTimestamp: true,
+                                showLanguageLabels: settings.showLanguageLabels,
+                                // Saved translations can be read aloud too —
+                                // the device synthesizer works from the text,
+                                // so nothing had to be stored.
+                                onReplay: live.canSpeak(message)
+                                    ? () => live.speakTranslation(message)
+                                    : null,
+                              );
+                            },
                           );
                         },
                       ),

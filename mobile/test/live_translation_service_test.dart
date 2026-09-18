@@ -508,10 +508,11 @@ void main() {
     for (var i = 0; i < phrases.length; i++) {
       expect(finalized[i].sourceText, phrases[i].$1);
       expect(finalized[i].translatedText, phrases[i].$2);
-      // Each keeps its own audio for on-demand replay.
-      expect(finalized[i].audio, isNotNull);
-      expect(finalized[i].audio!.length, 48000);
     }
+    // Gemini's audio was received and thrown away — the device synthesizer
+    // speaks translations instead, so nothing is buffered or played.
+    expect(h.playback.fed, isEmpty);
+    expect(h.playback.startCalls, 0);
     expect(finalized.map((e) => e.utteranceId).toSet(), hasLength(5),
         reason: 'every utterance gets its own bubble');
 
@@ -561,42 +562,39 @@ void main() {
     expect(h.playback.startCalls, 0);
   });
 
-  test('manual replay plays the clip and leaves the session listening',
+  test('speaking a translation quiets the uplink, then the microphone resumes',
       () async {
     var clock = DateTime.utc(2026, 9, 18, 9);
-    final h = Harness(
-      playbackGateTail: const Duration(milliseconds: 300),
-      now: () => clock,
-    );
+    final h = Harness(now: () => clock);
     await h.startListening();
     final socket = h.socket;
 
-    // 1 second of translated audio, replayed on demand.
-    final clip = Uint8List.fromList(List.filled(48000, 3));
-    await h.service.playTranslationAudio(clip);
-    await h.pump();
-    expect(h.playback.startCalls, 1);
-    expect(h.playback.fed.single, hasLength(48000));
+    // The device synthesizer starts: the uplink goes quiet so the spoken
+    // translation cannot be picked up and re-translated.
+    h.service.gateUplinkForSpeech(const Duration(seconds: 3));
+    h.mic();
+    expect(h.sentAudio(socket), isEmpty, reason: 'quiet while speaking');
 
-    // The session is untouched...
+    // The session itself is untouched throughout.
     expect(h.service.state, LiveServiceState.listening);
     expect(h.capture.stopCalls, 0);
     expect(socket.closed, isFalse);
 
-    // ...but the uplink is quiet while the speaker is audible, so the clip
-    // cannot loop back in and be re-translated.
-    h.playback.active.add(true);
-    await h.pump();
-    h.mic();
-    expect(h.sentAudio(socket), isEmpty, reason: 'gated during the replay');
-
-    // And it resumes by itself once the clip has played out.
-    h.playback.active.add(false);
-    await h.pump();
-    clock = clock.add(const Duration(seconds: 2));
+    // The synthesizer reports it finished early — the microphone resumes at
+    // once rather than waiting out the estimate.
+    h.service.releaseSpeechGate();
     h.mic();
     expect(h.sentAudio(socket), hasLength(1),
-        reason: 'listening continues normally after a replay');
+        reason: 'microphone resumes the moment speech ends');
+
+    // And the gate expires by itself even if that signal never arrives.
+    h.service.gateUplinkForSpeech(const Duration(seconds: 3));
+    h.mic();
+    expect(h.sentAudio(socket), hasLength(1));
+    clock = clock.add(const Duration(seconds: 4));
+    h.mic();
+    expect(h.sentAudio(socket), hasLength(2),
+        reason: 'a speech gate can never latch the microphone off');
   });
 
   test('a latched "still speaking" claim cannot gate the microphone forever',
@@ -660,7 +658,7 @@ void main() {
     expect(h.events.whereType<UtteranceFinalized>(), hasLength(1));
   });
 
-  test('translated audio is kept for replay, and a cut-off turn keeps none',
+  test('Gemini translated audio is received and discarded, never played',
       () async {
     final h = Harness();
     await h.startListening();
@@ -680,38 +678,35 @@ void main() {
           }
         });
 
-    // A complete turn: its audio rides along with the finalized utterance.
+    // Live Translate emits AUDIO because the ephemeral token locks that
+    // modality. The transcript is used; the audio is dropped on the floor.
     h.socket.serverSends({
       'serverContent': {
         'inputTranscription': {'text': 'Hello', 'languageCode': 'en'}
       }
     });
-    sendAudio(480);
-    sendAudio(480);
-    h.socket.serverSends({
-      'serverContent': {'turnComplete': true}
-    });
-    await h.pump();
-    expect(h.playback.fed, isEmpty, reason: 'never played automatically');
-    expect(h.events.whereType<UtteranceFinalized>().single.audio, hasLength(960));
-
-    // An interrupted turn produced only partial audio — it is dropped rather
-    // than offered for replay.
     h.socket.serverSends({
       'serverContent': {
-        'inputTranscription': {'text': 'Wait', 'languageCode': 'en'}
+        'outputTranscription': {'text': 'مرحبا'}
       }
     });
-    sendAudio(480);
-    h.socket.serverSends({
-      'serverContent': {'interrupted': true}
-    });
+    sendAudio(48000);
+    sendAudio(48000);
     h.socket.serverSends({
       'serverContent': {'turnComplete': true}
     });
     await h.pump();
-    expect(h.events.whereType<UtteranceFinalized>().last.audio, isNull);
-    expect(h.playback.fed, isEmpty);
+
+    final finalized = h.events.whereType<UtteranceFinalized>().single;
+    expect(finalized.translatedText, 'مرحبا',
+        reason: 'the TEXT is what the device synthesizer will speak');
+    expect(h.playback.fed, isEmpty, reason: 'never routed to the speaker');
+    expect(h.playback.startCalls, 0, reason: 'the player is never even armed');
+
+    // And the microphone was never gated by any of it.
+    h.mic();
+    expect(h.sentAudio(h.socket), hasLength(1));
+    expect(h.service.state, LiveServiceState.listening);
   });
 
   test('half-duplex gate: mic chunks are DROPPED while the device is speaking', () async {

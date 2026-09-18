@@ -17,8 +17,14 @@ product law; each names the code that enforces it.
    native capture FIRST, then closes the Gemini socket — not one extra sample
    is recorded or sent after Stop.
 
-4. **Leaving the app stops the session.** `didChangeAppLifecycleState` stops
-   listening when the app is backgrounded. No silent background capture.
+4. **Leaving the app stops the session — unless the user opted in.**
+   `didChangeAppLifecycleState` stops listening when the app is backgrounded.
+   "Continue listening in background" (`AppSettings.continueInBackground`, OFF
+   by default) is the only way that changes, and when it is on the listening
+   is never hidden: Android keeps the microphone foreground service and its
+   persistent "Sayvo is listening" notification with a Stop action on screen,
+   and iOS shows the system microphone indicator the whole time. No silent
+   background capture, ever.
 
 5. **Audio streams only while listening, only to Gemini.** Microphone audio
    goes over one encrypted WebSocket directly to the Gemini Live API — never
@@ -26,6 +32,9 @@ product law; each names the code that enforces it.
 
 6. **Raw audio is never stored.** Not on the device, not in Firestore
    (`SessionRepository.addMessage` writes text fields only), not anywhere.
+   Gemini's own generated speech is received and discarded rather than kept;
+   the speaker button re-synthesizes the translated TEXT with the device's
+   voice (`SpeechService`), so nothing audio-shaped is ever retained.
 
 7. **History is text-only and private to the user.** Finalized original +
    translated text with detected language, stored under `users/{uid}` and

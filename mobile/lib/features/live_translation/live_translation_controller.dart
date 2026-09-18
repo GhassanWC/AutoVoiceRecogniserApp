@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:developer' as developer;
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
@@ -9,6 +8,7 @@ import '../../models/translation_message.dart';
 import '../../services/firestore/session_repository.dart';
 import '../../services/gemini/live_translation_service.dart';
 import '../../services/permissions/mic_permission_service.dart';
+import '../../services/speech/speech_service.dart';
 import '../../services/storage/settings_store.dart';
 import '../../utils/languages.dart';
 
@@ -21,9 +21,14 @@ class SessionSummary {
   final Duration duration;
 }
 
-/// Thin adapter between [LiveTranslationService] (Gemini Live Translate) and
-/// the chat UI. Owns the message list, permission UX, history persistence of
-/// FINALIZED utterances, and user-facing error copy.
+/// Owns the live translation SESSION for the whole app.
+///
+/// This is deliberately app-level state (created once in main.dart and
+/// provided above the navigator), not screen state: switching tabs, pushing a
+/// route, or backgrounding the app must not tear a session down. The only
+/// things that end a session are the user stopping it, a fatal service error,
+/// or — when "Continue listening in background" is OFF — the app leaving the
+/// foreground.
 ///
 /// Invariant it protects: the UI state always matches the real microphone
 /// state, and the microphone is only ever started by an explicit user action.
@@ -34,14 +39,17 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     MicPermissionService? permissions,
     SessionRepository? sessionRepository,
     String? Function()? uidProvider,
+    SpeechService? speech,
   })  : _service = service,
         permissions = permissions ?? MicPermissionService(),
         _sessions = sessionRepository,
-        _uidProvider = uidProvider {
+        _uidProvider = uidProvider,
+        _speech = speech ?? SpeechService() {
     _eventSubscription = _service.events.listen(_onServiceEvent);
     _stateSubscription = _service.stateChanges.listen(_onServiceState);
     _levelSubscription = _service.micLevel.listen(_onMicLevel);
     _speakingSubscription = _service.speaking.listen(_onSpeaking);
+    _synthesizerSubscription = _speech.speaking.listen(_onSynthesizerSpeaking);
     settings.addListener(_onSettingsChanged);
     WidgetsBinding.instance.addObserver(this);
   }
@@ -51,6 +59,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   final LiveTranslationService _service;
   final SessionRepository? _sessions;
   final String? Function()? _uidProvider;
+  final SpeechService _speech;
 
   // ── Observable state ────────────────────────────────────────────────────────
 
@@ -74,23 +83,17 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   /// Set when a session just ended, so the UI can show the summary sheet.
   SessionSummary? lastSummary;
 
-  /// Gemini's spoken translation per message id, kept in memory for THIS
-  /// session so a message can be replayed on demand. Never persisted (audio
-  /// is never stored — see the privacy policy) and never played automatically.
-  final Map<String, Uint8List> _translationAudio = {};
-  int _translationAudioBytes = 0;
-
-  /// ~2 minutes of 24 kHz PCM16 across the whole conversation; the oldest
-  /// clips are dropped first so a long session cannot grow without bound.
-  static const int _maxRetainedAudioBytes = 6000000;
-
-  /// Message whose translation is playing right now (null when silent).
+  /// Message whose translation is being spoken right now (null when silent).
   String? _playingMessageId;
   String? get playingMessageId => _playingMessageId;
 
-  /// Whether [messageId] has audio available to replay.
-  bool hasTranslationAudio(String messageId) =>
-      _translationAudio.containsKey(messageId);
+  /// Whether [message] can be spoken aloud. The device synthesizer needs only
+  /// the finalized TEXT, so this is true the moment a translation lands — and
+  /// stays true for history, with nothing held in memory.
+  bool canSpeak(TranslationMessage message) =>
+      settings.settings.autoSpeak &&
+      message.status == TranslationStatus.done &&
+      message.translatedText.trim().isNotEmpty;
 
   final StreamController<String> _notices = StreamController.broadcast();
 
@@ -105,6 +108,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   StreamSubscription<LiveServiceState>? _stateSubscription;
   StreamSubscription<double>? _levelSubscription;
   StreamSubscription<bool>? _speakingSubscription;
+  StreamSubscription<bool>? _synthesizerSubscription;
 
   DateTime? _sessionStartedAt;
   String _sessionId = '';
@@ -168,7 +172,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     await _service.stop();
     state = ListeningState.idle;
     activityLabel = null;
-    _playingMessageId = null;
+    _listeningInBackground = false;
     micLevel = 0;
     lastSummary = SessionSummary(
       translationCount: _persistedCount,
@@ -229,10 +233,6 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
           status: TranslationStatus.pending,
         );
       case UtteranceFinalized():
-        // Retain BEFORE applying the transcript: _applyTranscript notifies
-        // listeners, and the speaker button is only offered for messages that
-        // already have audio.
-        _retainAudio(event.utteranceId, event.audio);
         _applyTranscript(
           event.utteranceId,
           sourceText: event.sourceText,
@@ -361,41 +361,61 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     }
   }
 
-  /// Only a manual replay reaches this now; when it finishes, the message
-  /// stops showing its playing state. The listening pill is untouched.
+  /// Gemini's own audio output is discarded, so nothing reaches this from the
+  /// translation flow; it exists for the service's own playback signal.
   void _onSpeaking(bool speaking) {
     if (speaking || _playingMessageId == null) return;
     _playingMessageId = null;
     notifyListeners();
   }
 
-  // ── On-demand translation playback ──────────────────────────────────────────
-
-  void _retainAudio(String messageId, Uint8List? audio) {
-    if (audio == null || audio.isEmpty) return;
-    _translationAudio[messageId] = audio;
-    _translationAudioBytes += audio.length;
-    // Drop the oldest clips first (insertion-ordered map).
-    while (_translationAudioBytes > _maxRetainedAudioBytes &&
-        _translationAudio.length > 1) {
-      final oldest = _translationAudio.keys.first;
-      _translationAudioBytes -= _translationAudio.remove(oldest)!.length;
+  /// The device synthesizer started/stopped. While it is audible the uplink
+  /// is quiet so the spoken translation cannot be re-translated; the moment it
+  /// stops, the microphone resumes. The session itself is never touched.
+  void _onSynthesizerSpeaking(bool speaking) {
+    if (!speaking) {
+      _service.releaseSpeechGate();
+      _playingMessageId = null;
+      notifyListeners();
     }
   }
 
-  /// Plays one finalized translation out loud, on an explicit tap. Listening
-  /// keeps running throughout — this never stops or restarts the session.
-  Future<void> playTranslation(String messageId) async {
-    final audio = _translationAudio[messageId];
-    if (audio == null) return;
-    _playingMessageId = messageId;
+  // ── Speak a translation on demand ───────────────────────────────────────────
+
+  /// Reads one finalized translation aloud with the device's own voice, in the
+  /// message's target language. Listening keeps running throughout — this
+  /// never stops, restarts, or re-scopes the session.
+  Future<void> speakTranslation(TranslationMessage message) async {
+    if (!canSpeak(message)) return;
+    final text = message.translatedText.trim();
+    // Tapping a second message replaces the first instead of overlapping.
+    await _speech.stop();
+    _playingMessageId = message.id;
     notifyListeners();
-    try {
-      await _service.playTranslationAudio(audio);
-    } catch (e) {
-      developer.log('translation playback failed: $e', name: 'live');
+
+    // Roughly how long the speech will last (~14 characters/second), used to
+    // quiet the uplink. It is only an upper bound: the synthesizer's "stopped"
+    // event releases the gate as soon as it really finishes.
+    if (isListening) {
+      final estimate = Duration(
+          milliseconds: (text.length * 1000 / 14).round().clamp(1000, 20000));
+      _service.gateUplinkForSpeech(estimate);
+    }
+
+    final spoken = await _speech.speak(
+      text,
+      languageCode: geminiCodeFor(message.targetLanguage),
+    );
+    if (!spoken) {
+      // No synthesizer or no voice for this language — don't leave the row
+      // showing a playing state, and let the microphone straight back in.
+      developer.log('no speech synthesis for ${message.targetLanguage}',
+          name: 'live');
+      _service.releaseSpeechGate();
       _playingMessageId = null;
       notifyListeners();
+      _notices.add('No installed voice for '
+          '${languageForCode(message.targetLanguage)?.name ?? message.targetLanguage}.');
     }
   }
 
@@ -424,9 +444,8 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   void clearConversation() {
     messages.clear();
-    _translationAudio.clear();
-    _translationAudioBytes = 0;
     _playingMessageId = null;
+    unawaited(_speech.stop());
     lastSummary = null;
     notifyListeners();
   }
@@ -443,17 +462,39 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   // ── Lifecycle ───────────────────────────────────────────────────────────────
 
+  /// True while a session is deliberately continuing with the app in the
+  /// background — the UI says so explicitly when the user comes back.
+  bool _listeningInBackground = false;
+  bool get listeningInBackground => _listeningInBackground;
+
   @override
   // ignore: avoid_renaming_method_parameters — `state` is taken by our own field.
   void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
-    // Privacy rule: the app leaving the foreground stops the session — no
-    // silent background listening (§16). The Android notification's Stop and
-    // iOS route loss surface through the service's capture callbacks instead.
-    if (lifecycle == AppLifecycleState.paused && isListening && !_restarting) {
-      stopListening();
-      errorBanner = 'Listening stopped because the app went to the background.';
-      notifyListeners();
+    if (lifecycle == AppLifecycleState.resumed) {
+      if (_listeningInBackground) {
+        _listeningInBackground = false;
+        notifyListeners();
+      }
+      return;
     }
+    if (lifecycle != AppLifecycleState.paused || !isListening || _restarting) {
+      return;
+    }
+    if (settings.settings.continueInBackground) {
+      // Opted in: the session keeps running behind the Android notification /
+      // the iOS microphone indicator. Nothing is hidden — both platforms show
+      // a live listening indicator the whole time.
+      _listeningInBackground = true;
+      developer.log('app backgrounded — continuing to listen (opted in)',
+          name: 'live');
+      notifyListeners();
+      return;
+    }
+    // Default: leaving the foreground stops the session, so listening can
+    // never continue without the user having asked for it.
+    stopListening();
+    errorBanner = 'Listening stopped because the app went to the background.';
+    notifyListeners();
   }
 
   @override
@@ -464,6 +505,8 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     _stateSubscription?.cancel();
     _levelSubscription?.cancel();
     _speakingSubscription?.cancel();
+    _synthesizerSubscription?.cancel();
+    _speech.dispose();
     _service.dispose();
     _notices.close();
     super.dispose();

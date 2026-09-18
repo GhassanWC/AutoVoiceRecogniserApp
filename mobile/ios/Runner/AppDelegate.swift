@@ -14,6 +14,7 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private let audioCapture = AudioCaptureManager()
   private let audioPlayback = AudioPlaybackManager()
+  private let speech = SpeechSynthesizer()
 
   override func application(
     _ application: UIApplication,
@@ -38,6 +39,29 @@ import UIKit
     let playbackEvents = FlutterEventChannel(
       name: "app.livetranslator/playback_events", binaryMessenger: messenger)
     playbackEvents.setStreamHandler(audioPlayback)
+
+    // Device text-to-speech: reads a finalized translation aloud on demand.
+    let ttsEvents = FlutterEventChannel(
+      name: "app.livetranslator/tts_events", binaryMessenger: messenger)
+    ttsEvents.setStreamHandler(speech)
+
+    let tts = FlutterMethodChannel(
+      name: "app.livetranslator/tts", binaryMessenger: messenger)
+    tts.setMethodCallHandler { [weak self] call, result in
+      guard let self else { return }
+      switch call.method {
+      case "speak":
+        let args = call.arguments as? [String: Any]
+        let text = args?["text"] as? String ?? ""
+        let language = args?["languageCode"] as? String ?? "en"
+        result(self.speech.speak(text: text, languageCode: language))
+      case "stop":
+        self.speech.stop()
+        result(nil)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
 
     control.setMethodCallHandler { [weak self] call, result in
       guard let self else { return }
@@ -137,6 +161,8 @@ final class AudioCaptureManager: NSObject, FlutterStreamHandler {
   private var eventSink: FlutterEventSink?
   private(set) var isRunning = false
 
+  private var observersRegistered = false
+
   func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink)
     -> FlutterError?
   {
@@ -213,21 +239,95 @@ final class AudioCaptureManager: NSObject, FlutterStreamHandler {
     try engine.start()
     isRunning = true
 
+    registerObservers(session: session)
+  }
+
+  /// Registered exactly once — `start` runs again on every recovery, and
+  /// duplicate observers would multiply every interruption into several
+  /// restarts.
+  private func registerObservers(session: AVAudioSession) {
+    guard !observersRegistered else { return }
+    observersRegistered = true
     // A phone call or Siri taking the microphone must flip the UI to
     // "Not Listening" — the app never pretends to listen when it can't.
     NotificationCenter.default.addObserver(
       self, selector: #selector(handleInterruption(_:)),
       name: AVAudioSession.interruptionNotification, object: session)
+    // Background listening spans headphone plugs, Bluetooth connects and
+    // speaker switches; a route change reconfigures the engine, so the tap has
+    // to be rebuilt or capture silently goes dead while still "listening".
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(handleRouteChange(_:)),
+      name: AVAudioSession.routeChangeNotification, object: session)
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(handleEngineConfigurationChange(_:)),
+      name: .AVAudioEngineConfigurationChange, object: engine)
   }
 
   @objc private func handleInterruption(_ notification: Notification) {
     guard isRunning,
       let info = notification.userInfo,
       let typeValue = info[AVAudioSessionInterruptionTypeKey] as? UInt,
-      let type = AVAudioSession.InterruptionType(rawValue: typeValue),
-      type == .began
+      let type = AVAudioSession.InterruptionType(rawValue: typeValue)
     else { return }
+
+    // A call or Siri took the microphone. Report the loss and stay stopped:
+    // resuming on `.ended` would turn the microphone back on without the user
+    // asking, and listening may only ever begin from an explicit action.
+    guard type == .began else { return }
     stop(notify: "mic_lost")
+  }
+
+  /// Headphones in/out, Bluetooth connect, speaker switch. The engine's input
+  /// format can change with the route, so rebuild the tap around it — the
+  /// session is NOT interrupted here, the microphone stays on and the UI keeps
+  /// showing it. Without this, background listening survives the route change
+  /// in name only: the tap stops delivering buffers and nothing is heard.
+  @objc private func handleRouteChange(_ notification: Notification) {
+    guard let info = notification.userInfo,
+      let reasonValue = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+      let reason = AVAudioSession.RouteChangeReason(rawValue: reasonValue)
+    else { return }
+    switch reason {
+    case .newDeviceAvailable, .oldDeviceUnavailable, .routeConfigurationChange,
+      .override:
+      restartOnMain()
+    default:
+      break
+    }
+  }
+
+  /// iOS reconfigured the engine (often alongside a route change). Without
+  /// rebuilding, the installed tap stops delivering buffers and the session
+  /// looks healthy while hearing nothing.
+  @objc private func handleEngineConfigurationChange(_ notification: Notification) {
+    restartOnMain()
+  }
+
+  /// Both notifications can arrive on an arbitrary thread; engine work belongs
+  /// on the main thread.
+  private func restartOnMain() {
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.isRunning else { return }
+      try? self.restart()
+    }
+  }
+
+  /// Rebuilds capture around the CURRENT hardware format, keeping the session
+  /// running. Never reports a stop: this is recovery, not an interruption.
+  private func restart() throws {
+    guard isRunning, let sampleRate = targetFormat?.sampleRate else { return }
+    stopEngineOnly()
+    try start(sampleRate: sampleRate)
+  }
+
+  /// Tears the engine down without emitting a "stopped" event to Dart.
+  private func stopEngineOnly() {
+    guard isRunning else { return }
+    isRunning = false
+    engine.inputNode.removeTap(onBus: 0)
+    engine.stop()
+    converter = nil
   }
 
   private func handle(buffer: AVAudioPCMBuffer) {
@@ -261,8 +361,8 @@ final class AudioCaptureManager: NSObject, FlutterStreamHandler {
     engine.stop()
     converter = nil
     targetFormat = nil
-    NotificationCenter.default.removeObserver(
-      self, name: AVAudioSession.interruptionNotification, object: nil)
+    NotificationCenter.default.removeObserver(self)
+    observersRegistered = false
     try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     if let reason, let sink = eventSink {
       DispatchQueue.main.async {

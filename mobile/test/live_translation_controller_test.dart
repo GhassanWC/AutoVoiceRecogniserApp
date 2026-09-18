@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:fake_cloud_firestore/fake_cloud_firestore.dart';
+import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:live_translator/features/live_translation/live_translation_controller.dart';
 import 'package:live_translator/models/translation_message.dart';
@@ -136,9 +137,115 @@ class Harness {
   }
 }
 
+/// Sends one complete utterance and returns once it has been applied.
+Future<void> _utterance(Harness h, String source, String translation) async {
+  h.socket.serverSends({
+    'serverContent': {
+      'inputTranscription': {'text': source, 'languageCode': 'en'}
+    }
+  });
+  h.socket.serverSends({
+    'serverContent': {
+      'outputTranscription': {'text': translation}
+    }
+  });
+  h.socket.serverSends({
+    'serverContent': {'turnComplete': true}
+  });
+  await h.pump();
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   setUp(() => SharedPreferences.setMockInitialValues({}));
+
+  // ── Background listening ────────────────────────────────────────────────────
+
+  test('backgrounding STOPS the session unless the user opted in', () async {
+    final h = Harness();
+    await h.startAndConnect();
+    expect(h.controller.settings.settings.continueInBackground, isFalse,
+        reason: 'background listening must be OFF by default');
+
+    h.controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+    await h.pump();
+
+    expect(h.controller.state, ListeningState.idle);
+    expect(h.controller.listeningInBackground, isFalse);
+    expect(h.controller.errorBanner, contains('background'));
+  });
+
+  test('with background listening ON, the app leaving the screen keeps the '
+      'session and translations keep arriving', () async {
+    final h = Harness();
+    await h.settings
+        .update((s) => s.copyWith(continueInBackground: true));
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    await _utterance(h, 'Where is the metro?', 'أين المترو؟');
+    expect(h.controller.messages, hasLength(1));
+
+    // App goes to the background (and the same state covers a locked screen).
+    h.controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+    await h.pump();
+    expect(h.controller.state, ListeningState.listening,
+        reason: 'the session belongs to the app, not the Home screen');
+    expect(h.controller.listeningInBackground, isTrue);
+    expect(h.controller.errorBanner, isNull);
+
+    // Speech keeps being translated while backgrounded.
+    await _utterance(h, 'How much is the ticket?', 'كم سعر التذكرة؟');
+    await _utterance(h, 'When is the last train?', 'متى آخر قطار؟');
+    expect(h.controller.messages, hasLength(3),
+        reason: 'translations continue to arrive in the background');
+
+    // Screen locked, then unlocked: still one uninterrupted session.
+    h.controller.didChangeAppLifecycleState(AppLifecycleState.inactive);
+    await h.pump();
+    expect(h.controller.state, ListeningState.listening);
+    await _utterance(h, 'Thank you', 'شكرا');
+
+    // Back in the foreground: SAME session, and the whole conversation is
+    // still on screen.
+    h.controller.didChangeAppLifecycleState(AppLifecycleState.resumed);
+    await h.pump();
+    expect(h.controller.state, ListeningState.listening);
+    expect(h.controller.listeningInBackground, isFalse);
+    expect(h.controller.messages, hasLength(4));
+    expect(h.controller.messages.map((m) => m.translatedText),
+        containsAll(<String>['أين المترو؟', 'كم سعر التذكرة؟', 'شكرا']));
+    expect(h.sockets, hasLength(1), reason: 'never reconnected');
+    expect(h.tokenTargets, hasLength(1), reason: 'never re-minted a token');
+  });
+
+  test('five consecutive translations land in five bubbles on one session',
+      () async {
+    final h = Harness();
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+
+    const phrases = [
+      ('Where is the metro?', 'أين المترو؟'),
+      ('How much is the ticket?', 'كم سعر التذكرة؟'),
+      ('Does it stop at the museum?', 'هل يتوقف عند المتحف؟'),
+      ('When is the last train?', 'متى آخر قطار؟'),
+      ('Thank you very much', 'شكرا جزيلا'),
+    ];
+    for (final (source, translation) in phrases) {
+      await _utterance(h, source, translation);
+    }
+
+    expect(h.controller.messages, hasLength(5));
+    for (var i = 0; i < phrases.length; i++) {
+      expect(h.controller.messages[i].originalText, phrases[i].$1);
+      expect(h.controller.messages[i].translatedText, phrases[i].$2);
+      expect(h.controller.messages[i].status, TranslationStatus.done);
+      // Speakable the moment the text is final — no audio has to be kept.
+      expect(h.controller.canSpeak(h.controller.messages[i]), isTrue);
+    }
+    expect(h.controller.state, ListeningState.listening);
+    expect(h.sockets, hasLength(1));
+  });
 
   test('start → listening; partial transcripts update ONE bubble in place', () async {
     final h = Harness();

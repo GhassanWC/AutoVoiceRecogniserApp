@@ -18,6 +18,7 @@ import 'package:live_translator/services/firestore/session_repository.dart';
 import 'package:live_translator/services/firestore/user_repository.dart';
 import 'package:live_translator/services/gemini/live_translation_service.dart';
 import 'package:live_translator/services/permissions/mic_permission_service.dart';
+import 'package:live_translator/services/speech/speech_service.dart';
 import 'package:live_translator/services/storage/settings_store.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -104,6 +105,36 @@ class _FakePlayback extends AudioPlaybackService {
   Future<void> dispose() async => active.close();
 }
 
+/// Stands in for the device synthesizer (AVSpeechSynthesizer /
+/// android TextToSpeech) so tests can assert what would be spoken.
+class _FakeSpeech extends SpeechService {
+  final List<({String text, String languageCode})> spoken = [];
+  final StreamController<bool> _speaking = StreamController<bool>.broadcast();
+  int stopCalls = 0;
+
+  /// Set false to simulate a device with no voice for that language.
+  bool available = true;
+
+  @override
+  Stream<bool> get speaking => _speaking.stream;
+
+  @override
+  Future<bool> speak(String text, {required String languageCode}) async {
+    spoken.add((text: text, languageCode: languageCode));
+    if (available) _speaking.add(true);
+    return available;
+  }
+
+  /// Simulates the synthesizer reaching the end of the utterance.
+  void finish() => _speaking.add(false);
+
+  @override
+  Future<void> stop() async => stopCalls++;
+
+  @override
+  Future<void> dispose() async => _speaking.close();
+}
+
 class _GrantedPermissions extends MicPermissionService {
   @override
   Future<MicPermissionStatus> currentStatus() async => MicPermissionStatus.granted;
@@ -160,6 +191,7 @@ class _ShellHarness {
       permissions: _GrantedPermissions(),
       sessionRepository: SessionRepository(firestore: firestore),
       uidProvider: () => 'user-1',
+      speech: speech,
     );
     auth = AuthController(
       authService: AuthService(auth: firebaseAuth),
@@ -173,6 +205,7 @@ class _ShellHarness {
   final List<_FakeSocket> sockets = [];
   final _FakeCapture capture = _FakeCapture();
   final _FakePlayback playback = _FakePlayback();
+  final _FakeSpeech speech = _FakeSpeech();
 
   /// Drives the service's half-duplex gate clock (real 300 ms tail).
   DateTime clock = DateTime.utc(2026, 9, 17, 12);
@@ -411,7 +444,7 @@ void main() {
     await _pumpFrames(tester);
   });
 
-  testWidgets('translated audio plays only when the speaker button is tapped',
+  testWidgets('every finalized translation can be spoken by the device voice',
       (tester) async {
     tester.view.physicalSize = const Size(390, 844);
     tester.view.devicePixelRatio = 1.0;
@@ -456,24 +489,40 @@ void main() {
     });
     await _pumpFrames(tester);
 
-    // Nothing played by itself, and the listening pill never claims to be
-    // speaking — the session just keeps listening.
+    // Gemini's audio was discarded, nothing played by itself, and the pill
+    // never claims to be speaking — the session just keeps listening.
     expect(h.playback.fedChunks, 0);
+    expect(h.speech.spoken, isEmpty);
     expect(find.textContaining('Speaking translation'), findsNothing);
     expect(find.text('Listening…'), findsOneWidget);
     expect(h.live.state, ListeningState.listening);
 
-    // The speaker button is offered on the finalized translation, and only a
-    // tap produces sound. (The bubble's own Semantics merges child labels, so
-    // match the label loosely and tap the icon itself.)
+    // The speaker button is available IMMEDIATELY once the text is final —
+    // it needs no retained audio. (The bubble's own Semantics merges child
+    // labels, so match loosely and tap the icon itself.)
     final speaker = find.byIcon(Icons.volume_up_outlined);
     expect(speaker, findsOneWidget);
     expect(find.bySemanticsLabel(RegExp('Play translation')), findsWidgets);
+
     await tester.tap(speaker);
     await _pumpFrames(tester);
-    expect(h.playback.fedBytes, 48000);
+    // Spoken with the device voice, in the message's target language.
+    expect(h.speech.spoken.single.text, 'أين المترو؟');
+    expect(h.speech.spoken.single.languageCode, 'ar');
+    expect(h.playback.fedChunks, 0, reason: 'no Gemini PCM is ever played');
 
-    // Replaying does not disturb the session.
+    // The uplink is quiet while it speaks, then resumes the moment it ends.
+    final sentWhileSpeaking = socket.audioFrames;
+    h.capture.emitChunk();
+    expect(socket.audioFrames, sentWhileSpeaking,
+        reason: 'microphone is quiet while the device speaks');
+    h.speech.finish();
+    await _pumpFrames(tester);
+    h.capture.emitChunk();
+    expect(socket.audioFrames, sentWhileSpeaking + 1,
+        reason: 'microphone resumes as soon as speech ends');
+
+    // Speaking never disturbs the session.
     expect(h.live.state, ListeningState.listening);
     expect(h.capture.startCalls, 1);
     expect(h.capture.stopCalls, 0);
