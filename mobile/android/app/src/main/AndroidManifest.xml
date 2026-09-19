@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- Subscriptions are sold through Google Play Billing and nothing else.
+         The Play Billing library merges this in too; declaring it here keeps
+         it visible in the app's own manifest. -->
+    <uses-permission android:name="com.android.vending.BILLING"/>
 
     <application
         android:label="Sayvo"

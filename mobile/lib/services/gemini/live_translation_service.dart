@@ -17,14 +17,32 @@ import '../network/connectivity_probe.dart';
 enum LiveServiceState { idle, connecting, listening, reconnecting, stopping, error }
 
 /// User-facing error categories (each maps to specific UI copy).
-enum LiveErrorKind { quota, network, auth, fatal }
+///
+/// [outOfMinutes] is this ACCOUNT's included minutes being spent, which opens
+/// the paywall; [quota] is Gemini's own capacity, which is not the user's
+/// fault and must never be shown as "buy more".
+enum LiveErrorKind { outOfMinutes, quota, network, auth, fatal }
 
 /// Ephemeral credential minted by the Cloud Function.
 class LiveSessionToken {
-  const LiveSessionToken({required this.token, required this.model, required this.expireTime});
+  const LiveSessionToken({
+    required this.token,
+    required this.model,
+    required this.expireTime,
+    this.sessionId,
+    this.remainingMinutes,
+  });
   final String token;
   final String model;
   final DateTime expireTime;
+
+  /// Server-issued id for the METERED session this token opened. The client
+  /// never invents it — heartbeats quote it back so the server bills the
+  /// right session.
+  final String? sessionId;
+
+  /// Minutes left at the moment the token was minted.
+  final double? remainingMinutes;
 }
 
 /// Thrown by the token provider when minting fails.
@@ -175,6 +193,10 @@ class LiveTranslationService {
 
   LiveServiceState _state = LiveServiceState.idle;
   LiveServiceState get state => _state;
+
+  /// The server-issued metered session id for the token in use, or null when
+  /// no session is open.
+  String? get meteredSessionId => _token?.sessionId;
 
   final StreamController<LiveServiceState> _stateChanges = StreamController.broadcast();
   Stream<LiveServiceState> get stateChanges => _stateChanges.stream;

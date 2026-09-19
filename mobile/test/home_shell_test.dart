@@ -14,6 +14,8 @@ import 'package:live_translator/services/audio/audio_capture_service.dart';
 import 'package:live_translator/services/audio/audio_playback_service.dart';
 import 'package:live_translator/services/auth/auth_controller.dart';
 import 'package:live_translator/services/auth/auth_service.dart';
+import 'package:live_translator/services/billing/entitlement_controller.dart';
+import 'package:live_translator/services/billing/subscription_service.dart';
 import 'package:live_translator/services/firestore/session_repository.dart';
 import 'package:live_translator/services/firestore/user_repository.dart';
 import 'package:live_translator/services/gemini/live_translation_service.dart';
@@ -164,6 +166,20 @@ class _FakeUser extends Fake implements User {
   List<UserInfo> get providerData => const [];
 }
 
+/// The shell never talks to StoreKit or Play Billing in a widget test; the
+/// store's own plugin has no implementation on the test host.
+class _NoopSubscriptions extends SubscriptionService {
+  _NoopSubscriptions() : super(store: BillingStore.apple);
+  @override
+  void listen() {}
+  @override
+  bool get isSupportedPlatform => false;
+  @override
+  Future<bool> loadProducts() async => false;
+  @override
+  Future<void> restorePurchases() async {}
+}
+
 class _ShellHarness {
   _ShellHarness() {
     settings = SettingsController(SettingsStore());
@@ -207,6 +223,12 @@ class _ShellHarness {
   final _FakePlayback playback = _FakePlayback();
   final _FakeSpeech speech = _FakeSpeech();
 
+  /// Entitlement is server-owned; the fake Firestore stands in for it and the
+  /// default (no document) is the free tier.
+  late final EntitlementController entitlements =
+      EntitlementController(firestore: firestore);
+  final SubscriptionService subscriptions = _NoopSubscriptions();
+
   /// Drives the service's half-duplex gate clock (real 300 ms tail).
   DateTime clock = DateTime.utc(2026, 9, 17, 12);
 
@@ -229,6 +251,9 @@ class _ShellHarness {
           ChangeNotifierProvider<AuthController>.value(value: auth),
           Provider<SessionRepository>.value(
               value: SessionRepository(firestore: firestore)),
+          ChangeNotifierProvider<EntitlementController>.value(
+              value: entitlements),
+          Provider<SubscriptionService>.value(value: subscriptions),
           ChangeNotifierProvider<LiveTranslationController>.value(value: live),
         ],
         child: MaterialApp(
@@ -339,6 +364,32 @@ void main() {
     expect(h.live.state, ListeningState.idle);
     expect(find.text('Translation stopped'), findsOneWidget);
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('with no minutes left the orb opens the paywall and starts '
+      'nothing', (tester) async {
+    _useSmallPhone(tester);
+    final h = _ShellHarness();
+    // The SERVER says this account is out of minutes.
+    await h.firestore.collection('entitlements').doc('user-1').set({
+      'plan': 'free',
+      'subscriptionStatus': 'none',
+      'freeMinutesUsed': 5.0,
+      'remainingMinutes': 0.0,
+      'allowanceSource': 'free',
+    });
+    h.entitlements.bind('user-1');
+    await h.pumpShell(tester);
+    await _pumpFrames(tester);
+
+    await tester.tap(find.bySemanticsLabel('Start listening'));
+    await _pumpFrames(tester);
+
+    expect(find.text('Sayvo Plans'), findsOneWidget);
+    expect(h.live.state, ListeningState.idle);
+    // No token was requested and no socket opened: an exhausted account
+    // never reaches the translation service.
+    expect(h.sockets, isEmpty);
   });
 
   // THE multi-turn regression guard at the UI level: one Start Listening,

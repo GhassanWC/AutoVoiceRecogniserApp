@@ -9,6 +9,7 @@ import 'package:live_translator/features/live_translation/live_translation_contr
 import 'package:live_translator/models/translation_message.dart';
 import 'package:live_translator/services/audio/audio_capture_service.dart';
 import 'package:live_translator/services/audio/audio_playback_service.dart';
+import 'package:live_translator/services/billing/usage_meter.dart';
 import 'package:live_translator/services/firestore/session_repository.dart';
 import 'package:live_translator/services/gemini/live_translation_service.dart';
 import 'package:live_translator/services/permissions/mic_permission_service.dart';
@@ -139,6 +140,7 @@ class Harness {
   Harness({
     MicPermissionService? permissions,
     List<TokenRequestException?> tokenErrors = const [],
+    this.sessionId,
   }) {
     settings = SettingsController(SettingsStore());
     var call = 0;
@@ -152,6 +154,7 @@ class Harness {
           token: 'tok',
           model: 'm',
           expireTime: DateTime.now().toUtc().add(const Duration(minutes: 30)),
+          sessionId: sessionId,
         );
       },
       connect: (uri) async {
@@ -172,8 +175,23 @@ class Harness {
       sessionRepository: SessionRepository(firestore: firestore),
       uidProvider: () => 'user-1',
       speech: speech,
+      // A long interval: these tests drive the meter's lifecycle (start on
+      // listening, final close on stop), not its heartbeat cadence.
+      meter: UsageMeter(
+        interval: const Duration(minutes: 5),
+        sender: (session, close) async {
+          meterCalls.add((session: session, close: close));
+          return {'remainingMinutes': 9.0, 'allowed': true};
+        },
+      ),
     );
   }
+
+  /// The server-issued session id the token carries, when metering applies.
+  final String? sessionId;
+
+  /// Every tick the controller's meter sent.
+  final List<({String session, bool close})> meterCalls = [];
 
   final FakeFirebaseFirestore firestore = FakeFirebaseFirestore();
   final List<FakeSocket> sockets = [];
@@ -717,5 +735,64 @@ void main() {
       await h.controller.stopListening();
       expect(h.controller.state, ListeningState.idle);
     }
+  });
+
+  // ── Metering ──────────────────────────────────────────────────────────────
+
+  test('metering stops the moment the listening session ends', () async {
+    final h = Harness(sessionId: 'srv-session-1');
+    await h.startAndConnect();
+    expect(h.controller.state, ListeningState.listening);
+    // Nothing has been billed yet; the server charges from its own clock.
+    expect(h.meterCalls, isEmpty);
+
+    await h.controller.stopListening();
+    await h.pump();
+
+    // Exactly one final tick, closing the server's session so no further
+    // minutes can accrue against it.
+    expect(h.meterCalls, [(session: 'srv-session-1', close: true)]);
+
+    // And the meter is idle: a later tick would have to come from a new
+    // session, not this one.
+    await h.pump();
+    expect(h.meterCalls.length, 1);
+  });
+
+  test('each listening session is metered under its own server session id',
+      () async {
+    final h = Harness(sessionId: 'srv-session-2');
+    await h.startAndConnect();
+    await h.controller.stopListening();
+    await h.startAndConnect();
+    await h.controller.stopListening();
+    await h.pump();
+    expect(h.meterCalls.length, 2);
+    expect(h.meterCalls.every((c) => c.session == 'srv-session-2' && c.close),
+        isTrue);
+  });
+
+  test('a session the server never metered is not billed on stop', () async {
+    // No sessionId on the token (e.g. an older server): nothing to charge.
+    final h = Harness();
+    await h.startAndConnect();
+    await h.controller.stopListening();
+    await h.pump();
+    expect(h.meterCalls, isEmpty);
+  });
+
+  test('running out of minutes routes to the paywall, not an error banner',
+      () async {
+    final h = Harness(tokenErrors: [
+      const TokenRequestException(LiveErrorKind.outOfMinutes, 'out of minutes'),
+    ]);
+    await h.controller.startListening();
+    await h.pump();
+    expect(h.controller.state, ListeningState.idle);
+    expect(h.controller.outOfMinutes, isTrue);
+    expect(h.controller.errorBanner, isNull);
+    // The flag is one-shot so the paywall opens once per refusal.
+    h.controller.consumeOutOfMinutes();
+    expect(h.controller.outOfMinutes, isFalse);
   });
 }

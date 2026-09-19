@@ -7,6 +7,23 @@ service cloud.firestore {
     match /users/{uid}/{document=**} {
       allow read, write: if request.auth != null && request.auth.uid == uid;
     }
+
+    // Entitlements are SERVER-OWNED. The owner may read their plan so the app
+    // can show it, but nobody may write: entitlement changes only ever happen
+    // in Cloud Functions after Apple or Google has verified a purchase.
+    // (This is why entitlements do NOT live under users/{uid} — that subtree
+    // is client-writable, so a hacked client could grant itself Pro.)
+    match /entitlements/{uid} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    // Metered session records are server-only in both directions: the client
+    // never needs them, and being able to forge one would mean free minutes.
+    match /usageSessions/{sessionId} {
+      allow read, write: if false;
+    }
+
     // Everything else is denied by default (no other top-level collections).
   }
 }

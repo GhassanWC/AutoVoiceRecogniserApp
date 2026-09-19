@@ -3,7 +3,9 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../services/billing/entitlement_controller.dart';
 import '../../services/storage/settings_store.dart';
+import '../subscription/paywall_screen.dart';
 import '../../theme/app_colors.dart';
 import '../../utils/languages.dart';
 import '../../widgets/components/app_bottom_nav.dart' show bottomNavClearance;
@@ -31,6 +33,7 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
   StreamSubscription<String>? _noticeSubscription;
   int _renderedMessageCount = 0;
   bool _showNewMessagePill = false;
+  bool _paywallOpen = false;
 
   // Resolved once: dispose() runs after this element is deactivated, when a
   // context lookup is no longer allowed.
@@ -56,6 +59,12 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
   bool get _isNearBottom => !_scroll.hasClients || _scroll.position.extentAfter < 120;
 
   void _handleControllerChanged() {
+    // The server refused (or cut short) a session for lack of minutes.
+    if (_controller.outOfMinutes && mounted && !_paywallOpen) {
+      _controller.consumeOutOfMinutes();
+      _paywallOpen = true;
+      PaywallScreen.show(context).whenComplete(() => _paywallOpen = false);
+    }
     final count = _controller.messages.length;
     if (count > _renderedMessageCount) {
       _renderedMessageCount = count;
@@ -82,6 +91,14 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
   Future<void> _toggleListening() async {
     final controller = _controller;
     if (controller.state == ListeningState.idle) {
+      // Cheap local check first, so an out-of-minutes user gets the paywall
+      // instead of a failed connection. The SERVER still decides: it refuses
+      // to mint a token without allowance, which lands in _handleOutOfMinutes.
+      final entitlements = context.read<EntitlementController>();
+      if (entitlements.loaded && !entitlements.canStartSession) {
+        await PaywallScreen.show(context);
+        return;
+      }
       await controller.startListening();
     } else if (controller.isListening) {
       await controller.stopListening();

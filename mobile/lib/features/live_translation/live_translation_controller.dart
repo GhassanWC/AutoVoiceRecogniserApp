@@ -8,6 +8,7 @@ import '../../models/translation_message.dart';
 import '../../services/firestore/session_repository.dart';
 import '../../services/gemini/live_translation_service.dart';
 import '../../services/permissions/mic_permission_service.dart';
+import '../../services/billing/usage_meter.dart';
 import '../../services/speech/speech_service.dart';
 import '../../services/storage/settings_store.dart';
 import '../../utils/languages.dart';
@@ -40,11 +41,20 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     SessionRepository? sessionRepository,
     String? Function()? uidProvider,
     SpeechService? speech,
+    UsageMeter? meter,
   })  : _service = service,
         permissions = permissions ?? MicPermissionService(),
         _sessions = sessionRepository,
         _uidProvider = uidProvider,
-        _speech = speech ?? SpeechService() {
+        _speech = speech ?? SpeechService(),
+        _meter = meter ?? UsageMeter() {
+    // The server is the authority on the remainder; it can also cut a session
+    // short the moment the allowance runs out.
+    _meter.onRemaining = (remaining) => onMinutesRemaining?.call(remaining);
+    _meter.onExhausted = () {
+      _outOfMinutes = true;
+      unawaited(stopListening());
+    };
     _eventSubscription = _service.events.listen(_onServiceEvent);
     _stateSubscription = _service.stateChanges.listen(_onServiceState);
     _levelSubscription = _service.micLevel.listen(_onMicLevel);
@@ -60,6 +70,10 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   final SessionRepository? _sessions;
   final String? Function()? _uidProvider;
   final SpeechService _speech;
+  final UsageMeter _meter;
+
+  /// Set by the app so the entitlement view counts down live while listening.
+  void Function(double remainingMinutes)? onMinutesRemaining;
 
   // ── Observable state ────────────────────────────────────────────────────────
 
@@ -79,6 +93,12 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   String? errorBanner;
 
   bool permissionPermanentlyDenied = false;
+
+  /// Set when the server refuses a session because the account's included
+  /// minutes are spent. The UI opens the paywall and clears it.
+  bool _outOfMinutes = false;
+  bool get outOfMinutes => _outOfMinutes;
+  void consumeOutOfMinutes() => _outOfMinutes = false;
 
   /// Set when a session just ended, so the UI can show the summary sheet.
   SessionSummary? lastSummary;
@@ -175,6 +195,9 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     if (state == ListeningState.idle) return;
     final startedAt = _sessionStartedAt;
     await _service.stop();
+    // Final tick + close: the last partial minute is billed, and nothing
+    // keeps metering once listening has stopped.
+    await _meter.finish();
     state = ListeningState.idle;
     activityLabel = null;
     _listeningInBackground = false;
@@ -204,6 +227,12 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       case LiveServiceState.listening:
         _sessionStartedAt ??= DateTime.now();
         state = ListeningState.listening;
+        // Metering starts when the session really starts, and is billed by
+        // the server from its own clock between heartbeats.
+        final meteredSession = _service.meteredSessionId;
+        if (meteredSession != null && !_meter.isRunning) {
+          _meter.start(meteredSession);
+        }
         if (_wasReconnecting) {
           _wasReconnecting = false;
           errorBanner = null;
@@ -218,6 +247,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       case LiveServiceState.error:
         // Terminal for the session; ServiceError carries the message.
         if (state != ListeningState.idle && next == LiveServiceState.error) {
+          unawaited(_meter.finish());
           state = ListeningState.idle;
           activityLabel = null;
           micLevel = 0;
@@ -252,7 +282,16 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
         // exact failure for debugging.
         developer.log('live session error [${event.kind.name}]: ${event.message}',
             name: 'live');
+        if (event.kind == LiveErrorKind.outOfMinutes) {
+          // The account's included minutes are spent — send the user to the
+          // paywall instead of showing a failure.
+          _outOfMinutes = true;
+          errorBanner = null;
+          notifyListeners();
+          return;
+        }
         errorBanner = switch (event.kind) {
+          LiveErrorKind.outOfMinutes => null, // handled above
           LiveErrorKind.quota =>
             'Free translation capacity is currently reached. Please try again later.',
           LiveErrorKind.network => 'Internet connection required for live translation. '
@@ -528,6 +567,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     _levelSubscription?.cancel();
     _speakingSubscription?.cancel();
     _synthesizerSubscription?.cancel();
+    _meter.dispose();
     _speech.dispose();
     _service.dispose();
     _notices.close();

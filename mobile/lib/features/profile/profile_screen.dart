@@ -12,6 +12,7 @@ import '../../widgets/components/glass_card.dart';
 import '../../widgets/components/language_selector_sheet.dart';
 import '../../widgets/components/profile_menu_tile.dart';
 import '../settings/privacy_policy_screen.dart';
+import '../subscription/subscription_card.dart';
 
 /// Profile: identity, translation preferences, privacy & data, appearance,
 /// about, and the account actions. All behavior (sign-out, safe delete with
@@ -63,6 +64,11 @@ class ProfileScreen extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 22),
+
+        // ── Plan ────────────────────────────────────────────────────────────
+        const _SectionLabel('Plan'),
+        const SubscriptionCard(),
+        const SizedBox(height: 16),
 
         // ── Translation ─────────────────────────────────────────────────────
         const _SectionLabel('Translation'),

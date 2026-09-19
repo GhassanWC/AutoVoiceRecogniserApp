@@ -49,6 +49,10 @@ class LiveTranslateTokenClient {
         expireTime:
             DateTime.tryParse(data['expireTime'] as String? ?? '')?.toUtc() ??
                 DateTime.now().toUtc().add(const Duration(minutes: 25)),
+        // Issued by the server alongside the token — this is the metered
+        // session the heartbeats will bill.
+        sessionId: data['sessionId'] as String?,
+        remainingMinutes: (data['remainingMinutes'] as num?)?.toDouble(),
       );
     } on FirebaseFunctionsException catch (e) {
       developer.log(
@@ -57,8 +61,14 @@ class LiveTranslateTokenClient {
         name: 'live.token',
         error: e,
       );
+      // The server flags an exhausted ACCOUNT allowance explicitly, so it is
+      // never confused with Gemini's own capacity limit.
+      final outOfMinutes = e.code == 'resource-exhausted' &&
+          e.details is Map &&
+          (e.details as Map)['reason'] == 'out-of-minutes';
       throw TokenRequestException(
         switch (e.code) {
+          _ when outOfMinutes => LiveErrorKind.outOfMinutes,
           'resource-exhausted' => LiveErrorKind.quota,
           // `unauthenticated` is either a missing Firebase sign-in or an
           // App Check rejection from enforceAppCheck — the log line above

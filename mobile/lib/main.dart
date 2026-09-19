@@ -9,6 +9,8 @@ import 'features/live_translation/live_translation_controller.dart';
 import 'firebase_options.dart';
 import 'services/auth/auth_controller.dart';
 import 'services/auth/auth_service.dart';
+import 'services/billing/entitlement_controller.dart';
+import 'services/billing/subscription_service.dart';
 import 'services/firestore/session_repository.dart';
 import 'services/firestore/user_repository.dart';
 import 'services/gemini/live_translation_service.dart';
@@ -42,19 +44,34 @@ Future<void> main() async {
     tokenProvider: LiveTranslateTokenClient().call,
   );
 
+  // Server-authoritative plan + minutes. It follows the signed-in user and is
+  // read-only to the app.
+  final entitlements = EntitlementController();
+  entitlements.bind(authController.uid);
+  authController.addListener(() => entitlements.bind(authController.uid));
+
+  final subscriptions = SubscriptionService()..listen();
+
+  final liveController = LiveTranslationController(
+    settings: settings,
+    service: liveService,
+    sessionRepository: sessionRepository,
+    uidProvider: () => authController.uid,
+  );
+  // The metering heartbeat is the freshest number there is, so let it drive
+  // the counter between Firestore snapshots.
+  liveController.onMinutesRemaining = entitlements.applyRemaining;
+
   runApp(
     MultiProvider(
       providers: [
         ChangeNotifierProvider<SettingsController>.value(value: settings),
         ChangeNotifierProvider<AuthController>.value(value: authController),
         Provider<SessionRepository>.value(value: sessionRepository),
-        ChangeNotifierProvider<LiveTranslationController>(
-          create: (_) => LiveTranslationController(
-            settings: settings,
-            service: liveService,
-            sessionRepository: sessionRepository,
-            uidProvider: () => authController.uid,
-          ),
+        ChangeNotifierProvider<EntitlementController>.value(value: entitlements),
+        Provider<SubscriptionService>.value(value: subscriptions),
+        ChangeNotifierProvider<LiveTranslationController>.value(
+          value: liveController,
         ),
       ],
       child: const SayvoApp(),
