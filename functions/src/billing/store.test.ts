@@ -273,6 +273,7 @@ describe("applying a verified subscription", () => {
         store: "apple",
         productId: PRODUCT_IDS.plus,
         status: "active",
+        handle: "store-handle-1",
         periodStart: NOW,
         periodEnd: NOW + 30 * 24 * 60 * MINUTE,
         eventId: "txn-1",
@@ -289,11 +290,34 @@ describe("applying a verified subscription", () => {
     });
   });
 
+  it("keeps the store's handle so the server can re-check a lapsed period",
+    async () => {
+      await applyVerified(
+        "u1",
+        {
+          store: "apple",
+          productId: PRODUCT_IDS.basic,
+          status: "active",
+          handle: "2000000111",
+          periodStart: NOW,
+          periodEnd: NOW + 30 * 24 * 60 * MINUTE,
+          eventId: "txn-1",
+        },
+        NOW,
+      );
+      // Round-trips through Firestore: without it, a renewal could only be
+      // noticed when the app happened to send a fresh purchase.
+      const stored = await readEntitlement("u1", NOW);
+      expect(stored.storeHandle).toBe("2000000111");
+      expect(stored.store).toBe("apple");
+    });
+
   it("is idempotent: the same store event applied twice bills once", async () => {
     const verified = {
       store: "google" as const,
       productId: PRODUCT_IDS.pro,
       status: "active" as const,
+      handle: "store-handle-1",
       periodStart: NOW,
       periodEnd: NOW + 30 * 24 * 60 * MINUTE,
       eventId: "order-9",
@@ -317,6 +341,7 @@ describe("applying a verified subscription", () => {
         store: "apple",
         productId: PRODUCT_IDS.pro,
         status: "active",
+        handle: "store-handle-1",
         periodStart: NOW,
         periodEnd: NOW + 30 * 24 * 60 * MINUTE,
         eventId: "txn-1",
@@ -329,6 +354,7 @@ describe("applying a verified subscription", () => {
         store: "apple",
         productId: PRODUCT_IDS.pro,
         status: "expired",
+        handle: "store-handle-1",
         periodStart: NOW,
         periodEnd: NOW + 30 * 24 * 60 * MINUTE,
         eventId: "txn-2",

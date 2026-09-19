@@ -1,0 +1,12 @@
+{
+  // The build deliberately excludes tests from the deployed bundle, which also
+  // left them unchecked — so a test could drift from the types it exercises.
+  // This config type-checks them without emitting anything.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "noUnusedLocals": false
+  },
+  "include": ["src"],
+  "exclude": []
+}

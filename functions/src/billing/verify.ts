@@ -81,6 +81,8 @@ export function mapAppleTransaction(
     store: "apple",
     productId,
     status,
+    // The ORIGINAL id survives renewals, so it is what we re-query with.
+    handle: payload.originalTransactionId ?? transactionId,
     periodStart,
     periodEnd,
     // Per-period id: a renewal has a NEW transactionId, so renewals apply
@@ -270,6 +272,8 @@ export function mapGoogleSubscription(
     store: "google",
     productId,
     status,
+    // A purchase token stays valid for the life of the subscription.
+    handle: purchaseToken,
     periodStart,
     periodEnd,
     eventId: `google:${purchaseToken.slice(-24)}:${orderId}`,

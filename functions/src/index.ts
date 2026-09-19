@@ -55,7 +55,7 @@ const OUT_OF_MINUTES = "out-of-minutes";
 export const createLiveTranslateToken = onCall(
   {
     enforceAppCheck: true,
-    secrets: [geminiApiKey],
+    secrets: [geminiApiKey, appleIssuerId, appleKeyId, applePrivateKey],
     region: REGION,
     // Cost safety: this function only mints tokens; it must never scale wide.
     maxInstances: 5,
@@ -75,6 +75,9 @@ export const createLiveTranslateToken = onCall(
     const sessionId = randomUUID();
 
     const now = Date.now();
+    // A subscriber whose period just rolled over should be able to start
+    // straight away, so re-check the store before deciding they are out.
+    await refreshLapsedFromStore(uid, await readEntitlement(uid, now), now);
     const opened = await openSession(uid, sessionId, now);
     if (opened === null) {
       // Out of minutes: the app shows the paywall.
@@ -234,15 +237,70 @@ export const verifySubscriptionPurchase = onCall(
 
 /** The app's read of its own entitlement, straight from the server. */
 export const getEntitlement = onCall(
-  { enforceAppCheck: true, region: REGION, maxInstances: 10 },
+  {
+    enforceAppCheck: true,
+    secrets: [appleIssuerId, appleKeyId, applePrivateKey],
+    region: REGION,
+    maxInstances: 10,
+  },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Sign in required.");
     }
     const now = Date.now();
-    return summarize(await readEntitlement(request.auth.uid, now), now);
+    const uid = request.auth.uid;
+    const stored = await readEntitlement(uid, now);
+    return summarize(await refreshLapsedFromStore(uid, stored, now), now);
   },
 );
+
+/**
+ * Re-asks Apple or Google about a subscription whose stored period has run
+ * out, so a renewal extends access without waiting for the user to open the
+ * paywall — and an expiry or refund is noticed without one either.
+ *
+ * Bounded on purpose: it only fires once the stored period has actually
+ * lapsed, and never for an account that has no store handle on file. A
+ * failure leaves the stored entitlement exactly as it was, so a store outage
+ * neither grants nor removes anything.
+ */
+async function refreshLapsedFromStore(
+  uid: string,
+  entitlement: Awaited<ReturnType<typeof readEntitlement>>,
+  nowMs: number,
+) {
+  const handle = entitlement.storeHandle;
+  if (
+    handle === null ||
+    entitlement.currentPeriodEnd === null ||
+    nowMs < entitlement.currentPeriodEnd
+  ) {
+    return entitlement;
+  }
+  try {
+    const verified =
+      entitlement.store === "apple"
+        ? await verifyAppleTransaction(handle, {
+            issuerId: appleIssuerId.value(),
+            keyId: appleKeyId.value(),
+            privateKey: applePrivateKey.value(),
+            bundleId: appleBundleId.value(),
+            environment: Environment.PRODUCTION,
+            rootCertificates: appleRootCertificates(),
+          })
+        : await verifyGoogleSubscription(handle, {
+            packageName: playPackageName.value(),
+          });
+    return await applyVerified(uid, verified, nowMs);
+  } catch (error) {
+    logger.warn("could not re-check a lapsed subscription", {
+      uid,
+      store: entitlement.store,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return entitlement;
+  }
+}
 
 function summarize(
   entitlement: Awaited<ReturnType<typeof readEntitlement>>,

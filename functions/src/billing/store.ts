@@ -43,6 +43,7 @@ function toEntitlement(data: FirebaseFirestore.DocumentData | undefined, nowMs: 
     subscriptionStatus: data.subscriptionStatus ?? "none",
     store: data.store ?? null,
     storeProductId: data.storeProductId ?? null,
+    storeHandle: data.storeHandle ?? null,
     currentPeriodStart: data.currentPeriodStart ?? null,
     currentPeriodEnd: data.currentPeriodEnd ?? null,
     minutesAllowance: data.minutesAllowance ?? 0,

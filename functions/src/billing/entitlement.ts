@@ -35,6 +35,12 @@ export interface Entitlement {
   subscriptionStatus: SubscriptionStatus;
   store: Store | null;
   storeProductId: string | null;
+  /**
+   * The opaque handle the store gave us for this subscription (Apple original
+   * transaction id / Play purchase token). Kept so the server can ask the
+   * store again when a period ends, instead of waiting for the app to.
+   */
+  storeHandle: string | null;
   /** Epoch ms. */
   currentPeriodStart: number | null;
   currentPeriodEnd: number | null;
@@ -62,6 +68,7 @@ export function freshEntitlement(nowMs: number): Entitlement {
     subscriptionStatus: "none",
     store: null,
     storeProductId: null,
+    storeHandle: null,
     currentPeriodStart: null,
     currentPeriodEnd: null,
     minutesAllowance: 0,
@@ -152,6 +159,12 @@ export interface VerifiedSubscription {
   store: Store;
   productId: string;
   status: SubscriptionStatus;
+  /**
+   * The handle to ask the store about this subscription again: Apple's
+   * ORIGINAL transaction id, or Play's purchase token. Both survive renewals,
+   * so the server can re-check a lapsed period on its own.
+   */
+  handle: string;
   /** Epoch ms. */
   periodStart: number;
   periodEnd: number;
@@ -206,6 +219,7 @@ export function applyVerifiedSubscription(
         subscriptionStatus: verified.status,
         store: verified.store,
         storeProductId: verified.productId,
+        storeHandle: verified.handle,
         currentPeriodStart: verified.periodStart,
         currentPeriodEnd: verified.periodEnd,
         minutesAllowance: 0,
@@ -234,6 +248,7 @@ export function applyVerifiedSubscription(
       subscriptionStatus: verified.status,
       store: verified.store,
       storeProductId: verified.productId,
+      storeHandle: verified.handle,
       currentPeriodStart: verified.periodStart,
       currentPeriodEnd: verified.periodEnd,
       minutesAllowance: minutesForPlan(plan),

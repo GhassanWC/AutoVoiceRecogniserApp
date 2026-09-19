@@ -34,6 +34,18 @@ describe("Apple mapping", () => {
     expect(verified.periodEnd).toBe(T0 + MONTH);
   });
 
+  it("carries the ORIGINAL transaction id as the re-query handle", () => {
+    // Renewals get a new transactionId, so only the original one can be used
+    // to ask Apple about the subscription later.
+    expect(mapAppleTransaction(payload, 1).handle).toBe("2000000111");
+    expect(
+      mapAppleTransaction(
+        { ...payload, transactionId: "2000001000", purchaseDate: T0 + MONTH },
+        1,
+      ).handle,
+    ).toBe("2000000111");
+  });
+
   it("maps billing retry and grace to a still-entitled state", () => {
     expect(mapAppleTransaction(payload, 3).status).toBe("grace");
     expect(mapAppleTransaction(payload, 4).status).toBe("grace");
@@ -113,6 +125,8 @@ describe("Google Play mapping", () => {
     expect(verified.status).toBe("active");
     expect(verified.periodStart).toBe(T0);
     expect(verified.periodEnd).toBe(T0 + MONTH);
+    // The token is how the server asks Play about this subscription again.
+    expect(verified.handle).toBe("token-abcdefghijklmnop");
   });
 
   it("keeps a cancelled-but-paid subscription entitled until it expires", () => {

@@ -21,6 +21,7 @@ function verified(
     store: "apple",
     productId: PRODUCT_IDS.plus,
     status: "active",
+    handle: "2000000111",
     periodStart: T0,
     periodEnd: T0 + 30 * DAY,
     eventId: "txn-1",
