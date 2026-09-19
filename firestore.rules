@@ -24,6 +24,13 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Which account owns which store purchase. Server-only: this is what
+    // stops one paid subscription being claimed by several accounts, so a
+    // client must not be able to read it, let alone rewrite it.
+    match /subscriptionOwners/{purchaseKey} {
+      allow read, write: if false;
+    }
+
     // Everything else is denied by default (no other top-level collections).
   }
 }

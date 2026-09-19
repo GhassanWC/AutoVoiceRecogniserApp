@@ -14,21 +14,15 @@ import 'paywall_screen.dart';
 class SubscriptionCard extends StatelessWidget {
   const SubscriptionCard({super.key});
 
-  static String _minutes(double value) {
-    // Whole minutes read better than "12.4 min"; round toward the user.
-    final rounded = value.floor();
-    return '$rounded';
-  }
-
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final controller = context.watch<EntitlementController>();
     final entitlement = controller.entitlement;
     final paid = entitlement.isPaid;
-    final remaining = entitlement.remainingMinutes;
-    final used = entitlement.usedMinutes;
-    final total = entitlement.totalMinutes;
+    final remaining = entitlement.remainingMs;
+    final used = entitlement.spentMs;
+    final total = entitlement.totalMs;
     final progress = total <= 0 ? 0.0 : (used / total).clamp(0.0, 1.0);
 
     return AppGlassCard(
@@ -63,9 +57,10 @@ class SubscriptionCard extends StatelessWidget {
                     ),
                     Text(
                       paid
-                          ? '${entitlement.minutesAllowance} minutes / month'
-                          : '${_minutes(remaining)} of $kFreeLifetimeMinutes '
-                              'free minutes remaining',
+                          ? '${planMinutes(entitlement.plan)} min translated '
+                              'speech / month'
+                          : '${formatSpeechDuration(remaining)} of '
+                              '$kFreeLifetimeMinutes free minutes left',
                       style: theme.textTheme.bodySmall
                           ?.copyWith(color: AppColors.textSecondary),
                     ),
@@ -88,7 +83,8 @@ class SubscriptionCard extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           Text(
-            '${_minutes(used)} min used · ${_minutes(remaining)} min remaining',
+            '${formatSpeechDuration(used)} translated · '
+            '${formatSpeechDuration(remaining)} remaining',
             style: theme.textTheme.bodySmall
                 ?.copyWith(color: AppColors.textSecondary),
           ),

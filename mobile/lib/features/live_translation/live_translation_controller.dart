@@ -17,9 +17,19 @@ import '../../utils/languages.dart';
 enum ListeningState { idle, starting, listening }
 
 class SessionSummary {
-  const SessionSummary({required this.translationCount, required this.duration});
+  const SessionSummary({
+    required this.translationCount,
+    required this.duration,
+    required this.translatedSpeechMs,
+  });
   final int translationCount;
+
+  /// How long the session ran. Shown as context, never as what it cost.
   final Duration duration;
+
+  /// Translated-speech milliseconds this session used — the only part of it
+  /// that came out of the user's allowance.
+  final int translatedSpeechMs;
 }
 
 /// Owns the live translation SESSION for the whole app.
@@ -48,9 +58,12 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
         _uidProvider = uidProvider,
         _speech = speech ?? SpeechService(),
         _meter = meter ?? UsageMeter() {
+    // Accounting watches the session from the outside: it can measure and
+    // report, but nothing it does can change what the user hears or sees.
+    _service.observer = _meter;
     // The server is the authority on the remainder; it can also cut a session
     // short the moment the allowance runs out.
-    _meter.onRemaining = (remaining) => onMinutesRemaining?.call(remaining);
+    _meter.onRemaining = (remainingMs) => onRemainingMs?.call(remainingMs);
     _meter.onExhausted = () {
       _outOfMinutes = true;
       unawaited(stopListening());
@@ -73,7 +86,9 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   final UsageMeter _meter;
 
   /// Set by the app so the entitlement view counts down live while listening.
-  void Function(double remainingMinutes)? onMinutesRemaining;
+  /// Milliseconds of TRANSLATED SPEECH left — it does not move while a room
+  /// is quiet, however long the microphone stays open.
+  void Function(int remainingMs)? onRemainingMs;
 
   // ── Observable state ────────────────────────────────────────────────────────
 
@@ -205,6 +220,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     lastSummary = SessionSummary(
       translationCount: _persistedCount,
       duration: startedAt == null ? Duration.zero : DateTime.now().difference(startedAt),
+      translatedSpeechMs: _meter.speech.committedSpeechMs,
     );
     await _endSessionDoc();
     _sessionStartedAt = null;

@@ -66,6 +66,9 @@ class FakeCapture extends AudioCaptureService {
 
   /// ~100 ms of 16 kHz PCM16 — one full uplink chunk.
   void emitChunk() => onAudio!(Uint8List.fromList(List.filled(3200, 7)));
+
+  /// The same chunk, but digital silence.
+  void emitSilence() => onAudio!(Uint8List(3200));
 }
 
 class FakePlayback extends AudioPlaybackService {
@@ -175,23 +178,31 @@ class Harness {
       sessionRepository: SessionRepository(firestore: firestore),
       uidProvider: () => 'user-1',
       speech: speech,
-      // A long interval: these tests drive the meter's lifecycle (start on
-      // listening, final close on stop), not its heartbeat cadence.
-      meter: UsageMeter(
-        interval: const Duration(minutes: 5),
-        sender: (session, close) async {
-          meterCalls.add((session: session, close: close));
-          return {'remainingMinutes': 9.0, 'allowed': true};
-        },
-      ),
+      meter: meter,
     );
   }
+
+  /// Long timers: these tests drive the meter's LIFECYCLE (start on listening,
+  /// final flush on stop), not its batching cadence.
+  late final UsageMeter meter = UsageMeter(
+    flushDelay: const Duration(minutes: 5),
+    safetyInterval: const Duration(minutes: 5),
+    sender: (payload) async {
+      meterCalls.add((
+        session: payload['sessionId'] as String,
+        close: payload['close'] == true,
+        cumulativeSpeechMs: payload['cumulativeSpeechMs'] as int,
+      ));
+      return {'remainingMs': 540000, 'allowed': true};
+    },
+  );
 
   /// The server-issued session id the token carries, when metering applies.
   final String? sessionId;
 
-  /// Every tick the controller's meter sent.
-  final List<({String session, bool close})> meterCalls = [];
+  /// Every usage report the controller's meter sent.
+  final List<({String session, bool close, int cumulativeSpeechMs})>
+      meterCalls = [];
 
   final FakeFirebaseFirestore firestore = FakeFirebaseFirestore();
   final List<FakeSocket> sockets = [];
@@ -739,21 +750,25 @@ void main() {
 
   // ── Metering ──────────────────────────────────────────────────────────────
 
-  test('metering stops the moment the listening session ends', () async {
+  test('a silent session reports zero translated speech when it ends',
+      () async {
     final h = Harness(sessionId: 'srv-session-1');
     await h.startAndConnect();
     expect(h.controller.state, ListeningState.listening);
-    // Nothing has been billed yet; the server charges from its own clock.
+    // Nothing is reported while listening: reports follow translated speech,
+    // not the clock.
     expect(h.meterCalls, isEmpty);
 
     await h.controller.stopListening();
     await h.pump();
 
-    // Exactly one final tick, closing the server's session so no further
-    // minutes can accrue against it.
-    expect(h.meterCalls, [(session: 'srv-session-1', close: true)]);
+    // One closing report, and it carries nothing to charge.
+    expect(h.meterCalls, hasLength(1));
+    expect(h.meterCalls.single.session, 'srv-session-1');
+    expect(h.meterCalls.single.close, isTrue);
+    expect(h.meterCalls.single.cumulativeSpeechMs, 0);
 
-    // And the meter is idle: a later tick would have to come from a new
+    // And the meter is idle: a later report would have to come from a new
     // session, not this one.
     await h.pump();
     expect(h.meterCalls.length, 1);
@@ -770,6 +785,83 @@ void main() {
     expect(h.meterCalls.length, 2);
     expect(h.meterCalls.every((c) => c.session == 'srv-session-2' && c.close),
         isTrue);
+  });
+
+  test('silence is still STREAMED to Gemini even though it is never charged',
+      () async {
+    // Deliberate, and documented as a COST OPTIMIZATION FOLLOW-UP: the
+    // transport is unchanged by the speech-only accounting, because gating the
+    // uplink on a new VAD threshold risks the far-field and quiet-speaker
+    // regressions Sayvo has already had once. What the user pays and what
+    // Gemini costs us are now different numbers, on purpose.
+    final h = Harness(sessionId: 'srv-session-silent');
+    await h.startAndConnect();
+    for (var i = 0; i < 20; i++) {
+      h.capture.emitSilence();
+    }
+    await h.pump();
+
+    expect(h.socket.audioFrames, 20, reason: 'silence still goes upstream');
+
+    await h.controller.stopListening();
+    await h.pump();
+    // ...and the user is charged nothing for any of it.
+    expect(h.meterCalls.single.cumulativeSpeechMs, 0);
+    expect(h.meter.telemetry()['audioSentMs'], 2000);
+    expect(h.meter.telemetry()['committedSpeechMs'], 0);
+  });
+
+  test('background translated speech is metered like any other', () async {
+    final h = Harness(sessionId: 'srv-session-bg');
+    await h.settings.update((s) => s.copyWith(continueInBackground: true));
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+
+    h.controller.didChangeAppLifecycleState(AppLifecycleState.paused);
+    await h.pump();
+    expect(h.controller.listeningInBackground, isTrue);
+
+    await _utterance(h, 'Where is the metro?', 'أين المترو؟');
+    await _utterance(h, 'How much is the ticket?', 'كم سعر التذكرة؟');
+
+    // Same meter, same rules — there is no separate background rate.
+    expect(h.meter.speech.translatedUtteranceCount, 2);
+
+    await h.controller.stopListening();
+    await h.pump();
+    expect(h.meterCalls.last.close, isTrue);
+  });
+
+  test('translated speech reaches the meter; the bubbles are untouched',
+      () async {
+    final h = Harness(sessionId: 'srv-session-3');
+    await h.startAndConnect();
+
+    // Somebody speaks and Sayvo translates it.
+    h.socket.serverSends({
+      'serverContent': {
+        'inputTranscription': {'text': 'wo ist das hotel', 'languageCode': 'de-DE'},
+      },
+    });
+    await h.pump();
+    h.socket.serverSends({
+      'serverContent': {
+        'outputTranscription': {'text': 'where is the hotel'},
+      },
+    });
+    await h.pump();
+    h.socket.serverSends({'serverContent': {'turnComplete': true}});
+    await h.pump();
+
+    // The conversation is exactly what it was before billing existed: one
+    // bubble, its own language, its own translation.
+    expect(h.controller.messages, hasLength(1));
+    expect(h.controller.messages.single.sourceLanguage, 'de');
+    expect(h.controller.messages.single.translatedText, 'where is the hotel');
+
+    // And the meter saw the translation (no audio was fed, so there is no
+    // speech duration to charge — the ACCOUNTING is what is wired up here).
+    expect(h.meter.speech.translatedUtteranceCount, 1);
   });
 
   test('a session the server never metered is not billed on stop', () async {

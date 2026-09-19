@@ -55,6 +55,8 @@ export interface AppleTransactionPayload {
   purchaseDate?: number;
   expiresDate?: number;
   revocationDate?: number;
+  /** UUID the app attached to the purchase, identifying the Sayvo account. */
+  appAccountToken?: string;
 }
 
 /**
@@ -83,6 +85,7 @@ export function mapAppleTransaction(
     status,
     // The ORIGINAL id survives renewals, so it is what we re-query with.
     handle: payload.originalTransactionId ?? transactionId,
+    accountToken: payload.appAccountToken ?? null,
     periodStart,
     periodEnd,
     // Per-period id: a renewal has a NEW transactionId, so renewals apply
@@ -249,6 +252,20 @@ export interface GoogleSubscriptionV2 {
     offerDetails?: { basePlanId?: string };
   }[];
   startTime?: string;
+  /** ACKNOWLEDGEMENT_STATE_PENDING until we acknowledge the purchase. */
+  acknowledgementState?: string;
+  externalAccountIdentifiers?: {
+    obfuscatedExternalAccountId?: string;
+    externalAccountId?: string;
+  };
+}
+
+/**
+ * Play auto-refunds a subscription that is not acknowledged within three
+ * days, so acknowledging is part of accepting a purchase, not an extra.
+ */
+export function needsAcknowledgement(response: GoogleSubscriptionV2): boolean {
+  return response.acknowledgementState === "ACKNOWLEDGEMENT_STATE_PENDING";
 }
 
 /** Pure mapping of Play's subscriptionsv2 response — unit-tested. */
@@ -274,6 +291,10 @@ export function mapGoogleSubscription(
     status,
     // A purchase token stays valid for the life of the subscription.
     handle: purchaseToken,
+    accountToken:
+      response.externalAccountIdentifiers?.obfuscatedExternalAccountId ??
+      response.externalAccountIdentifiers?.externalAccountId ??
+      null,
     periodStart,
     periodEnd,
     eventId: `google:${purchaseToken.slice(-24)}:${orderId}`,
@@ -301,7 +322,14 @@ async function defaultAccessToken(): Promise<string> {
   return token;
 }
 
-/** Asks Google Play about [purchaseToken] and returns what Play says. */
+/**
+ * Asks Google Play about [purchaseToken] and returns what Play says.
+ *
+ * Also ACKNOWLEDGES the purchase when Play is still waiting for it: an
+ * unacknowledged subscription is refunded automatically after three days.
+ * Acknowledgement is idempotent from our side — Play refuses a second one,
+ * and that refusal is not a verification failure.
+ */
 export async function verifyGoogleSubscription(
   purchaseToken: string,
   deps: GoogleDeps | null,
@@ -311,21 +339,39 @@ export async function verifyGoogleSubscription(
   }
   const doFetch = deps.fetchFn ?? fetch;
   const token = await (deps.accessToken ?? defaultAccessToken)();
-  const url =
+  const base =
     `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/` +
-    `${encodeURIComponent(deps.packageName)}/purchases/subscriptionsv2/tokens/` +
-    `${encodeURIComponent(purchaseToken)}`;
+    `${encodeURIComponent(deps.packageName)}`;
 
-  const response = await doFetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const response = await doFetch(
+    `${base}/purchases/subscriptionsv2/tokens/${encodeURIComponent(purchaseToken)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
   if (!response.ok) {
     throw new BillingVerificationError(
       `Play verification failed (${response.status})`,
     );
   }
-  return mapGoogleSubscription(
-    (await response.json()) as GoogleSubscriptionV2,
-    purchaseToken,
-  );
+  const body = (await response.json()) as GoogleSubscriptionV2;
+  const verified = mapGoogleSubscription(body, purchaseToken);
+
+  // Only a purchase that is actually paid for is worth acknowledging.
+  if (needsAcknowledgement(body) && verified.status !== "none") {
+    const productId = verified.productId;
+    const acknowledged = await doFetch(
+      `${base}/purchases/subscriptions/${encodeURIComponent(productId)}` +
+        `/tokens/${encodeURIComponent(purchaseToken)}:acknowledge`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      },
+    );
+    // A repeat acknowledgement comes back 400; the purchase is still fine.
+    return { ...verified, acknowledged: acknowledged.ok || undefined };
+  }
+  return { ...verified, acknowledged: true };
 }

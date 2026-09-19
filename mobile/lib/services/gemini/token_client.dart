@@ -50,9 +50,9 @@ class LiveTranslateTokenClient {
             DateTime.tryParse(data['expireTime'] as String? ?? '')?.toUtc() ??
                 DateTime.now().toUtc().add(const Duration(minutes: 25)),
         // Issued by the server alongside the token — this is the metered
-        // session the heartbeats will bill.
+        // session the usage reports will be charged against.
         sessionId: data['sessionId'] as String?,
-        remainingMinutes: (data['remainingMinutes'] as num?)?.toDouble(),
+        remainingMs: (data['remainingMs'] as num?)?.toInt(),
       );
     } on FirebaseFunctionsException catch (e) {
       developer.log(

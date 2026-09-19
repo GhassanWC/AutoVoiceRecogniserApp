@@ -10,8 +10,8 @@ import 'package:live_translator/features/subscription/subscription_card.dart';
 import 'package:live_translator/services/billing/entitlement.dart';
 import 'package:live_translator/services/billing/entitlement_controller.dart';
 import 'package:live_translator/services/billing/subscription_service.dart';
-import 'package:live_translator/services/billing/usage_meter.dart';
 import 'package:live_translator/theme/app_theme.dart';
+import 'package:live_translator/utils/account_token.dart';
 import 'package:live_translator/utils/plans.dart';
 import 'package:provider/provider.dart';
 
@@ -138,18 +138,6 @@ void _useTallSurface(WidgetTester tester) {
   addTearDown(tester.view.reset);
 }
 
-/// Polls until [done] or the timeout, so the meter's real-timer tests do not
-/// depend on the host's timer resolution.
-Future<void> _waitFor(
-  bool Function() done, {
-  Duration timeout = const Duration(seconds: 3),
-}) async {
-  final deadline = DateTime.now().add(timeout);
-  while (!done() && DateTime.now().isBefore(deadline)) {
-    await Future<void>.delayed(const Duration(milliseconds: 5));
-  }
-}
-
 void main() {
   // ── The catalog itself ────────────────────────────────────────────────────
 
@@ -184,66 +172,137 @@ void main() {
   // ── Entitlement: the server's word, parsed ────────────────────────────────
 
   group('entitlement', () {
-    test('a fresh account has five free minutes, not a plan', () {
+    test('a fresh account has five free minutes of translated speech', () {
       const e = Entitlement.free;
       expect(e.plan, SayvoPlan.free);
       expect(e.isPaid, isFalse);
-      expect(e.remainingMinutes, 5);
-      expect(e.totalMinutes, 5);
-      expect(e.hasMinutesLeft, isTrue);
+      expect(e.remainingMs, 5 * kMsPerMinute);
+      expect(e.totalMs, 5 * kMsPerMinute);
+      expect(e.hasSpeechLeft, isTrue);
     });
 
-    test('spent free minutes leave nothing, and do not refill', () {
+    test('a spent free allowance leaves nothing, and does not refill', () {
       final e = Entitlement.fromMap({
         'plan': 'free',
         'subscriptionStatus': 'none',
-        'freeMinutesUsed': 5.0,
-        'remainingMinutes': 0.0,
+        'freeUsedMs': kFreeLifetimeMs,
+        'remainingMs': 0,
         'allowanceSource': 'free',
       });
-      expect(e.hasMinutesLeft, isFalse);
-      expect(e.usedMinutes, 5);
+      expect(e.hasSpeechLeft, isFalse);
+      expect(e.spentMs, kFreeLifetimeMs);
     });
 
     test('a paid plan reports the plan allowance, not the free one', () {
-      final e = Entitlement.fromMap({
-        'plan': 'pro',
-        'subscriptionStatus': 'active',
-        'store': 'apple',
-        'storeProductId': kProProductId,
-        'minutesAllowance': 55,
-        'minutesUsed': 12.5,
-        'freeMinutesUsed': 5.0,
-        'remainingMinutes': 42.5,
-        'allowanceSource': 'plan',
-        'currentPeriodEnd': DateTime.utc(2026, 11, 3).millisecondsSinceEpoch,
-      });
+      final e = Entitlement.fromMap(
+        {
+          'plan': 'pro',
+          'subscriptionStatus': 'active',
+          'store': 'apple',
+          'storeProductId': kProProductId,
+          'allowanceMs': 55 * kMsPerMinute,
+          'usedMs': 12 * kMsPerMinute + 30000,
+          'freeUsedMs': kFreeLifetimeMs,
+          'remainingMs': 42 * kMsPerMinute + 30000,
+          'allowanceSource': 'plan',
+          'currentPeriodEnd': DateTime.utc(2026, 11, 3).millisecondsSinceEpoch,
+        },
+        now: DateTime.utc(2026, 9, 20),
+      );
       expect(e.isPaid, isTrue);
-      expect(e.totalMinutes, 55);
-      expect(e.usedMinutes, 12.5);
-      expect(e.remainingMinutes, 42.5);
+      expect(e.totalMs, 55 * kMsPerMinute);
+      expect(e.spentMs, 12 * kMsPerMinute + 30000);
+      expect(e.remainingMs, 42 * kMsPerMinute + 30000);
       expect(e.currentPeriodEnd, DateTime.utc(2026, 11, 3).toLocal());
     });
 
     test('a negative remainder from the server is clamped to zero', () {
-      final e = Entitlement.fromMap({
-        'plan': 'basic',
-        'minutesAllowance': 15,
-        'minutesUsed': 16.0,
-        'allowanceSource': 'plan',
-      });
-      expect(e.remainingMinutes, 0);
-      expect(e.hasMinutesLeft, isFalse);
+      final e = Entitlement.fromMap(
+        {
+          'plan': 'basic',
+          'subscriptionStatus': 'active',
+          'allowanceMs': 15 * kMsPerMinute,
+          'usedMs': 16 * kMsPerMinute,
+          'allowanceSource': 'plan',
+          'currentPeriodEnd':
+              DateTime.utc(2026, 10, 20).millisecondsSinceEpoch,
+        },
+        now: DateTime.utc(2026, 9, 20),
+      );
+      expect(e.remainingMs, 0);
+      expect(e.hasSpeechLeft, isFalse);
+    });
+
+    test('a plan whose period has passed falls back to the free remainder', () {
+      // The stored document still says the subscription is live, because
+      // nothing has written to it since it lapsed.
+      final e = Entitlement.fromMap(
+        {
+          'plan': 'pro',
+          'subscriptionStatus': 'active',
+          'allowanceMs': 55 * kMsPerMinute,
+          'usedMs': 55 * kMsPerMinute,
+          'freeUsedMs': 2 * kMsPerMinute,
+          'allowanceSource': 'plan',
+          'remainingMs': 0,
+          'currentPeriodEnd': DateTime.utc(2026, 9, 1).millisecondsSinceEpoch,
+        },
+        now: DateTime.utc(2026, 9, 20),
+      );
+      expect(e.isPaid, isFalse);
+      expect(e.allowanceSource, 'free');
+      // Three unused free minutes, not zero.
+      expect(e.remainingMs, 3 * kMsPerMinute);
+    });
+
+    test('a plan inside its period uses the server remainder as given', () {
+      final e = Entitlement.fromMap(
+        {
+          'plan': 'plus',
+          'subscriptionStatus': 'active',
+          'allowanceMs': 35 * kMsPerMinute,
+          'usedMs': 10 * kMsPerMinute,
+          'allowanceSource': 'plan',
+          'remainingMs': 25 * kMsPerMinute,
+          'currentPeriodEnd': DateTime.utc(2026, 10, 20).millisecondsSinceEpoch,
+        },
+        now: DateTime.utc(2026, 9, 20),
+      );
+      expect(e.isPaid, isTrue);
+      expect(e.remainingMs, 25 * kMsPerMinute);
     });
 
     test('an unknown plan id from a tampered document reads as free', () {
       final e = Entitlement.fromMap({
         'plan': 'unlimited_pro_max',
-        'minutesAllowance': 999999,
+        'allowanceMs': 999999999,
         'allowanceSource': 'plan',
       });
       expect(e.plan, SayvoPlan.free);
       expect(e.isPaid, isFalse);
+    });
+
+    test('durations are shown to the second, never rounded up to a minute', () {
+      expect(formatSpeechDuration(48000), '48s');
+      expect(formatSpeechDuration(0), '0s');
+      expect(formatSpeechDuration(744000), '12m 24s');
+      expect(formatSpeechDuration(1356000), '22m 36s');
+      expect(formatSpeechDuration(120000), '2m');
+      expect(formatSpeechDuration(3840000), '1h 04m');
+    });
+  });
+
+  group('the account a purchase belongs to', () {
+    test('matches the server derivation exactly', () {
+      // functions/src/billing/account_token.test.ts pins the same value. A
+      // drift here would make every purchase look like somebody else's.
+      expect(accountTokenForUid('uid-abc123'),
+          '9e65ab7b-6d88-590e-a831-0012d8bac0ae');
+    });
+
+    test('is stable per account and different between accounts', () {
+      expect(accountTokenForUid('a'), accountTokenForUid('a'));
+      expect(accountTokenForUid('a'), isNot(accountTokenForUid('b')));
     });
   });
 
@@ -257,7 +316,7 @@ void main() {
         ..bind('uid-1');
       await Future<void>.delayed(Duration.zero);
       expect(controller.entitlement.plan, SayvoPlan.free);
-      expect(controller.entitlement.remainingMinutes, 5);
+      expect(controller.entitlement.remainingMs, kFreeLifetimeMs);
       expect(controller.canStartSession, isTrue);
       controller.dispose();
     });
@@ -266,8 +325,8 @@ void main() {
       final firestore = FakeFirebaseFirestore();
       await firestore.collection('entitlements').doc('uid-1').set({
         'plan': 'free',
-        'freeMinutesUsed': 5.0,
-        'remainingMinutes': 0.0,
+        'freeUsedMs': kFreeLifetimeMs,
+        'remainingMs': 0,
         'allowanceSource': 'free',
       });
       final controller = EntitlementController(firestore: firestore)
@@ -284,16 +343,16 @@ void main() {
       await firestore.collection('entitlements').doc('uid-1').set({
         'plan': 'plus',
         'subscriptionStatus': 'active',
-        'minutesAllowance': 35,
-        'minutesUsed': 5.0,
-        'remainingMinutes': 30.0,
+        'allowanceMs': 35 * kMsPerMinute,
+        'usedMs': 5 * kMsPerMinute,
+        'remainingMs': 30 * kMsPerMinute,
         'allowanceSource': 'plan',
       });
       final controller = EntitlementController(firestore: firestore)
         ..bind('uid-1');
       await Future<void>.delayed(Duration.zero);
       expect(controller.entitlement.plan, SayvoPlan.plus);
-      expect(controller.entitlement.remainingMinutes, 30);
+      expect(controller.entitlement.remainingMs, 30 * kMsPerMinute);
       controller.dispose();
     });
 
@@ -302,8 +361,8 @@ void main() {
       await firestore.collection('entitlements').doc('uid-1').set({
         'plan': 'pro',
         'subscriptionStatus': 'active',
-        'minutesAllowance': 55,
-        'remainingMinutes': 55.0,
+        'allowanceMs': 55 * kMsPerMinute,
+        'remainingMs': 55 * kMsPerMinute,
         'allowanceSource': 'plan',
       });
       final controller = EntitlementController(firestore: firestore)
@@ -313,7 +372,7 @@ void main() {
       // offline case: it must not downgrade anybody.
       await controller.refresh();
       expect(controller.entitlement.plan, SayvoPlan.pro);
-      expect(controller.entitlement.remainingMinutes, 55);
+      expect(controller.entitlement.remainingMs, 55 * kMsPerMinute);
       controller.dispose();
     });
 
@@ -322,17 +381,17 @@ void main() {
       await firestore.collection('entitlements').doc('uid-1').set({
         'plan': 'basic',
         'subscriptionStatus': 'active',
-        'minutesAllowance': 15,
-        'minutesUsed': 0.0,
-        'remainingMinutes': 15.0,
+        'allowanceMs': 15 * kMsPerMinute,
+        'usedMs': 0,
+        'remainingMs': 15 * kMsPerMinute,
         'allowanceSource': 'plan',
       });
       final controller = EntitlementController(firestore: firestore)
         ..bind('uid-1');
       await Future<void>.delayed(Duration.zero);
-      controller.applyRemaining(13.5);
-      expect(controller.entitlement.remainingMinutes, 13.5);
-      expect(controller.entitlement.usedMinutes, closeTo(1.5, 0.001));
+      controller.applyRemainingMs(13 * kMsPerMinute + 30000);
+      expect(controller.entitlement.remainingMs, 13 * kMsPerMinute + 30000);
+      expect(controller.entitlement.spentMs, kMsPerMinute + 30000);
       controller.dispose();
     });
 
@@ -340,9 +399,13 @@ void main() {
       final firestore = FakeFirebaseFirestore();
       await firestore.collection('entitlements').doc('uid-1').set({
         'plan': 'pro',
-        'minutesAllowance': 55,
-        'remainingMinutes': 55.0,
+        'subscriptionStatus': 'active',
+        'allowanceMs': 55 * kMsPerMinute,
+        'remainingMs': 55 * kMsPerMinute,
         'allowanceSource': 'plan',
+        'currentPeriodEnd': DateTime.now()
+            .add(const Duration(days: 20))
+            .millisecondsSinceEpoch,
       });
       final controller = EntitlementController(firestore: firestore)
         ..bind('uid-1');
@@ -431,9 +494,11 @@ void main() {
       expect(find.text('Sayvo Basic'), findsOneWidget);
       expect(find.text('Sayvo Plus'), findsOneWidget);
       expect(find.text('Sayvo Pro'), findsOneWidget);
-      expect(find.text('15 min/month'), findsOneWidget);
-      expect(find.text('35 min/month'), findsOneWidget);
-      expect(find.text('55 min/month'), findsOneWidget);
+      expect(find.text('15 min translated speech / month'), findsOneWidget);
+      expect(find.text('35 min translated speech / month'), findsOneWidget);
+      expect(find.text('55 min translated speech / month'), findsOneWidget);
+      expect(find.textContaining("Silent listening doesn't use your minutes"),
+          findsOneWidget);
       expect(find.text('Recommended'), findsOneWidget);
       expect(find.textContaining('Automatically renews'), findsOneWidget);
       expect(find.textContaining('Cancel anytime'), findsOneWidget);
@@ -577,13 +642,13 @@ void main() {
         (tester) async {
       await pumpCard(tester, {
         'plan': 'free',
-        'freeMinutesUsed': 2.0,
-        'remainingMinutes': 3.0,
+        'freeUsedMs': 2 * kMsPerMinute,
+        'remainingMs': 3 * kMsPerMinute,
         'allowanceSource': 'free',
       });
       expect(find.text('Free'), findsOneWidget);
-      expect(find.text('3 of 5 free minutes remaining'), findsOneWidget);
-      expect(find.text('2 min used · 3 min remaining'), findsOneWidget);
+      expect(find.text('3m of 5 free minutes left'), findsOneWidget);
+      expect(find.text('2m translated · 3m remaining'), findsOneWidget);
       expect(find.text('Upgrade Sayvo'), findsOneWidget);
       expect(find.text('Manage Subscription'), findsNothing);
     });
@@ -595,15 +660,15 @@ void main() {
         'subscriptionStatus': 'active',
         'store': 'apple',
         'storeProductId': kPlusProductId,
-        'minutesAllowance': 35,
-        'minutesUsed': 10.0,
-        'remainingMinutes': 25.0,
+        'allowanceMs': 35 * kMsPerMinute,
+        'usedMs': 12 * kMsPerMinute + 24000,
+        'remainingMs': 22 * kMsPerMinute + 36000,
         'allowanceSource': 'plan',
         'currentPeriodEnd': DateTime(2026, 11, 3).millisecondsSinceEpoch,
       });
       expect(find.text('Sayvo Plus'), findsOneWidget);
-      expect(find.text('35 minutes / month'), findsOneWidget);
-      expect(find.text('10 min used · 25 min remaining'), findsOneWidget);
+      expect(find.text('35 min translated speech / month'), findsOneWidget);
+      expect(find.text('12m 24s translated · 22m 36s remaining'), findsOneWidget);
       expect(find.textContaining('Renews'), findsOneWidget);
       expect(find.textContaining('November 3, 2026'), findsOneWidget);
       expect(find.text('Upgrade Sayvo'), findsNothing);
@@ -618,102 +683,16 @@ void main() {
       await pumpCard(tester, {
         'plan': 'pro',
         'subscriptionStatus': 'expired',
-        'minutesAllowance': 0,
-        'minutesUsed': 55.0,
-        'freeMinutesUsed': 0.0,
-        'remainingMinutes': 5.0,
+        'allowanceMs': 0,
+        'usedMs': 55 * kMsPerMinute,
+        'freeUsedMs': 0,
+        'remainingMs': kFreeLifetimeMs,
         'allowanceSource': 'free',
       });
       // The plan is gone, so the card shows Free and offers an upgrade.
       expect(find.text('Free'), findsOneWidget);
-      expect(find.text('5 of 5 free minutes remaining'), findsOneWidget);
+      expect(find.text('5m of 5 free minutes left'), findsOneWidget);
       expect(find.text('Upgrade Sayvo'), findsOneWidget);
-    });
-  });
-
-  // ── Metering lifecycle ────────────────────────────────────────────────────
-
-  group('usage meter', () {
-    test('heartbeats while listening and stops the moment the session ends',
-        () async {
-      final calls = <({String session, bool close})>[];
-      final meter = UsageMeter(
-        interval: const Duration(milliseconds: 20),
-        sender: (sessionId, close) async {
-          calls.add((session: sessionId, close: close));
-          return {'remainingMinutes': 12.0, 'allowed': true};
-        },
-      );
-
-      meter.start('session-a');
-      await _waitFor(() => calls.length >= 2);
-      expect(calls.length, greaterThanOrEqualTo(2));
-      expect(calls.every((c) => c.session == 'session-a'), isTrue);
-      expect(calls.every((c) => c.close == false), isTrue);
-
-      await meter.finish();
-      expect(meter.isRunning, isFalse);
-      expect(calls.last.close, isTrue);
-      final atClose = calls.length;
-
-      // Nothing accrues once listening has stopped.
-      await Future<void>.delayed(const Duration(milliseconds: 200));
-      expect(calls.length, atClose);
-      meter.dispose();
-    });
-
-    test('the server remainder is reported to the UI', () async {
-      final remainders = <double>[];
-      final meter = UsageMeter(
-        interval: const Duration(milliseconds: 20),
-        sender: (_, __) async => {'remainingMinutes': 7.5, 'allowed': true},
-      )..onRemaining = remainders.add;
-      meter.start('session-b');
-      await _waitFor(() => remainders.isNotEmpty);
-      meter.stopTimer();
-      expect(remainders, isNotEmpty);
-      expect(remainders.first, 7.5);
-      meter.dispose();
-    });
-
-    test('an exhausted allowance cuts the session off', () async {
-      var exhausted = 0;
-      final meter = UsageMeter(
-        interval: const Duration(milliseconds: 20),
-        sender: (_, __) async => {'remainingMinutes': 0.0, 'allowed': false},
-      )..onExhausted = () => exhausted++;
-      meter.start('session-c');
-      await _waitFor(() => exhausted > 0);
-      meter.stopTimer();
-      expect(exhausted, greaterThanOrEqualTo(1));
-      meter.dispose();
-    });
-
-    test('a dropped heartbeat does not stop a paid session', () async {
-      var attempts = 0;
-      final meter = UsageMeter(
-        interval: const Duration(milliseconds: 20),
-        sender: (_, __) async {
-          attempts++;
-          throw Exception('offline');
-        },
-      );
-      meter.start('session-d');
-      await _waitFor(() => attempts >= 2);
-      expect(meter.isRunning, isTrue);
-      expect(attempts, greaterThanOrEqualTo(2));
-      meter.dispose();
-    });
-
-    test('finishing without a session bills nothing', () async {
-      var calls = 0;
-      final meter = UsageMeter(sender: (_, __) async {
-        calls++;
-        return const {};
-      });
-      await meter.finish();
-      expect(calls, 0);
-      meter.dispose();
     });
   });
 }

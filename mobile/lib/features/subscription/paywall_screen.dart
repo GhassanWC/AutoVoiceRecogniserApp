@@ -159,8 +159,8 @@ class _PaywallScreenState extends State<PaywallScreen> {
                     const SizedBox(height: 6),
                     Text(
                       'Choose the monthly plan that fits how much you talk. '
-                      'Every plan includes live translation minutes that '
-                      'refresh each billing period.',
+                      'Minutes count translated speech, so silent listening '
+                      'never uses them.',
                       style: theme.textTheme.bodyMedium
                           ?.copyWith(color: AppColors.textSecondary),
                     ),
@@ -184,7 +184,22 @@ class _PaywallScreenState extends State<PaywallScreen> {
                           recommended: plan == kRecommendedPlan,
                           onTap: () => setState(() => _selected = plan),
                         ),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: 2),
+                    Row(
+                      children: [
+                        const Icon(Icons.volume_off_rounded,
+                            size: 15, color: AppColors.textTertiary),
+                        const SizedBox(width: 7),
+                        Expanded(
+                          child: Text(
+                            'Silent listening doesn\'t use your minutes.',
+                            style: theme.textTheme.bodySmall
+                                ?.copyWith(color: AppColors.textTertiary),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
                     GradientButton(
                       label: 'Subscribe',
                       busy: _busy,
@@ -269,9 +284,11 @@ void showTermsOfUse(BuildContext context) {
           const SizedBox(height: 14),
           const Text(
             'Sayvo subscriptions are monthly and renew automatically until '
-            'cancelled. Each plan includes a set number of live translation '
-            'minutes per billing period; unused minutes do not carry over to '
-            'the next period.\n\n'
+            'cancelled. Each plan includes a set number of minutes of '
+            'translated speech per billing period. Minutes are consumed only '
+            'while Sayvo is translating what somebody said — listening to a '
+            'silent room, waiting, and playing a translation aloud all cost '
+            'nothing. Unused minutes do not carry over to the next period.\n\n'
             'Payment is charged to your store account at confirmation of '
             'purchase. Your subscription renews automatically unless it is '
             'cancelled at least 24 hours before the end of the current '
@@ -310,7 +327,8 @@ class _PlanCard extends StatelessWidget {
       child: Semantics(
         button: true,
         selected: selected,
-        label: '${planDisplayName(plan)}, ${planMinutes(plan)} minutes a month',
+        label: '${planDisplayName(plan)}, ${planMinutes(plan)} minutes of '
+            'translated speech a month',
         child: Material(
           type: MaterialType.transparency,
           child: InkWell(
@@ -359,7 +377,7 @@ class _PlanCard extends StatelessWidget {
                             ],
                           ],
                         ),
-                        Text('${planMinutes(plan)} min/month',
+                        Text('${planMinutes(plan)} min translated speech / month',
                             style: theme.textTheme.bodySmall
                                 ?.copyWith(color: AppColors.textSecondary)),
                       ],

@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
 import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../utils/account_token.dart';
 import '../../utils/plans.dart';
 
 /// Outcome of a purchase attempt, as far as the APP is concerned. A granted
@@ -35,9 +36,14 @@ class SubscriptionService {
     InAppPurchase? iap,
     FirebaseFunctions? functions,
     BillingStore? store,
+    String? Function()? uidProvider,
   })  : _injectedIap = iap,
         _functions = functions,
-        _injectedStore = store;
+        _injectedStore = store,
+        _uidProvider = uidProvider;
+
+  /// Who is signed in, so a purchase can carry the account it was made for.
+  final String? Function()? _uidProvider;
 
   final BillingStore? _injectedStore;
 
@@ -109,8 +115,17 @@ class SubscriptionService {
   /// Starts the platform's own purchase sheet. Upgrades and downgrades go
   /// through the same call — the stores handle proration within the
   /// subscription group.
+  ///
+  /// The signed-in account's purchase identifier is recorded WITH the purchase
+  /// by the store (Play's obfuscated account id, Apple's appAccountToken), so
+  /// a subscription carries the account it was bought for and a mismatch is
+  /// visible server-side.
   Future<void> buy(ProductDetails product) async {
-    final param = PurchaseParam(productDetails: product);
+    final uid = _uidProvider?.call();
+    final param = PurchaseParam(
+      productDetails: product,
+      applicationUserName: uid == null ? null : accountTokenForUid(uid),
+    );
     await _iap.buyNonConsumable(purchaseParam: param);
   }
 
@@ -140,9 +155,11 @@ class SubscriptionService {
 
   Future<void> _onPurchases(List<PurchaseDetails> purchases) async {
     for (final purchase in purchases) {
+      var settled = true;
       switch (purchase.status) {
         case PurchaseStatus.pending:
-          // Deferred payment (e.g. Ask to Buy). Nothing is granted yet.
+          // Deferred payment (e.g. Ask to Buy). Nothing is granted yet, and
+          // the store will deliver it again when it resolves.
           _results.add(const PurchaseResult(PurchaseOutcome.pending));
           continue;
         case PurchaseStatus.canceled:
@@ -152,10 +169,14 @@ class SubscriptionService {
               message: purchase.error?.message));
         case PurchaseStatus.purchased:
         case PurchaseStatus.restored:
-          await _verify(purchase);
+          settled = await _verify(purchase);
       }
-      // Always complete, or the store replays it forever.
-      if (purchase.pendingCompletePurchase) {
+      // Finishing a transaction tells the store to stop delivering it. Only
+      // do that once the SERVER has settled it — either granting the
+      // entitlement or rejecting the purchase outright. A backend outage must
+      // leave the transaction in the queue so it is redelivered, rather than
+      // discarding a purchase somebody paid for.
+      if (settled && purchase.pendingCompletePurchase) {
         await _iap.completePurchase(purchase);
       }
     }
@@ -174,19 +195,27 @@ class SubscriptionService {
 
   /// Hands the opaque store handle to the backend. The plan is NEVER sent —
   /// the server derives it from what Apple/Google say about this purchase.
-  Future<void> _verify(PurchaseDetails purchase) async {
+  ///
+  /// Returns whether the purchase is SETTLED: verified, or definitively
+  /// refused. A transient failure returns false so the transaction stays in
+  /// the store's queue and is delivered again.
+  Future<bool> _verify(PurchaseDetails purchase) async {
     try {
       final callable = (_functions ?? FirebaseFunctions.instance)
           .httpsCallable('verifySubscriptionPurchase');
       await callable.call<Map<String, dynamic>>(verificationPayload(purchase));
       _results.add(const PurchaseResult(PurchaseOutcome.success));
+      return true;
     } on FirebaseFunctionsException catch (e) {
       developer.log('verification rejected: ${e.code} ${e.message}',
           name: 'billing');
       _results.add(PurchaseResult(PurchaseOutcome.failed, message: e.message));
+      // The server had an answer, and the answer was no.
+      return e.code == 'permission-denied' || e.code == 'invalid-argument';
     } catch (e) {
       developer.log('verification failed: $e', name: 'billing');
       _results.add(PurchaseResult(PurchaseOutcome.failed, message: '$e'));
+      return false;
     }
   }
 

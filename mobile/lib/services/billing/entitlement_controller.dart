@@ -36,7 +36,7 @@ class EntitlementController extends ChangeNotifier {
   bool _loaded = false;
   bool get loaded => _loaded;
 
-  bool get canStartSession => _entitlement.hasMinutesLeft;
+  bool get canStartSession => _entitlement.hasSpeechLeft;
 
   /// Points at a user (or clears on sign-out).
   void bind(String? uid) {
@@ -84,10 +84,15 @@ class EntitlementController extends ChangeNotifier {
     }
   }
 
-  /// Applies a server-reported remainder from the metering call, so the UI
+  /// Applies a server-reported remainder from the usage report, so the UI
   /// counts down between Firestore snapshots without waiting for one.
-  void applyRemaining(double remainingMinutes) {
-    if (remainingMinutes == _entitlement.remainingMinutes) return;
+  ///
+  /// This only ever moves when speech was actually translated — a quiet room
+  /// produces no reports, so the number on screen simply stays put.
+  void applyRemainingMs(int remainingMs) {
+    final clamped = remainingMs < 0 ? 0 : remainingMs;
+    if (clamped == _entitlement.remainingMs) return;
+    final spent = (_entitlement.totalMs - clamped).clamp(0, _entitlement.totalMs);
     _entitlement = Entitlement(
       plan: _entitlement.plan,
       subscriptionStatus: _entitlement.subscriptionStatus,
@@ -95,16 +100,11 @@ class EntitlementController extends ChangeNotifier {
       storeProductId: _entitlement.storeProductId,
       currentPeriodStart: _entitlement.currentPeriodStart,
       currentPeriodEnd: _entitlement.currentPeriodEnd,
-      minutesAllowance: _entitlement.minutesAllowance,
-      minutesUsed: _entitlement.allowanceSource == 'plan'
-          ? (_entitlement.minutesAllowance - remainingMinutes)
-              .clamp(0, double.infinity)
-              .toDouble()
-          : _entitlement.minutesUsed,
-      freeMinutesUsed: _entitlement.allowanceSource == 'free'
-          ? _entitlement.totalMinutes - remainingMinutes
-          : _entitlement.freeMinutesUsed,
-      remainingMinutes: remainingMinutes < 0 ? 0 : remainingMinutes,
+      allowanceMs: _entitlement.allowanceMs,
+      usedMs: _entitlement.allowanceSource == 'plan' ? spent : _entitlement.usedMs,
+      freeUsedMs:
+          _entitlement.allowanceSource == 'free' ? spent : _entitlement.freeUsedMs,
+      remainingMs: clamped,
       allowanceSource: _entitlement.allowanceSource,
     );
     notifyListeners();

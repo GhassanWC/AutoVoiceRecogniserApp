@@ -13,13 +13,39 @@ const String kProProductId = 'sayvo_pro_monthly';
 /// One-time allowance for a new account, for the LIFETIME of the account.
 const int kFreeLifetimeMinutes = 5;
 
-/// Included Live Translation minutes per billing period.
+/// Included minutes of TRANSLATED SPEECH per billing period.
+///
+/// A Sayvo minute is a minute of speech Sayvo translated — not a minute of the
+/// microphone being switched on. Listening to a silent room costs nothing.
 const Map<SayvoPlan, int> kPlanMinutes = {
   SayvoPlan.free: kFreeLifetimeMinutes,
   SayvoPlan.basic: 15,
   SayvoPlan.plus: 35,
   SayvoPlan.pro: 55,
 };
+
+const int kMsPerMinute = 60000;
+
+/// Everything is accounted in milliseconds; minutes are for reading.
+const int kFreeLifetimeMs = kFreeLifetimeMinutes * kMsPerMinute;
+
+int planAllowanceMs(SayvoPlan plan) => planMinutes(plan) * kMsPerMinute;
+
+/// "12m 24s" / "48s" / "1h 04m" — friendly, and never rounded up to a whole
+/// minute, because a user who spoke for ten seconds did not spend a minute.
+String formatSpeechDuration(int milliseconds) {
+  final total = milliseconds < 0 ? 0 : milliseconds;
+  final seconds = total ~/ 1000;
+  if (seconds < 60) return '${seconds}s';
+  final minutes = seconds ~/ 60;
+  if (minutes < 60) {
+    final remainder = seconds % 60;
+    return remainder == 0 ? '${minutes}m' : '${minutes}m ${remainder}s';
+  }
+  final hours = minutes ~/ 60;
+  final remainder = minutes % 60;
+  return '${hours}h ${remainder.toString().padLeft(2, '0')}m';
+}
 
 const Map<SayvoPlan, String> kPlanProductIds = {
   SayvoPlan.basic: kBasicProductId,

@@ -8,6 +8,7 @@ import '../../services/storage/settings_store.dart';
 import '../subscription/paywall_screen.dart';
 import '../../theme/app_colors.dart';
 import '../../utils/languages.dart';
+import '../../utils/plans.dart';
 import '../../widgets/components/app_bottom_nav.dart' show bottomNavClearance;
 import '../../widgets/components/app_error_banner.dart';
 import '../../widgets/components/audio_waveform.dart';
@@ -112,8 +113,6 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
   }
 
   void _showSummarySheet(SessionSummary summary) {
-    final minutes = summary.duration.inMinutes;
-    final seconds = summary.duration.inSeconds % 60;
     showModalBottomSheet<void>(
       context: context,
       builder: (sheetContext) => SafeArea(
@@ -131,8 +130,9 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
                       ?.copyWith(fontWeight: FontWeight.w800)),
               const SizedBox(height: 8),
               Text(
+                // What it cost, not how long the microphone was open.
                 '${summary.translationCount} translation${summary.translationCount == 1 ? '' : 's'}'
-                ' · ${minutes > 0 ? '$minutes min ' : ''}$seconds sec',
+                ' · ${formatSpeechDuration(summary.translatedSpeechMs)} used',
                 textAlign: TextAlign.center,
                 style: Theme.of(sheetContext)
                     .textTheme

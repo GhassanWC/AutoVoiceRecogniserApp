@@ -7,12 +7,16 @@
  * claims. The client never writes these fields: they live in a collection the
  * security rules make read-only for the owner and writable only by the Admin
  * SDK (Cloud Functions).
+ *
+ * The unit of account is a MILLISECOND OF TRANSLATED SPEECH. It is not
+ * microphone wall-clock time: a ten-minute session in a quiet room costs
+ * nothing. See usage.ts for what counts as translated speech.
  */
 
 import {
-  FREE_LIFETIME_MINUTES,
+  FREE_LIFETIME_MS,
   Plan,
-  minutesForPlan,
+  allowanceMsForPlan,
   planForProductId,
 } from "./plans.js";
 
@@ -21,7 +25,7 @@ export type Store = "apple" | "google";
 /**
  * Mirrors the meaningful store states. Only "active" and "grace" grant the
  * paid allowance; everything else falls back to whatever is left of the free
- * lifetime minutes.
+ * lifetime allowance.
  */
 export type SubscriptionStatus =
   | "none"
@@ -44,12 +48,12 @@ export interface Entitlement {
   /** Epoch ms. */
   currentPeriodStart: number | null;
   currentPeriodEnd: number | null;
-  /** Included minutes for the CURRENT paid period. */
-  minutesAllowance: number;
-  /** Fractional minutes consumed in the current paid period. */
-  minutesUsed: number;
-  /** Fractional minutes consumed against the one-time free allowance. */
-  freeMinutesUsed: number;
+  /** Included translated-speech milliseconds for the CURRENT paid period. */
+  allowanceMs: number;
+  /** Translated-speech milliseconds consumed in the current paid period. */
+  usedMs: number;
+  /** Translated-speech milliseconds consumed against the free allowance. */
+  freeUsedMs: number;
   entitlementUpdatedAt: number;
   /**
    * Store event/transaction identifiers already applied. Makes every
@@ -62,6 +66,13 @@ export interface Entitlement {
 /** How many applied ids to keep (bounded so the document cannot grow forever). */
 const MAX_APPLIED_EVENT_IDS = 50;
 
+/**
+ * How far past the allowance a single accepted report may push usage, so that
+ * a sentence already being translated can finish rather than being cut off
+ * mid-way. Strictly bounded: it is a courtesy, not an overrun budget.
+ */
+export const OVERRUN_GRACE_MS = 15_000;
+
 export function freshEntitlement(nowMs: number): Entitlement {
   return {
     plan: "free",
@@ -71,9 +82,9 @@ export function freshEntitlement(nowMs: number): Entitlement {
     storeHandle: null,
     currentPeriodStart: null,
     currentPeriodEnd: null,
-    minutesAllowance: 0,
-    minutesUsed: 0,
-    freeMinutesUsed: 0,
+    allowanceMs: 0,
+    usedMs: 0,
+    freeUsedMs: 0,
     entitlementUpdatedAt: nowMs,
     appliedEventIds: [],
   };
@@ -86,7 +97,10 @@ export interface Access {
   allowed: boolean;
   source: AllowanceSource;
   /** Never negative. */
-  remainingMinutes: number;
+  remainingMs: number;
+  /** The allowance in force, so the client can render a progress bar. */
+  allowanceMs: number;
+  usedMs: number;
   plan: Plan;
 }
 
@@ -105,52 +119,79 @@ function paidIsLive(entitlement: Entitlement, nowMs: number): boolean {
 
 /**
  * The single authority on "may this user start translating, and against which
- * bucket". A lapsed subscriber falls back to whatever free minutes they never
- * used, which is normally zero — so they see the paywall.
+ * bucket". A lapsed subscriber falls back to whatever free allowance they
+ * never used, which is normally zero — so they see the paywall.
  */
 export function accessFor(entitlement: Entitlement, nowMs: number): Access {
   if (paidIsLive(entitlement, nowMs)) {
-    const remaining = entitlement.minutesAllowance - entitlement.minutesUsed;
+    const remaining = entitlement.allowanceMs - entitlement.usedMs;
     return {
       allowed: remaining > 0,
       source: "plan",
-      remainingMinutes: Math.max(0, remaining),
+      remainingMs: Math.max(0, remaining),
+      allowanceMs: entitlement.allowanceMs,
+      usedMs: entitlement.usedMs,
       plan: entitlement.plan,
     };
   }
-  const remaining = FREE_LIFETIME_MINUTES - entitlement.freeMinutesUsed;
+  const remaining = FREE_LIFETIME_MS - entitlement.freeUsedMs;
   return {
     allowed: remaining > 0,
     source: "free",
-    remainingMinutes: Math.max(0, remaining),
+    remainingMs: Math.max(0, remaining),
+    allowanceMs: FREE_LIFETIME_MS,
+    usedMs: entitlement.freeUsedMs,
     plan: "free",
   };
 }
 
+export interface ChargeResult {
+  entitlement: Entitlement;
+  /** What was actually taken off the allowance, after the grace clamp. */
+  chargedMs: number;
+}
+
 /**
- * Charges [seconds] of live translation to the right bucket. Returns the new
- * entitlement — never mutates. Charging is always additive and clamped, so a
- * replay can overcharge at worst by the capped tick, never grant minutes.
+ * Charges [speechMs] of TRANSLATED SPEECH to the right bucket. Returns the new
+ * entitlement — never mutates.
+ *
+ * Charging is additive and clamped: usage can never decrease, and a single
+ * charge can never push usage more than [OVERRUN_GRACE_MS] past the allowance,
+ * so no one long utterance can walk through the cap.
  */
-export function chargeSeconds(
+export function chargeSpeechMs(
   entitlement: Entitlement,
-  seconds: number,
+  speechMs: number,
   nowMs: number,
-): Entitlement {
-  if (!(seconds > 0)) return entitlement;
-  const minutes = seconds / 60;
-  const source = accessFor(entitlement, nowMs).source;
-  if (source === "plan") {
+): ChargeResult {
+  if (!(speechMs > 0)) return { entitlement, chargedMs: 0 };
+  const access = accessFor(entitlement, nowMs);
+  // Bounded overrun: TOTAL usage may reach the allowance plus a small grace,
+  // so a sentence in flight can finish. The grace is a ceiling on the whole
+  // period, not a fresh allowance handed out on every report.
+  const headroom = Math.max(
+    0,
+    access.allowanceMs + OVERRUN_GRACE_MS - access.usedMs,
+  );
+  const chargedMs = Math.min(speechMs, headroom);
+  if (chargedMs <= 0) return { entitlement, chargedMs: 0 };
+  if (access.source === "plan") {
     return {
-      ...entitlement,
-      minutesUsed: entitlement.minutesUsed + minutes,
-      entitlementUpdatedAt: nowMs,
+      entitlement: {
+        ...entitlement,
+        usedMs: entitlement.usedMs + chargedMs,
+        entitlementUpdatedAt: nowMs,
+      },
+      chargedMs,
     };
   }
   return {
-    ...entitlement,
-    freeMinutesUsed: entitlement.freeMinutesUsed + minutes,
-    entitlementUpdatedAt: nowMs,
+    entitlement: {
+      ...entitlement,
+      freeUsedMs: entitlement.freeUsedMs + chargedMs,
+      entitlementUpdatedAt: nowMs,
+    },
+    chargedMs,
   };
 }
 
@@ -173,14 +214,30 @@ export interface VerifiedSubscription {
    * suffixed by the notification id where one exists). Used for idempotency.
    */
   eventId: string;
+  /**
+   * The account identifier the store recorded with the purchase, when there
+   * is one (Apple appAccountToken / Google obfuscatedExternalAccountId).
+   */
+  accountToken?: string | null;
+  /**
+   * Google only: whether Play has the purchase acknowledged. Undefined means
+   * the acknowledgement attempt did not come back OK and should be retried.
+   */
+  acknowledged?: boolean;
 }
 
 export interface ApplyResult {
   entitlement: Entitlement;
   /** False when the event had already been applied. */
   changed: boolean;
-  /** True when a new billing period reset the used minutes. */
+  /** True when a new billing period reset the used allowance. */
   periodAdvanced: boolean;
+}
+
+/** Statuses that grant nothing: the paid allowance goes to zero. */
+function grantsNothing(status: SubscriptionStatus): boolean {
+  // "none" is Play's PENDING state — a purchase that has not been paid for.
+  return status === "expired" || status === "revoked" || status === "none";
 }
 
 /**
@@ -209,9 +266,9 @@ export function applyVerifiedSubscription(
     -MAX_APPLIED_EVENT_IDS,
   );
 
-  // A lost subscription keeps its history but grants nothing; the user falls
-  // back to their unused free minutes via accessFor().
-  if (verified.status === "expired" || verified.status === "revoked") {
+  // A lost or unpaid subscription keeps its history but grants nothing; the
+  // user falls back to their unused free allowance via accessFor().
+  if (grantsNothing(verified.status)) {
     return {
       entitlement: {
         ...entitlement,
@@ -222,7 +279,7 @@ export function applyVerifiedSubscription(
         storeHandle: verified.handle,
         currentPeriodStart: verified.periodStart,
         currentPeriodEnd: verified.periodEnd,
-        minutesAllowance: 0,
+        allowanceMs: 0,
         entitlementUpdatedAt: nowMs,
         appliedEventIds,
       },
@@ -232,8 +289,8 @@ export function applyVerifiedSubscription(
   }
 
   // A NEW billing period (renewal, or a switch that re-based the period)
-  // resets usage. Unused minutes never roll over: the allowance is replaced,
-  // not added to.
+  // resets usage. Unused allowance never rolls over: it is replaced, not
+  // added to.
   const periodAdvanced =
     entitlement.currentPeriodStart === null ||
     verified.periodStart > entitlement.currentPeriodStart;
@@ -251,8 +308,8 @@ export function applyVerifiedSubscription(
       storeHandle: verified.handle,
       currentPeriodStart: verified.periodStart,
       currentPeriodEnd: verified.periodEnd,
-      minutesAllowance: minutesForPlan(plan),
-      minutesUsed: periodAdvanced ? 0 : entitlement.minutesUsed,
+      allowanceMs: allowanceMsForPlan(plan),
+      usedMs: periodAdvanced ? 0 : entitlement.usedMs,
       entitlementUpdatedAt: nowMs,
       appliedEventIds,
     },

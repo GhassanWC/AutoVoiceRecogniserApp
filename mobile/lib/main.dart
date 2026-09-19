@@ -50,7 +50,8 @@ Future<void> main() async {
   entitlements.bind(authController.uid);
   authController.addListener(() => entitlements.bind(authController.uid));
 
-  final subscriptions = SubscriptionService()..listen();
+  final subscriptions =
+      SubscriptionService(uidProvider: () => authController.uid)..listen();
 
   final liveController = LiveTranslationController(
     settings: settings,
@@ -58,9 +59,9 @@ Future<void> main() async {
     sessionRepository: sessionRepository,
     uidProvider: () => authController.uid,
   );
-  // The metering heartbeat is the freshest number there is, so let it drive
+  // The usage report carries the freshest remainder there is, so let it drive
   // the counter between Firestore snapshots.
-  liveController.onMinutesRemaining = entitlements.applyRemaining;
+  liveController.onRemainingMs = entitlements.applyRemainingMs;
 
   runApp(
     MultiProvider(

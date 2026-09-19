@@ -22,6 +22,7 @@ import 'package:live_translator/services/gemini/live_translation_service.dart';
 import 'package:live_translator/services/permissions/mic_permission_service.dart';
 import 'package:live_translator/services/speech/speech_service.dart';
 import 'package:live_translator/services/storage/settings_store.dart';
+import 'package:live_translator/utils/plans.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -370,12 +371,12 @@ void main() {
       'nothing', (tester) async {
     _useSmallPhone(tester);
     final h = _ShellHarness();
-    // The SERVER says this account is out of minutes.
+    // The SERVER says this account's translated-speech allowance is spent.
     await h.firestore.collection('entitlements').doc('user-1').set({
       'plan': 'free',
       'subscriptionStatus': 'none',
-      'freeMinutesUsed': 5.0,
-      'remainingMinutes': 0.0,
+      'freeUsedMs': kFreeLifetimeMs,
+      'remainingMs': 0,
       'allowanceSource': 'free',
     });
     h.entitlements.bind('user-1');

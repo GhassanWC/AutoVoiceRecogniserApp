@@ -30,7 +30,7 @@ class LiveSessionToken {
     required this.model,
     required this.expireTime,
     this.sessionId,
-    this.remainingMinutes,
+    this.remainingMs,
   });
   final String token;
   final String model;
@@ -41,8 +41,8 @@ class LiveSessionToken {
   /// right session.
   final String? sessionId;
 
-  /// Minutes left at the moment the token was minted.
-  final double? remainingMinutes;
+  /// Translated-speech milliseconds left when the token was minted.
+  final int? remainingMs;
 }
 
 /// Thrown by the token provider when minting fails.
@@ -69,6 +69,37 @@ abstract class GeminiSocket {
 }
 
 typedef SocketConnector = Future<GeminiSocket> Function(Uri uri);
+
+/// A passive watcher of the live session, for ACCOUNTING ONLY.
+///
+/// Everything here is an observation after the fact: an observer cannot gate
+/// the microphone, withhold audio, change segmentation or influence anything
+/// the user sees. Billing lives on the other side of this interface so that
+/// the translation pipeline stays unaware of it.
+abstract class LiveSessionObserver {
+  /// The socket is up and the microphone is streaming.
+  void onConnected();
+
+  /// The socket went down (a reconnect calls [onConnected] again).
+  void onDisconnected();
+
+  /// One microphone chunk, with the same level the waveform uses.
+  ///
+  /// [gated] is true whenever the chunk is not reaching Gemini — the uplink is
+  /// muted for Sayvo's own spoken translation, or the session is not live yet.
+  void onMicAudio({
+    required double rms,
+    required Duration duration,
+    required bool gated,
+    required bool sentUpstream,
+  });
+
+  /// Non-empty translated text just became visible to the user.
+  void onTranslatedText();
+
+  /// A translated utterance finished (telemetry only).
+  void onUtteranceTranslated();
+}
 
 class _ChannelSocket implements GeminiSocket {
   _ChannelSocket(this._channel);
@@ -190,6 +221,10 @@ class LiveTranslationService {
   final Duration playbackGateTail;
   final String Function() _newUtteranceId;
   final DateTime Function() _now;
+
+  /// Accounting-only watcher; see [LiveSessionObserver]. Null in tests that
+  /// care about translation behaviour rather than billing.
+  LiveSessionObserver? observer;
 
   LiveServiceState _state = LiveServiceState.idle;
   LiveServiceState get state => _state;
@@ -367,6 +402,7 @@ class LiveTranslationService {
     // Capture stops FIRST: not one extra sample is recorded after Stop.
     await _stopCapture();
     _finalizePendingUtterance();
+    if (_setupDone) observer?.onDisconnected();
     await playback.stop();
     await _closeSocket();
     _token = null;
@@ -524,6 +560,7 @@ class LiveTranslationService {
     // Playback is NOT started here: nothing plays until the user taps a
     // message's speaker button.
     _setState(LiveServiceState.listening);
+    observer?.onConnected();
     liveTrace('SETUP_COMPLETE',
         'capture=$_captureRunning target=$_targetLanguageCode');
     _startHealthTrace();
@@ -542,6 +579,7 @@ class LiveTranslationService {
       _lastSocketError =
           'closed during setup (code=${socket.closeCode}, reason=${socket.closeReason})';
     }
+    if (_setupDone) observer?.onDisconnected();
     // A connection that died during setup leaves its 15s timer armed; kill
     // it so it cannot fire into a later reconnect of the same generation.
     _setupTimer?.cancel();
@@ -723,6 +761,8 @@ class LiveTranslationService {
             'OUTPUT_TRANSCRIPTION',
             'utterance=$_utteranceId +${text.length}ch '
                 'total=${_translationBuffer.length}ch');
+        // The speech that produced this has now earned its keep.
+        observer?.onTranslatedText();
         _emitUpdate();
       }
     }
@@ -850,6 +890,8 @@ class LiveTranslationService {
     if (id == null) return;
     liveTrace('TRANSLATION_TAIL',
         'utterance=$id claimed its ${translation.length}ch translation');
+    observer?.onTranslatedText();
+    if (translation.trim().isNotEmpty) observer?.onUtteranceTranslated();
     _events.add(UtteranceFinalized(
       utteranceId: id,
       sourceText: _tailSource.toString().trim(),
@@ -893,6 +935,7 @@ class LiveTranslationService {
     if (id == null) return;
     final source = _sourceBuffer.toString().trim();
     final translation = _translationBuffer.toString().trim();
+    if (translation.isNotEmpty) observer?.onUtteranceTranslated();
     if (source.isNotEmpty || translation.isNotEmpty) {
       _events.add(UtteranceFinalized(
         utteranceId: id,
@@ -916,9 +959,20 @@ class LiveTranslationService {
 
   void _onMicChunk(Uint8List pcm) {
     _lastChunkAt = _now();
-    _micLevel.add(micUiLevel(pcm16Rms(pcm)));
-    if (_state != LiveServiceState.listening || !_setupDone) return;
-    final gated = _uplinkGated;
+    final rms = pcm16Rms(pcm);
+    _micLevel.add(micUiLevel(rms));
+    final live = _state == LiveServiceState.listening && _setupDone;
+    final gated = live && _uplinkGated;
+    // Accounting sees every chunk, including the ones that never leave the
+    // device; it can then charge for none of them.
+    observer?.onMicAudio(
+      rms: rms,
+      // 16 kHz mono PCM16 is 32 bytes per millisecond.
+      duration: Duration(milliseconds: pcm.lengthInBytes ~/ 32),
+      gated: gated || !live,
+      sentUpstream: live && !gated,
+    );
+    if (!live) return;
     if (gated != _lastGateState) {
       _lastGateState = gated;
       liveTrace(
@@ -1022,6 +1076,7 @@ class LiveTranslationService {
     _reconnectTimer?.cancel();
     unawaited(_stopCapture());
     _finalizePendingUtterance();
+    if (_setupDone) observer?.onDisconnected();
     unawaited(playback.stop());
     unawaited(_closeSocket());
     _token = null;

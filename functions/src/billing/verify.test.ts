@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { accessFor, applyVerifiedSubscription, freshEntitlement } from "./entitlement.js";
-import { PLAN_MINUTES, PRODUCT_IDS } from "./plans.js";
+import { PLAN_ALLOWANCE_MS, PRODUCT_IDS } from "./plans.js";
 import { Environment } from "@apple/app-store-server-library";
 
 import {
@@ -140,7 +140,7 @@ describe("Google Play mapping", () => {
       cancelled,
       T0,
     ).entitlement;
-    expect(accessFor(entitlement, T0 + 5000).remainingMinutes).toBe(PLAN_MINUTES.pro);
+    expect(accessFor(entitlement, T0 + 5000).remainingMs).toBe(PLAN_ALLOWANCE_MS.pro);
     // ...and stops the moment the paid period ends.
     expect(accessFor(entitlement, T0 + MONTH + 1).source).toBe("free");
   });
@@ -201,6 +201,116 @@ describe("Google Play mapping", () => {
       T0,
     ).entitlement;
     expect(entitlement.plan).toBe("pro");
-    expect(entitlement.minutesAllowance).toBe(PLAN_MINUTES.pro);
+    expect(entitlement.allowanceMs).toBe(PLAN_ALLOWANCE_MS.pro);
+  });
+
+  it("carries Play's obfuscated account id as the account token", () => {
+    const withAccount = mapGoogleSubscription(
+      {
+        ...response,
+        externalAccountIdentifiers: {
+          obfuscatedExternalAccountId: "9e65ab7b-6d88-590e-a831-0012d8bac0ae",
+        },
+      },
+      "token-abcdefghijklmnop",
+    );
+    expect(withAccount.accountToken).toBe("9e65ab7b-6d88-590e-a831-0012d8bac0ae");
+  });
+});
+
+describe("Google Play acknowledgement", () => {
+  const pendingAck = {
+    subscriptionState: "SUBSCRIPTION_STATE_ACTIVE",
+    acknowledgementState: "ACKNOWLEDGEMENT_STATE_PENDING",
+    latestOrderId: "GPA.1111-2222",
+    startTime: new Date(T0).toISOString(),
+    lineItems: [
+      {
+        productId: PRODUCT_IDS.plus,
+        expiryTime: new Date(T0 + MONTH).toISOString(),
+      },
+    ],
+  };
+
+  /** Records every request so the acknowledge call can be asserted. */
+  function recordingFetch(acknowledgeStatus = 200) {
+    const calls: { url: string; method: string }[] = [];
+    const fetchFn = (async (url: string, init?: { method?: string }) => {
+      calls.push({ url: String(url), method: init?.method ?? "GET" });
+      if (String(url).endsWith(":acknowledge")) {
+        return new Response("{}", { status: acknowledgeStatus });
+      }
+      return new Response(JSON.stringify(pendingAck), { status: 200 });
+    }) as unknown as typeof fetch;
+    return { calls, fetchFn };
+  }
+
+  it("acknowledges a purchase Play is still waiting on", async () => {
+    const { calls, fetchFn } = recordingFetch();
+    const verified = await verifyGoogleSubscription("token-to-ack", {
+      packageName: "com.livetranslator.live_translator",
+      accessToken: async () => "test-token",
+      fetchFn,
+    });
+    expect(verified.acknowledged).toBe(true);
+    const ack = calls.find((c) => c.url.endsWith(":acknowledge"));
+    expect(ack?.method).toBe("POST");
+    // Acknowledgement is per product + token.
+    expect(ack?.url).toContain(PRODUCT_IDS.plus);
+    expect(ack?.url).toContain("token-to-ack");
+  });
+
+  it("does not acknowledge a purchase Play has already acknowledged", async () => {
+    const calls: string[] = [];
+    const verified = await verifyGoogleSubscription("token-done", {
+      packageName: "com.livetranslator.live_translator",
+      accessToken: async () => "test-token",
+      fetchFn: (async (url: string) => {
+        calls.push(String(url));
+        return new Response(
+          JSON.stringify({
+            ...pendingAck,
+            acknowledgementState: "ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED",
+          }),
+          { status: 200 },
+        );
+      }) as unknown as typeof fetch,
+    });
+    expect(verified.acknowledged).toBe(true);
+    expect(calls.some((url) => url.endsWith(":acknowledge"))).toBe(false);
+  });
+
+  it("a repeat acknowledgement is safe: the purchase still verifies", async () => {
+    // Play answers 400 for an already-acknowledged purchase. That is not a
+    // verification failure, and the entitlement must still be granted.
+    const { fetchFn } = recordingFetch(400);
+    const verified = await verifyGoogleSubscription("token-again", {
+      packageName: "com.livetranslator.live_translator",
+      accessToken: async () => "test-token",
+      fetchFn,
+    });
+    expect(verified.productId).toBe(PRODUCT_IDS.plus);
+    expect(verified.status).toBe("active");
+    // Undefined means "we could not confirm it", which the caller logs.
+    expect(verified.acknowledged).toBeUndefined();
+  });
+
+  it("never acknowledges a purchase that was never paid for", async () => {
+    const calls: string[] = [];
+    await verifyGoogleSubscription("token-pending", {
+      packageName: "com.livetranslator.live_translator",
+      accessToken: async () => "test-token",
+      fetchFn: (async (url: string) => {
+        calls.push(String(url));
+        return new Response(
+          JSON.stringify({
+            ...pendingAck,
+            subscriptionState: "SUBSCRIPTION_STATE_PENDING",
+          }),
+          { status: 200 },
+        );
+      }) as unknown as typeof fetch,
+    });
+    expect(calls.some((url) => url.endsWith(":acknowledge"))).toBe(false);
   });
 });
