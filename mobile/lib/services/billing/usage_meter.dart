@@ -55,8 +55,19 @@ class UsageMeter implements LiveSessionObserver {
   Timer? _safetyTimer;
   String? _sessionId;
   int _sequence = 0;
+
+  /// Translated speech already settled with EARLIER metered sessions — either
+  /// previous listening sessions, or earlier Gemini leases within this one.
+  /// The speech meter counts forever; only what is past this line belongs to
+  /// the session being reported now.
+  int _baselineMs = 0;
+
+  /// Reported to the CURRENT metered session, relative to [_baselineMs].
   int _reportedMs = 0;
   bool _sending = false;
+
+  /// Whether a lease has been taken out since the last [finish].
+  bool _leased = false;
 
   // Telemetry: how much audio we stream for how much translated speech.
   int _connectedMs = 0;
@@ -71,22 +82,36 @@ class UsageMeter implements LiveSessionObserver {
 
   bool get isRunning => _sessionId != null;
 
+  /// Translated speech this metered session is responsible for.
+  int get _sessionCommittedMs => _speech.committedSpeechMs - _baselineMs;
+
   /// Translated-speech ms committed locally but not yet accepted by the server.
-  int get unreportedMs => _speech.committedSpeechMs - _reportedMs;
+  int get unreportedMs => _sessionCommittedMs - _reportedMs;
 
   /// Exposed for the controller's session summary and for tests.
   SpeechActivityMeter get speech => _speech;
 
-  /// Begins reporting for a server-issued session id.
+  /// Begins reporting for a new LISTENING session.
+  ///
+  /// The speech meter keeps counting across sessions, so everything committed
+  /// so far is drawn behind the line: this session reports only its own
+  /// translated speech, never a total that a previous session already paid.
   void start(String sessionId) {
+    if (_sessionId == sessionId) return;
     _flushTimer?.cancel();
     _safetyTimer?.cancel();
+    _baselineMs = _speech.committedSpeechMs;
     _sessionId = sessionId;
     _sequence = 0;
     _reportedMs = 0;
     _connectedMs = 0;
     _audioSentMs = 0;
     _connectedAt = null;
+    _armSafetyTimer();
+  }
+
+  void _armSafetyTimer() {
+    _safetyTimer?.cancel();
     _safetyTimer = Timer.periodic(safetyInterval, (_) {
       // Quiet room, nothing translated: there is nothing to say, so say
       // nothing. No write, no wake-up, no cost.
@@ -103,6 +128,7 @@ class UsageMeter implements LiveSessionObserver {
     _safetyTimer = null;
     _speech.endSession(_now());
     _closeConnectedWindow();
+    _leased = false;
     final sessionId = _sessionId;
     if (sessionId == null) return;
     await _send(close: true);
@@ -149,6 +175,40 @@ class UsageMeter implements LiveSessionObserver {
     _scheduleFlush();
   }
 
+  /// A Gemini lease is ending. Settle what this metered session owes before
+  /// the server is asked for another one — that settlement is exactly what
+  /// makes an exhausted account fail to get a new lease.
+  @override
+  Future<void> onLeaseEnding() async {
+    final sessionId = _sessionId;
+    if (sessionId == null) return;
+    _flushTimer?.cancel();
+    _flushTimer = null;
+    await _send(close: true);
+    // Whatever the server accepted is behind us now; anything it did not
+    // carries into the next lease rather than being charged twice or lost.
+    _baselineMs += _reportedMs;
+    _reportedMs = 0;
+    _sessionId = null;
+  }
+
+  /// A new lease is in force. The listening session, the conversation and the
+  /// speech meter all continue — only the metered session id changes.
+  @override
+  void onLeaseStarted(String? sessionId) {
+    if (sessionId == null || _sessionId == sessionId) return;
+    if (_leased) {
+      // A renewal: keep the telemetry and the speech already measured.
+      _sessionId = sessionId;
+      _sequence = 0;
+      _reportedMs = 0;
+      _armSafetyTimer();
+    } else {
+      start(sessionId);
+    }
+    _leased = true;
+  }
+
   // ── Reporting ─────────────────────────────────────────────────────────────
 
   void _scheduleFlush() {
@@ -173,7 +233,9 @@ class UsageMeter implements LiveSessionObserver {
     // total twice, and while that is harmless server-side it is pure noise.
     if (_sending && !close) return;
     _sending = true;
-    final cumulative = _speech.committedSpeechMs;
+    // Cumulative FOR THIS metered session: the server takes the difference
+    // against what it has already accepted for it.
+    final cumulative = _sessionCommittedMs;
     final sequence = ++_sequence;
     try {
       final data = await (_sender ?? _callFunction)({
@@ -207,7 +269,7 @@ class UsageMeter implements LiveSessionObserver {
     return {
       'connectedMs': connected,
       'audioSentMs': _audioSentMs,
-      'committedSpeechMs': _speech.committedSpeechMs,
+      'committedSpeechMs': _sessionCommittedMs,
       'translatedUtteranceCount': _speech.translatedUtteranceCount,
     };
   }

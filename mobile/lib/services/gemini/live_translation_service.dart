@@ -99,6 +99,16 @@ abstract class LiveSessionObserver {
 
   /// A translated utterance finished (telemetry only).
   void onUtteranceTranslated();
+
+  /// The current Gemini lease is ending and another is about to be requested.
+  ///
+  /// Awaited, so accounting can settle what it owes for the metered session
+  /// that is closing BEFORE the server decides whether to issue another
+  /// lease. That is what makes an exhausted account fail to renew.
+  Future<void> onLeaseEnding();
+
+  /// A new lease is in force, carrying its own metered session id.
+  void onLeaseStarted(String? sessionId);
 }
 
 class _ChannelSocket implements GeminiSocket {
@@ -188,6 +198,7 @@ class LiveTranslationService {
       Duration(seconds: 4),
     ],
     this.setupTimeout = const Duration(seconds: 15),
+    this.leaseRenewalMargin = const Duration(seconds: 30),
     this.playbackGateTail = const Duration(milliseconds: 300),
     String Function()? utteranceIdFactory,
     DateTime Function()? now,
@@ -218,6 +229,10 @@ class LiveTranslationService {
   final AudioPlaybackService playback;
   final List<Duration> backoffDelays;
   final Duration setupTimeout;
+
+  /// How far ahead of a lease's expiry the next one is requested, so the swap
+  /// happens while the current connection is still healthy.
+  final Duration leaseRenewalMargin;
   final Duration playbackGateTail;
   final String Function() _newUtteranceId;
   final DateTime Function() _now;
@@ -228,10 +243,6 @@ class LiveTranslationService {
 
   LiveServiceState _state = LiveServiceState.idle;
   LiveServiceState get state => _state;
-
-  /// The server-issued metered session id for the token in use, or null when
-  /// no session is open.
-  String? get meteredSessionId => _token?.sessionId;
 
   final StreamController<LiveServiceState> _stateChanges = StreamController.broadcast();
   Stream<LiveServiceState> get stateChanges => _stateChanges.stream;
@@ -258,6 +269,7 @@ class LiveTranslationService {
   StreamSubscription<bool>? _playbackSubscription;
   Timer? _setupTimer;
   Timer? _reconnectTimer;
+  Timer? _leaseTimer;
   LiveSessionToken? _token;
   String _targetLanguageCode = 'en';
   bool _setupDone = false;
@@ -367,9 +379,8 @@ class LiveTranslationService {
     _resetUtterance();
     _setState(LiveServiceState.connecting);
 
-    final LiveSessionToken token;
     try {
-      token = await _tokenProvider(targetLanguageCode);
+      await _acquireLease(generation);
     } on TokenRequestException catch (e) {
       if (generation != _generation) return;
       _failSession(e.kind, e.message);
@@ -383,8 +394,25 @@ class LiveTranslationService {
       return;
     }
     if (generation != _generation) return;
-    _token = token;
     await _openSocket(generation, resuming: false);
+  }
+
+  /// Takes out a new Gemini lease.
+  ///
+  /// Leases are short on purpose — a stolen token is worth minutes, not half
+  /// an hour — so a long conversation renews several times. Accounting settles
+  /// the closing lease FIRST, which is what lets the server refuse the next
+  /// one to an account that has just run out.
+  ///
+  /// A lease is a cost and security boundary, never a billing unit: five
+  /// minutes of silence under a five-minute lease costs the user nothing.
+  Future<LiveSessionToken> _acquireLease(int generation) async {
+    if (_token != null) await observer?.onLeaseEnding();
+    final token = await _tokenProvider(_targetLanguageCode);
+    if (generation != _generation) return token;
+    _token = token;
+    observer?.onLeaseStarted(token.sessionId);
+    return token;
   }
 
   /// Stops everything and returns to idle. Callable from any state; must
@@ -399,6 +427,7 @@ class LiveTranslationService {
     _setState(LiveServiceState.stopping);
     _setupTimer?.cancel();
     _reconnectTimer?.cancel();
+    _leaseTimer?.cancel();
     // Capture stops FIRST: not one extra sample is recorded after Stop.
     await _stopCapture();
     _finalizePendingUtterance();
@@ -563,7 +592,68 @@ class LiveTranslationService {
     observer?.onConnected();
     liveTrace('SETUP_COMPLETE',
         'capture=$_captureRunning target=$_targetLanguageCode');
+    _scheduleLeaseRenewal(generation);
     _startHealthTrace();
+  }
+
+  /// Arms the renewal a little before the current lease runs out, so the swap
+  /// happens on a healthy connection rather than as a failure.
+  void _scheduleLeaseRenewal(int generation) {
+    _leaseTimer?.cancel();
+    final token = _token;
+    if (token == null) return;
+    final untilExpiry = token.expireTime.difference(_now().toUtc());
+    final delay = untilExpiry - leaseRenewalMargin;
+    _leaseTimer = Timer(
+      delay.isNegative ? Duration.zero : delay,
+      () => unawaited(_renewLease(generation)),
+    );
+    liveTrace('LEASE',
+        'renewing in ${delay.isNegative ? 0 : delay.inSeconds}s '
+        '(lease ends in ${untilExpiry.inSeconds}s)');
+  }
+
+  /// Replaces an expiring lease without the user noticing.
+  ///
+  /// The conversation is kept: capture never stops, the state never leaves
+  /// [LiveServiceState.listening], and the new connection resumes the same
+  /// Gemini session where it can, so no new bubble, session or history entry
+  /// appears. If the account has run out, the server refuses the new lease
+  /// and the session ends at the paywall instead.
+  Future<void> _renewLease(int generation) async {
+    if (generation != _generation) return;
+    if (_state != LiveServiceState.listening) return;
+    liveTrace('LEASE_RENEW', 'requesting a new lease mid-session');
+    try {
+      await _acquireLease(generation);
+    } on TokenRequestException catch (e) {
+      if (generation != _generation) return;
+      // Out of allowance, out of Gemini capacity, or unauthorized: all
+      // terminal for this session, and each has its own user-facing copy.
+      _failSession(e.kind, e.message);
+      return;
+    } catch (e) {
+      developer.log('lease renewal failed: $e', name: 'live.session', error: e);
+      if (generation != _generation) return;
+      // Treat it as a connection problem: the existing backoff will try
+      // again, and the current socket keeps working until it does.
+      await _handleConnectionLoss(generation);
+      return;
+    }
+    if (generation != _generation) return;
+    await _swapConnection(generation);
+  }
+
+  /// Moves to a new connection under the new lease, leaving the session,
+  /// the microphone and the on-screen conversation alone.
+  Future<void> _swapConnection(int generation) async {
+    if (generation != _generation) return;
+    if (_setupDone) observer?.onDisconnected();
+    // Cancelling the subscription first means the old socket's onDone cannot
+    // be mistaken for a dropped connection.
+    await _closeSocket();
+    if (generation != _generation) return;
+    await _openSocket(generation, resuming: _resumeHandle != null);
   }
 
   void _onSocketClosed(int generation) {
@@ -629,20 +719,20 @@ class LiveTranslationService {
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(delay, () async {
       if (generation != _generation) return;
-      final token = _token;
-      final tokenValid = token != null &&
-          _now().toUtc().isBefore(token.expireTime.subtract(const Duration(seconds: 10)));
-      if (tokenValid && _resumeHandle != null) {
-        await _openSocket(generation, resuming: true);
-        return;
-      }
-      // Fresh token (single-use tokens can't reopen without a resume handle).
+      // Always a FRESH lease: tokens are single-use, so the old one cannot
+      // open a second connection however much of its five minutes is left.
+      // The resume handle, not the token, is what keeps the conversation.
+      final bool resuming = _resumeHandle != null;
       try {
-        _token = await _tokenProvider(_targetLanguageCode);
+        await _acquireLease(generation);
       } on TokenRequestException catch (e) {
         if (generation != _generation) return;
-        if (e.kind == LiveErrorKind.quota || e.kind == LiveErrorKind.auth) {
-          _failSession(e.kind, e.message); // never retry quota/auth
+        if (e.kind == LiveErrorKind.quota ||
+            e.kind == LiveErrorKind.auth ||
+            e.kind == LiveErrorKind.outOfMinutes) {
+          // Never retry: capacity, authorization and an exhausted allowance
+          // are all answers, not hiccups.
+          _failSession(e.kind, e.message);
           return;
         }
         await _handleConnectionLoss(generation); // burns another attempt
@@ -655,8 +745,7 @@ class LiveTranslationService {
         return;
       }
       if (generation != _generation) return;
-      _resumeHandle = null;
-      await _openSocket(generation, resuming: false);
+      await _openSocket(generation, resuming: resuming);
     });
   }
 
@@ -1074,6 +1163,7 @@ class LiveTranslationService {
     _healthTimer = null;
     _setupTimer?.cancel();
     _reconnectTimer?.cancel();
+    _leaseTimer?.cancel();
     unawaited(_stopCapture());
     _finalizePendingUtterance();
     if (_setupDone) observer?.onDisconnected();

@@ -12,8 +12,20 @@ export const MODEL = "models/gemini-3.5-live-translate-preview";
 export const AUTH_TOKENS_URL =
   "https://generativelanguage.googleapis.com/v1beta/auth_tokens";
 
-/** How long the token may keep an open session sending messages. */
-const TOKEN_TTL_MINUTES = 30;
+/**
+ * How long one lease may keep a session open.
+ *
+ * This is a SECURITY AND COST lease, not a billing quantity. A leaked or
+ * stolen token is worth at most five minutes of Gemini time, and a session
+ * that outlives its lease renews transparently — the app asks for another
+ * token, which re-checks the account's entitlement before it is issued.
+ *
+ * It says nothing about what the customer pays. Customer usage is translated
+ * speech only, so five minutes of silence under a five-minute lease still
+ * costs zero.
+ */
+export const MAX_TOKEN_LEASE_MINUTES = 5;
+const TOKEN_TTL_MINUTES = MAX_TOKEN_LEASE_MINUTES;
 /** Window in which the single new session must be started. */
 const NEW_SESSION_TTL_SECONDS = 60;
 

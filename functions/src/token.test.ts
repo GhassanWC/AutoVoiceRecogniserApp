@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AUTH_TOKENS_URL,
+  MAX_TOKEN_LEASE_MINUTES,
   MODEL,
   TokenError,
   issueLiveTranslateToken,
@@ -24,6 +25,38 @@ function fakeFetch(
   return { calls, fetchFn };
 }
 
+describe("the lease a token grants", () => {
+  it("never runs longer than five minutes", () => {
+    expect(MAX_TOKEN_LEASE_MINUTES).toBeLessThanOrEqual(5);
+    const body = tokenRequestBody("ar", NOW);
+    const lease = Date.parse(body.expireTime as string) - NOW;
+    expect(lease).toBeGreaterThan(0);
+    expect(lease).toBeLessThanOrEqual(5 * 60_000);
+  });
+
+  it("is single-use, so one token opens exactly one connection", () => {
+    expect(tokenRequestBody("ar", NOW).uses).toBe(1);
+  });
+
+  it("gives an even shorter window to actually start the session", () => {
+    const body = tokenRequestBody("ar", NOW);
+    const startWindow = Date.parse(body.newSessionExpireTime as string) - NOW;
+    expect(startWindow).toBeLessThan(
+      Date.parse(body.expireTime as string) - NOW,
+    );
+  });
+
+  it("is a cost and security bound, not a billing unit", () => {
+    // Nothing about the lease reaches the customer's allowance: usage is
+    // translated speech, measured and charged entirely elsewhere. This test
+    // exists to pin the intent — a five-minute lease spent in silence is
+    // worth zero, which usage.test.ts and store.test.ts prove.
+    const body = tokenRequestBody("ar", NOW);
+    expect(Object.keys(body)).not.toContain("minutes");
+    expect(Object.keys(body)).not.toContain("allowance");
+  });
+});
+
 describe("tokenRequestBody", () => {
   // Pins the exact v1beta AuthToken request shape, verified against the
   // live discovery document and a real 200 mint — if Google changes the
@@ -32,7 +65,7 @@ describe("tokenRequestBody", () => {
     const body = tokenRequestBody("ar", NOW);
     expect(body).toEqual({
       uses: 1,
-      expireTime: "2026-09-14T10:30:00.000Z",
+      expireTime: "2026-09-14T10:05:00.000Z",
       newSessionExpireTime: "2026-09-14T10:01:00.000Z",
       bidiGenerateContentSetup: {
         model: "models/gemini-3.5-live-translate-preview",
@@ -84,7 +117,7 @@ describe("issueLiveTranslateToken", () => {
     expect(result).toEqual({
       token: "auth_tokens/abc123",
       model: MODEL,
-      expireTime: "2026-09-14T10:30:00.000Z",
+      expireTime: "2026-09-14T10:05:00.000Z",
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(AUTH_TOKENS_URL);

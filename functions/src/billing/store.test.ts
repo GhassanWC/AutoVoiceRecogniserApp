@@ -306,6 +306,51 @@ describe("reporting translated speech", () => {
     expect(await openSession("u1", "s2", NOW + 10 * MINUTE)).toBeNull();
   });
 
+  it("renewing the Gemini lease keeps accumulating, it does not reset", async () => {
+    // A long conversation outlives its five-minute lease. Each renewal opens
+    // a new metered session; the allowance must keep going down, not restart.
+    await openSession("u1", "lease-1", NOW);
+    await report("u1", "lease-1", 1, 40_000, NOW + 60 * SECOND);
+    await report("u1", "lease-1", 2, 55_000, NOW + 4 * MINUTE, true);
+
+    await openSession("u1", "lease-2", NOW + 4 * MINUTE);
+    await report("u1", "lease-2", 1, 30_000, NOW + 5 * MINUTE);
+    await report("u1", "lease-2", 2, 45_000, NOW + 8 * MINUTE, true);
+
+    await openSession("u1", "lease-3", NOW + 8 * MINUTE);
+    const last = await report("u1", "lease-3", 1, 20_000, NOW + 9 * MINUTE);
+
+    // 55 + 45 + 20 seconds of translated speech across three leases.
+    expect(entitlementDoc()).toMatchObject({ freeUsedMs: 120_000 });
+    expect(last.remainingMs).toBe(FREE_LIFETIME_MS - 120_000);
+  });
+
+  it("a silent lease costs nothing, however many times it is renewed",
+    async () => {
+      // Five minutes of silence, a renewal, five more, another renewal.
+      await openSession("u1", "lease-1", NOW);
+      await report("u1", "lease-1", 1, 0, NOW + 5 * MINUTE, true);
+      await openSession("u1", "lease-2", NOW + 5 * MINUTE);
+      await report("u1", "lease-2", 1, 0, NOW + 10 * MINUTE, true);
+      const third = await openSession("u1", "lease-3", NOW + 10 * MINUTE);
+
+      expect(entitlementDoc()).toMatchObject({ freeUsedMs: 0, usedMs: 0 });
+      expect(third?.remainingMs).toBe(FREE_LIFETIME_MS);
+    });
+
+  it("an exhausted account cannot take out another lease", async () => {
+    await openSession("u1", "lease-1", NOW);
+    let cumulative = 0;
+    for (let i = 1; i <= 6; i++) {
+      cumulative += MINUTE;
+      await report("u1", "lease-1", i, cumulative, NOW + i * 70 * SECOND);
+    }
+    // The lease that was running is settled...
+    await report("u1", "lease-1", 7, cumulative, NOW + 8 * MINUTE, true);
+    // ...and the renewal is refused, which is what ends the session.
+    expect(await openSession("u1", "lease-2", NOW + 8 * MINUTE)).toBeNull();
+  });
+
   it("charges nothing for a session belonging to somebody else", async () => {
     await openSession("attacker", "s1", NOW);
     fake.write(ENTITLEMENTS, "victim", {

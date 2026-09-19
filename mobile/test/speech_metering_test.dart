@@ -405,6 +405,166 @@ void main() {
       meter.dispose();
     });
 
+    test('a lease spent in silence reports nothing and costs nothing',
+        () async {
+      final clock = _Clock();
+      final sent = <Map<String, dynamic>>[];
+      final speech = SpeechActivityMeter();
+      final meter = UsageMeter(
+        speech: speech,
+        now: clock.call,
+        flushDelay: const Duration(milliseconds: 5),
+        safetyInterval: const Duration(milliseconds: 20),
+        sender: (payload) async {
+          sent.add(payload);
+          return {'remainingMs': 300000, 'allowed': true};
+        },
+      );
+      meter.onLeaseStarted('lease-1');
+
+      // A full five-minute lease in a quiet room.
+      _feed(speech, clock, rms: _silence, total: const Duration(minutes: 5));
+      await Future<void>.delayed(const Duration(milliseconds: 60));
+      expect(sent, isEmpty, reason: 'nothing to report, so nothing is sent');
+
+      // The lease runs out and is replaced.
+      await meter.onLeaseEnding();
+      meter.onLeaseStarted('lease-2');
+      _feed(speech, clock, rms: _silence, total: const Duration(minutes: 5));
+      await meter.finish();
+
+      // Every report carried a zero: ten minutes of listening, no charge.
+      expect(sent.every((p) => p['cumulativeSpeechMs'] == 0), isTrue);
+      meter.dispose();
+    });
+
+    test('renewing a lease does not re-charge speech already settled',
+        () async {
+      final clock = _Clock();
+      final sent = <Map<String, dynamic>>[];
+      final speech = SpeechActivityMeter();
+      final meter = UsageMeter(
+        speech: speech,
+        now: clock.call,
+        flushDelay: const Duration(seconds: 30),
+        sender: (payload) async {
+          sent.add(payload);
+          return {'remainingMs': 300000, 'allowed': true};
+        },
+      );
+      meter.onLeaseStarted('lease-1');
+
+      _speakAndTranslate(speech, clock, const Duration(seconds: 20));
+      await meter.onLeaseEnding();
+      meter.onLeaseStarted('lease-2');
+      _speakAndTranslate(speech, clock, const Duration(seconds: 15));
+      await meter.finish();
+
+      final byLease = {
+        for (final p in sent) p['sessionId'] as String: p['cumulativeSpeechMs'] as int,
+      };
+      // Each lease is told only about its own speech, so the twenty seconds
+      // the first one settled are never sent to the second.
+      expect(byLease['lease-1'], closeTo(20000, 600));
+      expect(byLease['lease-2'], closeTo(15000, 600));
+      meter.dispose();
+    });
+
+    test('repeated renewals keep accumulating rather than resetting', () async {
+      final clock = _Clock();
+      final charged = <String, int>{};
+      final speech = SpeechActivityMeter();
+      final meter = UsageMeter(
+        speech: speech,
+        now: clock.call,
+        flushDelay: const Duration(seconds: 30),
+        sender: (payload) async {
+          // The server adds each lease's own total to the account.
+          charged[payload['sessionId'] as String] =
+              payload['cumulativeSpeechMs'] as int;
+          return {'remainingMs': 300000, 'allowed': true};
+        },
+      );
+
+      meter.onLeaseStarted('lease-1');
+      _speakAndTranslate(speech, clock, const Duration(seconds: 10));
+      await meter.onLeaseEnding();
+
+      meter.onLeaseStarted('lease-2');
+      _speakAndTranslate(speech, clock, const Duration(seconds: 12));
+      await meter.onLeaseEnding();
+
+      meter.onLeaseStarted('lease-3');
+      _speakAndTranslate(speech, clock, const Duration(seconds: 8));
+      await meter.finish();
+
+      final total = charged.values.reduce((a, b) => a + b);
+      // Thirty seconds of speech across three leases — not ten, and not
+      // thirty charged three times over.
+      expect(total, closeTo(30000, 1500));
+      expect(charged.keys, containsAll(['lease-1', 'lease-2', 'lease-3']));
+      meter.dispose();
+    });
+
+    test('playback stays free across a lease renewal', () async {
+      final clock = _Clock();
+      final sent = <int>[];
+      final speech = SpeechActivityMeter();
+      final meter = UsageMeter(
+        speech: speech,
+        now: clock.call,
+        flushDelay: const Duration(seconds: 30),
+        sender: (payload) async {
+          sent.add(payload['cumulativeSpeechMs'] as int);
+          return {'remainingMs': 300000, 'allowed': true};
+        },
+      );
+
+      meter.onLeaseStarted('lease-1');
+      // Sayvo reads a translation aloud while the lease expires under it.
+      _feed(speech, clock,
+          rms: _speech, total: const Duration(seconds: 30), gated: true);
+      await meter.onLeaseEnding();
+      meter.onLeaseStarted('lease-2');
+      _feed(speech, clock,
+          rms: _speech, total: const Duration(seconds: 30), gated: true);
+      await meter.finish();
+
+      expect(sent.every((ms) => ms == 0), isTrue);
+      meter.dispose();
+    });
+
+    test('a new listening session never re-reports the previous one',
+        () async {
+      final clock = _Clock();
+      final sent = <Map<String, dynamic>>[];
+      final speech = SpeechActivityMeter();
+      final meter = UsageMeter(
+        speech: speech,
+        now: clock.call,
+        flushDelay: const Duration(seconds: 30),
+        sender: (payload) async {
+          sent.add(payload);
+          return {'remainingMs': 300000, 'allowed': true};
+        },
+      );
+
+      meter.start('session-a');
+      _speakAndTranslate(speech, clock, const Duration(seconds: 12));
+      await meter.finish();
+
+      // Stop, then start again — the speech meter carries on counting, but
+      // the new session must not be charged for the old session's speech.
+      meter.start('session-b');
+      _speakAndTranslate(speech, clock, const Duration(seconds: 5));
+      await meter.finish();
+
+      expect(sent, hasLength(2));
+      expect(sent.first['cumulativeSpeechMs'], closeTo(12000, 600));
+      expect(sent.last['cumulativeSpeechMs'], closeTo(5000, 600));
+      meter.dispose();
+    });
+
     test('an unknown session id reports nothing', () async {
       var calls = 0;
       final meter = UsageMeter(sender: (_) async {

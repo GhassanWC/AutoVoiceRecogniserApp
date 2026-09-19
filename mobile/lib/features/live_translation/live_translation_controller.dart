@@ -243,12 +243,9 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
       case LiveServiceState.listening:
         _sessionStartedAt ??= DateTime.now();
         state = ListeningState.listening;
-        // Metering starts when the session really starts, and is billed by
-        // the server from its own clock between heartbeats.
-        final meteredSession = _service.meteredSessionId;
-        if (meteredSession != null && !_meter.isRunning) {
-          _meter.start(meteredSession);
-        }
+        // Metering follows the Gemini LEASE, not this state: the service
+        // hands each new metered session id to the meter as it takes one out,
+        // including the renewals that keep a long conversation going.
         if (_wasReconnecting) {
           _wasReconnecting = false;
           errorBanner = null;

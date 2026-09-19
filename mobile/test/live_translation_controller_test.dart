@@ -144,6 +144,9 @@ class Harness {
     MicPermissionService? permissions,
     List<TokenRequestException?> tokenErrors = const [],
     this.sessionId,
+    this.leaseSessionIds,
+    Duration? tokenLease,
+    Duration leaseRenewalMargin = const Duration(seconds: 30),
   }) {
     settings = SettingsController(SettingsStore());
     var call = 0;
@@ -153,11 +156,18 @@ class Harness {
         final error = call < tokenErrors.length ? tokenErrors[call] : null;
         call++;
         if (error != null) throw error;
+        final ids = leaseSessionIds;
         return LiveSessionToken(
           token: 'tok',
           model: 'm',
-          expireTime: DateTime.now().toUtc().add(const Duration(minutes: 30)),
-          sessionId: sessionId,
+          // Measured from the harness clock, which is what the service
+          // compares against when it schedules the renewal.
+          expireTime:
+              clock.toUtc().add(tokenLease ?? const Duration(minutes: 5)),
+          // Each lease may carry its own metered session id.
+          sessionId: ids == null
+              ? sessionId
+              : ids[(call - 1).clamp(0, ids.length - 1)],
         );
       },
       connect: (uri) async {
@@ -167,6 +177,7 @@ class Harness {
       },
       capture: capture,
       playback: FakePlayback(),
+      leaseRenewalMargin: leaseRenewalMargin,
       backoffDelays: const [Duration.zero],
       playbackGateTail: Duration.zero,
       now: () => clock,
@@ -199,6 +210,9 @@ class Harness {
 
   /// The server-issued session id the token carries, when metering applies.
   final String? sessionId;
+
+  /// One metered session id per lease, for renewal tests.
+  final List<String>? leaseSessionIds;
 
   /// Every usage report the controller's meter sent.
   final List<({String session, bool close, int cumulativeSpeechMs})>
@@ -809,6 +823,68 @@ void main() {
     expect(h.meterCalls.single.cumulativeSpeechMs, 0);
     expect(h.meter.telemetry()['audioSentMs'], 2000);
     expect(h.meter.telemetry()['committedSpeechMs'], 0);
+  });
+
+  test('the conversation and the Sayvo session survive a lease renewal',
+      () async {
+    final h = Harness(
+      leaseSessionIds: ['lease-1', 'lease-2'],
+      tokenLease: const Duration(milliseconds: 250),
+      leaseRenewalMargin: Duration.zero,
+    );
+    await h.settings.setTargetLanguage('ar');
+    await h.startAndConnect();
+    await _utterance(h, 'Where is the metro?', 'أين المترو؟');
+    expect(h.controller.messages, hasLength(1));
+    final firstId = h.controller.messages.single.id;
+
+    // The five-minute lease runs out mid-conversation.
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await h.pump();
+    h.sockets.last.serverSends({'setupComplete': {}});
+    await h.pump();
+
+    // Still one Sayvo session: same listening state, same bubbles, same ids.
+    expect(h.controller.state, ListeningState.listening);
+    expect(h.controller.errorBanner, isNull);
+    expect(h.controller.messages, hasLength(1));
+    expect(h.controller.messages.single.id, firstId);
+
+    // And the conversation carries on under the new lease.
+    await _utterance(h, 'How much is the ticket?', 'كم سعر التذكرة؟');
+    expect(h.controller.messages, hasLength(2));
+
+    // One Firestore session document for the whole thing, not one per lease.
+    final sessions =
+        await h.firestore.collection('users').doc('user-1').collection('sessions').get();
+    expect(sessions.docs, hasLength(1));
+
+    await h.controller.stopListening();
+    await h.pump();
+    // The old lease was settled when it ended, and the new one on stop.
+    expect(h.meterCalls.map((c) => c.session).toSet(), {'lease-1', 'lease-2'});
+    expect(h.meterCalls.where((c) => c.close).length, 2);
+  });
+
+  test('an exhausted account cannot renew its lease', () async {
+    final h = Harness(
+      leaseSessionIds: ['lease-1'],
+      tokenLease: const Duration(milliseconds: 250),
+      leaseRenewalMargin: Duration.zero,
+      tokenErrors: [
+        null,
+        const TokenRequestException(
+            LiveErrorKind.outOfMinutes, 'out of minutes'),
+      ],
+    );
+    await h.startAndConnect();
+
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await h.pump();
+
+    expect(h.controller.state, ListeningState.idle);
+    expect(h.controller.outOfMinutes, isTrue);
+    expect(h.controller.errorBanner, isNull);
   });
 
   test('background translated speech is metered like any other', () async {

@@ -89,6 +89,39 @@ class FakePlayback extends AudioPlaybackService {
   Future<void> dispose() async => active.close();
 }
 
+/// Records the lease handover, standing in for the usage meter.
+class RecordingObserver implements LiveSessionObserver {
+  final List<String> log = [];
+
+  /// Runs inside onLeaseEnding, so a test can see what had happened by then.
+  void Function()? onEnding;
+  int? tokenRequestsAtSettle;
+
+  @override
+  void onConnected() => log.add('connected');
+  @override
+  void onDisconnected() => log.add('disconnected');
+  @override
+  void onMicAudio({
+    required double rms,
+    required Duration duration,
+    required bool gated,
+    required bool sentUpstream,
+  }) {}
+  @override
+  void onTranslatedText() => log.add('translated');
+  @override
+  void onUtteranceTranslated() => log.add('utterance');
+  @override
+  Future<void> onLeaseEnding() async {
+    log.add('leaseEnding');
+    onEnding?.call();
+  }
+
+  @override
+  void onLeaseStarted(String? sessionId) => log.add('leaseStarted:$sessionId');
+}
+
 class Harness {
   Harness({
     List<TokenRequestException?> tokenErrors = const [],
@@ -100,11 +133,14 @@ class Harness {
     // the half-duplex gate REOPENS instead of latching closed.
     Duration playbackGateTail = Duration.zero,
     DateTime Function()? now,
+    Duration leaseRenewalMargin = const Duration(seconds: 30),
+    this.observer,
   }) {
     var call = 0;
     service = LiveTranslationService(
       isOnline: () async => online,
       setupTimeout: setupTimeout,
+      leaseRenewalMargin: leaseRenewalMargin,
       now: now,
       tokenProvider: (target) async {
         tokenRequests.add(target);
@@ -114,7 +150,10 @@ class Harness {
         return LiveSessionToken(
           token: 'tok-$call',
           model: 'models/gemini-3.5-live-translate-preview',
-          expireTime: tokenExpiry ?? DateTime.now().toUtc().add(const Duration(minutes: 30)),
+          // Each lease carries its own metered session id.
+          sessionId: 'session-$call',
+          expireTime: tokenExpiry ??
+              DateTime.now().toUtc().add(const Duration(minutes: 5)),
         );
       },
       connect: (uri) async {
@@ -130,11 +169,15 @@ class Harness {
       playbackGateTail: playbackGateTail,
       utteranceIdFactory: () => 'utt-${++utteranceCounter}',
     );
+    service.observer = observer;
     service.events.listen(events.add);
     service.stateChanges.listen(states.add);
     // Releases the diagnostics health timer so it cannot leak between tests.
     addTearDown(service.stop);
   }
+
+  /// Accounting seam, so lease handover can be observed.
+  final LiveSessionObserver? observer;
 
   final FakeCapture capture = FakeCapture();
   final FakePlayback playback = FakePlayback();
@@ -1064,8 +1107,10 @@ void main() {
 
     expect(h.states, contains(LiveServiceState.reconnecting));
     expect(h.sockets, hasLength(2));
-    // Same token (still valid) + the resume handle in the new setup.
-    expect(h.uris.last.toString(), contains('access_token=tok-1'));
+    // A FRESH lease, because tokens are single-use: the old one could not
+    // open a second connection however much of its five minutes remains.
+    // The resume handle, not the token, is what continues the conversation.
+    expect(h.uris.last.toString(), contains('access_token=tok-2'));
     final setup = jsonDecode(h.sockets.last.sent.first) as Map<String, dynamic>;
     expect(setup['setup']['sessionResumption'], {'handle': 'handle-1'});
 
@@ -1162,5 +1207,133 @@ void main() {
     h.capture.onStopped!('notification');
     await h.pump();
     expect(h.service.state, LiveServiceState.idle);
+  });
+
+  // ── Gemini lease ──────────────────────────────────────────────────────────
+  //
+  // The lease is a COST AND SECURITY bound: a token is single-use and good
+  // for at most five minutes, so a long conversation renews several times.
+  // None of that is customer usage — a lease spent in silence costs nothing.
+
+  test('an expiring lease is replaced without interrupting the session',
+      () async {
+    final recorder = RecordingObserver();
+    final h = Harness(
+      observer: recorder,
+      leaseRenewalMargin: Duration.zero,
+      tokenExpiry: DateTime.now().toUtc().add(const Duration(milliseconds: 250)),
+    );
+    await h.startListening();
+    expect(h.tokenRequests, hasLength(1));
+    final statesBefore = h.states.length;
+
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await h.pump();
+    h.sockets.last.serverSends({'setupComplete': {}});
+    await h.pump();
+
+    // A second lease, on a second connection.
+    expect(h.tokenRequests, hasLength(2));
+    expect(h.sockets, hasLength(2));
+    expect(h.uris.last.toString(), contains('access_token=tok-2'));
+    // The session never wavered: still listening, microphone never stopped,
+    // and the UI saw no state change at all.
+    expect(h.service.state, LiveServiceState.listening);
+    expect(h.capture.stopCalls, 0);
+    expect(h.capture.startCalls, 1);
+    expect(h.states.length, statesBefore);
+    expect(h.events.whereType<ServiceError>(), isEmpty);
+  });
+
+  test('accounting settles the old lease BEFORE the new one is requested',
+      () async {
+    // This ordering is what lets the server refuse a renewal to an account
+    // that has just run out.
+    final recorder = RecordingObserver();
+    final h = Harness(
+      observer: recorder,
+      leaseRenewalMargin: Duration.zero,
+      tokenExpiry: DateTime.now().toUtc().add(const Duration(milliseconds: 250)),
+    );
+    recorder.onEnding = () => recorder.tokenRequestsAtSettle = h.tokenRequests.length;
+    await h.startListening();
+
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await h.pump();
+
+    expect(recorder.log, contains('leaseEnding'));
+    expect(recorder.log.indexOf('leaseEnding'),
+        lessThan(recorder.log.indexOf('leaseStarted:session-2')));
+    // Only the first lease had been requested when the settle ran.
+    expect(recorder.tokenRequestsAtSettle, 1);
+    // Each lease hands accounting its own metered session id.
+    expect(recorder.log.where((e) => e.startsWith('leaseStarted:')),
+        ['leaseStarted:session-1', 'leaseStarted:session-2']);
+  });
+
+  test('a renewal resumes the same Gemini session rather than starting one',
+      () async {
+    final h = Harness(
+      leaseRenewalMargin: Duration.zero,
+      tokenExpiry: DateTime.now().toUtc().add(const Duration(milliseconds: 250)),
+    );
+    await h.startListening();
+    h.socket.serverSends({
+      'sessionResumptionUpdate': {'resumable': true, 'newHandle': 'handle-9'}
+    });
+    await h.pump();
+
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await h.pump();
+
+    final setup = jsonDecode(h.sockets.last.sent.first) as Map<String, dynamic>;
+    expect(setup['setup']['sessionResumption'], {'handle': 'handle-9'});
+  });
+
+  test('an exhausted account is refused a new lease and lands on the paywall',
+      () async {
+    final h = Harness(
+      leaseRenewalMargin: Duration.zero,
+      tokenExpiry: DateTime.now().toUtc().add(const Duration(milliseconds: 250)),
+      tokenErrors: [
+        null,
+        const TokenRequestException(
+            LiveErrorKind.outOfMinutes, 'out of minutes'),
+      ],
+    );
+    await h.startListening();
+
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await h.pump();
+
+    expect(h.service.state, LiveServiceState.error);
+    final error = h.events.whereType<ServiceError>().single;
+    expect(error.kind, LiveErrorKind.outOfMinutes);
+    // No second connection was opened for a lease that was never granted.
+    expect(h.sockets, hasLength(1));
+    expect(h.capture.stopCalls, 1, reason: 'the microphone must stop');
+  });
+
+  test('a lease spent in silence renews cleanly', () async {
+    final h = Harness(
+      leaseRenewalMargin: Duration.zero,
+      tokenExpiry: DateTime.now().toUtc().add(const Duration(milliseconds: 250)),
+    );
+    await h.startListening();
+    // Digital silence for the life of the lease. It is still STREAMED —
+    // transport is unchanged, and that is the documented cost follow-up —
+    // but it buys the user nothing and costs them nothing.
+    for (var i = 0; i < 5; i++) {
+      h.mic(0);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await h.pump();
+    h.sockets.last.serverSends({'setupComplete': {}});
+    await h.pump();
+
+    expect(h.sentAudio(h.sockets.first), hasLength(5));
+    expect(h.service.state, LiveServiceState.listening);
+    expect(h.tokenRequests, hasLength(2));
+    expect(h.events.whereType<ServiceError>(), isEmpty);
   });
 }
