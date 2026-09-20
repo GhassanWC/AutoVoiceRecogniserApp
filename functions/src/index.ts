@@ -41,6 +41,13 @@ const playPackageName = defineString("PLAY_PACKAGE_NAME", {
   default: "com.livetranslator.live_translator",
 });
 
+/**
+ * Room-tuned Gemini speech detection. On by default; set to "off" to mint
+ * tokens exactly as before, without redeploying code, if a device test shows
+ * the model rejects the realtimeInputConfig.
+ */
+const farFieldVad = defineString("LIVE_FAR_FIELD_VAD", { default: "on" });
+
 const REGION = "us-central1";
 
 /** Client-visible code the app turns into the paywall. */
@@ -94,6 +101,7 @@ export const createLiveTranslateToken = onCall(
       const issued = await issueLiveTranslateToken(target, {
         fetchFn: fetch,
         apiKey: geminiApiKey.value(),
+        farField: farFieldVad.value() !== "off",
       });
       // Safe telemetry only: NEVER log the ephemeral token or the API key.
       logger.info("createLiveTranslateToken issued", {

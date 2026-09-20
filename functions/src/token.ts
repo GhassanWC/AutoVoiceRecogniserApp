@@ -29,6 +29,51 @@ const TOKEN_TTL_MINUTES = MAX_TOKEN_LEASE_MINUTES;
 /** Window in which the single new session must be started. */
 const NEW_SESSION_TTL_SECONDS = 60;
 
+/**
+ * Speech detection tuned for a ROOM rather than a phone held to a face.
+ *
+ * Sayvo is an ambient translator: somebody across a table or three metres away
+ * is the normal case, not the edge case. Gemini's own automatic activity
+ * detection is what decides whether that speech becomes a turn at all, and at
+ * its default sensitivity a quiet or distant voice frequently is not detected
+ * — the audio arrives, and nothing happens.
+ *
+ * Field meanings are from the v1beta discovery document, and two of them read
+ * the opposite way round to what the names suggest:
+ *  - `prefixPaddingMs` is the duration of speech REQUIRED before a start is
+ *    committed, so a LOW value is the sensitive one. 20 ms barely asks for
+ *    anything, which is what keeps the first quiet word.
+ *  - `silenceDurationMs` is the silence required before an end is committed,
+ *    so a HIGH value tolerates longer gaps. A distant speaker dips below the
+ *    threshold mid-sentence; 800 ms stops that being read as "finished".
+ *  - START_SENSITIVITY_HIGH detects speech starts more often.
+ *  - END_SENSITIVITY_LOW is less eager to declare speech over.
+ *
+ * These are a calibrated STARTING POINT, to be trimmed against real device
+ * logs — see the far-field acceptance matrix in the report.
+ */
+export const FAR_FIELD_ACTIVITY_DETECTION = {
+  disabled: false,
+  startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
+  endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
+  prefixPaddingMs: 20,
+  silenceDurationMs: 800,
+} as const;
+
+/**
+ * The realtimeInputConfig the token locks in — and the SAME object the app is
+ * told to send in its own setup frame, so the two can never disagree. Returns
+ * undefined when far-field detection is switched off, which restores exactly
+ * the previous behaviour.
+ */
+export function farFieldRealtimeInputConfig(
+  enabled: boolean,
+): Record<string, unknown> | undefined {
+  return enabled
+    ? { automaticActivityDetection: { ...FAR_FIELD_ACTIVITY_DETECTION } }
+    : undefined;
+}
+
 export type TokenErrorKind = "quota" | "upstream";
 
 export class TokenError extends Error {
@@ -45,12 +90,19 @@ export interface TokenDeps {
   fetchFn: typeof fetch;
   apiKey: string;
   now?: () => number;
+  /** Far-field speech detection; off restores the previous default VAD. */
+  farField?: boolean;
 }
 
 export interface LiveTranslateToken {
   token: string;
   model: string;
   expireTime: string;
+  /**
+   * Echoed to the app so its setup frame matches the token constraint
+   * exactly. The client never composes this itself.
+   */
+  realtimeInputConfig?: Record<string, unknown>;
 }
 
 /**
@@ -72,7 +124,9 @@ export interface LiveTranslateToken {
 export function tokenRequestBody(
   targetLanguageCode: string,
   nowMs: number,
+  farField = true,
 ): Record<string, unknown> {
+  const realtimeInputConfig = farFieldRealtimeInputConfig(farField);
   return {
     uses: 1,
     expireTime: new Date(nowMs + TOKEN_TTL_MINUTES * 60_000).toISOString(),
@@ -90,6 +144,9 @@ export function tokenRequestBody(
       },
       inputAudioTranscription: {},
       outputAudioTranscription: {},
+      // Room-tuned speech detection. The token LOCKS it, so a tampered client
+      // cannot quietly widen or disable it.
+      ...(realtimeInputConfig ? { realtimeInputConfig } : {}),
       // Lets a dropped connection resume the same session on this token.
       sessionResumption: {},
     },
@@ -101,7 +158,8 @@ export async function issueLiveTranslateToken(
   deps: TokenDeps,
 ): Promise<LiveTranslateToken> {
   const nowMs = (deps.now ?? Date.now)();
-  const body = tokenRequestBody(targetLanguageCode, nowMs);
+  const farField = deps.farField ?? true;
+  const body = tokenRequestBody(targetLanguageCode, nowMs, farField);
   const response = await deps.fetchFn(AUTH_TOKENS_URL, {
     method: "POST",
     headers: {
@@ -130,5 +188,7 @@ export async function issueLiveTranslateToken(
     token: json.name,
     model: MODEL,
     expireTime: body.expireTime as string,
+    // Handed to the app so its setup frame matches this token exactly.
+    realtimeInputConfig: farFieldRealtimeInputConfig(farField),
   };
 }

@@ -53,6 +53,10 @@ class LiveTranslateTokenClient {
         // session the usage reports will be charged against.
         sessionId: data['sessionId'] as String?,
         remainingMs: (data['remainingMs'] as num?)?.toInt(),
+        // Server-owned speech detection; echoed back in the setup frame.
+        realtimeInputConfig: data['realtimeInputConfig'] is Map
+            ? Map<String, dynamic>.from(data['realtimeInputConfig'] as Map)
+            : null,
       );
     } on FirebaseFunctionsException catch (e) {
       developer.log(

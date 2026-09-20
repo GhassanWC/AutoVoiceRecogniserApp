@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:uuid/uuid.dart';
@@ -8,6 +9,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../utils/languages.dart' show normalizeDetectedLanguage;
 import '../../utils/mic_level.dart';
+import '../audio/adaptive_gain.dart';
 import '../audio/audio_capture_service.dart';
 import '../audio/audio_playback_service.dart';
 import '../diagnostics/live_diagnostics.dart';
@@ -31,6 +33,7 @@ class LiveSessionToken {
     required this.expireTime,
     this.sessionId,
     this.remainingMs,
+    this.realtimeInputConfig,
   });
   final String token;
   final String model;
@@ -43,6 +46,11 @@ class LiveSessionToken {
 
   /// Translated-speech milliseconds left when the token was minted.
   final int? remainingMs;
+
+  /// Speech-detection settings the SERVER locked into this token. The app
+  /// echoes them verbatim in its setup frame so the two cannot disagree; it
+  /// never composes them itself.
+  final Map<String, dynamic>? realtimeInputConfig;
 }
 
 /// Thrown by the token provider when minting fails.
@@ -99,6 +107,10 @@ abstract class LiveSessionObserver {
 
   /// A translated utterance finished (telemetry only).
   void onUtteranceTranslated();
+
+  /// Whether ACCOUNTING currently believes somebody is speaking. Read only
+  /// for the diagnostic line — nothing in the audio path may branch on it.
+  bool get isSpeechDetected;
 
   /// The current Gemini lease is ending and another is about to be requested.
   ///
@@ -203,7 +215,9 @@ class LiveTranslationService {
     String Function()? utteranceIdFactory,
     DateTime Function()? now,
     Future<bool> Function()? isOnline,
-  })  : _tokenProvider = tokenProvider,
+    AdaptiveGain? gain,
+  })  : gain = gain ?? AdaptiveGain(),
+        _tokenProvider = tokenProvider,
         _isOnline = isOnline ?? hasInternetConnection,
         _connect = connect ?? defaultSocketConnector,
         capture = capture ?? AudioCaptureService(),
@@ -306,6 +320,12 @@ class LiveTranslationService {
   DateTime _queuedAudioEndsAt = DateTime.fromMillisecondsSinceEpoch(0);
   final BytesBuilder _pendingAudio = BytesBuilder(copy: true);
 
+  /// Bounded pre-gain so far-field speech reaches Gemini at a detectable
+  /// level. Never gates: see [AdaptiveGain].
+  final AdaptiveGain gain;
+  Uint8List _gainBuffer = Uint8List(0);
+  GainReport _lastGain = GainReport.idle;
+
   /// Slack for device-side buffering before a "still speaking" claim from the
   /// native player is treated as stale.
   static const Duration _playbackClaimSlack = Duration(seconds: 2);
@@ -374,6 +394,8 @@ class LiveTranslationService {
     _lastGateState = null;
     _lastServerKeys = null;
     _clearTail();
+    gain.reset();
+    _lastGain = GainReport.idle;
     resetLiveTraceThrottles();
     liveTrace('SESSION_START', 'target=$targetLanguageCode');
     _resetUtterance();
@@ -562,6 +584,9 @@ class LiveTranslationService {
           },
           'inputAudioTranscription': <String, dynamic>{},
           'outputAudioTranscription': <String, dynamic>{},
+          // Room-tuned speech detection, exactly as the token locked it.
+          if (_token?.realtimeInputConfig != null)
+            'realtimeInputConfig': _token!.realtimeInputConfig,
           'sessionResumption': {
             if (resuming && _resumeHandle != null) 'handle': _resumeHandle,
           },
@@ -1087,14 +1112,48 @@ class LiveTranslationService {
       liveTrace('MIC_CHUNK_DROPPED', 'socket is null');
       return;
     }
+    // Quiet, distant speech is lifted toward a level the model can detect.
+    // This is a LEVEL change, never a gate: the chunk goes upstream either
+    // way, and billing has already seen the original level above.
+    if (_gainBuffer.length < chunk.length) {
+      _gainBuffer = Uint8List(chunk.length);
+    }
+    _lastGain = gain.apply(chunk, _gainBuffer);
+    final outgoing = Uint8List.sublistView(_gainBuffer, 0, chunk.length);
     socket.send(jsonEncode({
       'realtimeInput': {
-        'audio': {'data': base64Encode(chunk), 'mimeType': 'audio/pcm;rate=16000'},
+        'audio': {
+          'data': base64Encode(outgoing),
+          'mimeType': 'audio/pcm;rate=16000',
+        },
       },
     }));
     _chunksSent++;
-    liveTraceThrottled(
-        'MIC_CHUNK_SENT', () => 'total=$_chunksSent bytes=${chunk.length}');
+    _traceAudioLevels();
+  }
+
+  /// The far-field diagnostic line: one per second while listening, carrying
+  /// what each layer did to the signal. It is what tells a device test whether
+  /// a distant voice was captured-but-not-detected, captured-and-attenuated,
+  /// or never captured at all. No audio and no transcript content, ever.
+  void _traceAudioLevels() {
+    liveTraceThrottled('AUDIO', () {
+      final report = _lastGain;
+      String db(double value) => value <= 0
+          ? '-inf'
+          : (20 * (math.log(value) / math.ln10)).toStringAsFixed(1);
+      return 'inputRms=${report.rawRms.toStringAsFixed(5)}(${db(report.rawRms)}dB) '
+          'processedRms=${report.processedRms.toStringAsFixed(5)}'
+          '(${db(report.processedRms)}dB) '
+          'gain=${report.appliedGain.toStringAsFixed(2)}x '
+          'peak=${report.peakAfterGain.toStringAsFixed(3)} '
+          'clipped=${report.clippedSamples} '
+          'noiseFloor=${report.noiseFloor.toStringAsFixed(5)} '
+          'billingSpeech=${observer?.isSpeechDetected ?? false} '
+          'pcmSentToGemini=$_chunksSent '
+          'micGate=${_uplinkGated ? 'closed' : 'open'} '
+          'sampleRate=16000 channels=1';
+    });
   }
 
   void _onPlaybackActive(bool active) {

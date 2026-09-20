@@ -161,6 +161,11 @@ class UsageMeter implements LiveSessionObserver {
     if (sentUpstream) _audioSentMs += duration.inMilliseconds;
   }
 
+  /// Diagnostics only. Nothing in the audio path may branch on this: the
+  /// billing detector must never decide what Gemini gets to hear.
+  @override
+  bool get isSpeechDetected => _speech.inSpeech;
+
   @override
   void onTranslatedText() {
     _speech.onTranslatedText(_now());

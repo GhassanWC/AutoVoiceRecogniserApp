@@ -236,6 +236,8 @@ final class AudioCaptureManager: NSObject, FlutterStreamHandler {
     self.converter = converter
     self.targetFormat = outFormat
 
+    logCaptureConfiguration(session: session, input: input, inputFormat: inputFormat)
+
     input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
       self?.handle(buffer: buffer)
     }
@@ -244,6 +246,32 @@ final class AudioCaptureManager: NSObject, FlutterStreamHandler {
     isRunning = true
 
     registerObservers(session: session)
+  }
+
+  /// One line per capture start describing what the HARDWARE is actually
+  /// doing. This is the evidence that separates "the phone never captured the
+  /// distant voice" from "it captured it and something downstream lost it" —
+  /// without it, a far-field report is guesswork. Configuration only: no audio
+  /// and no transcript ever reaches the log.
+  private func logCaptureConfiguration(
+    session: AVAudioSession, input: AVAudioInputNode, inputFormat: AVAudioFormat
+  ) {
+    let route = session.currentRoute.inputs.first
+    let polar = route?.selectedDataSource?.selectedPolarPattern?.rawValue ?? "n/a"
+    let dataSource = route?.selectedDataSource?.dataSourceName ?? "n/a"
+    print(
+      """
+      [LT-NATIVE] AUDIO_SESSION category=\(session.category.rawValue) \
+      mode=\(session.mode.rawValue) \
+      route=\(route?.portType.rawValue ?? "none") dataSource=\(dataSource) \
+      polarPattern=\(polar) \
+      voiceProcessing=\(input.isVoiceProcessingEnabled) \
+      hwSampleRate=\(session.sampleRate) tapSampleRate=\(inputFormat.sampleRate) \
+      tapChannels=\(inputFormat.channelCount) \
+      inputGain=\(session.inputGain) gainSettable=\(session.isInputGainSettable) \
+      ioBuffer=\(session.ioBufferDuration)
+      """
+    )
   }
 
   /// Registered exactly once — `start` runs again on every recovery, and

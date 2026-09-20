@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -109,6 +110,9 @@ class RecordingObserver implements LiveSessionObserver {
     required bool sentUpstream,
   }) {}
   @override
+  bool get isSpeechDetected => false;
+
+  @override
   void onTranslatedText() => log.add('translated');
   @override
   void onUtteranceTranslated() => log.add('utterance');
@@ -121,6 +125,17 @@ class RecordingObserver implements LiveSessionObserver {
   @override
   void onLeaseStarted(String? sessionId) => log.add('leaseStarted:$sessionId');
 }
+
+/// Mirrors what the Cloud Function locks into a token today.
+const Map<String, dynamic> _defaultDetection = {
+  'automaticActivityDetection': {
+    'disabled': false,
+    'startOfSpeechSensitivity': 'START_SENSITIVITY_HIGH',
+    'endOfSpeechSensitivity': 'END_SENSITIVITY_LOW',
+    'prefixPaddingMs': 20,
+    'silenceDurationMs': 800,
+  },
+};
 
 class Harness {
   Harness({
@@ -135,7 +150,9 @@ class Harness {
     DateTime Function()? now,
     Duration leaseRenewalMargin = const Duration(seconds: 30),
     this.observer,
+    Map<String, dynamic>? realtimeInputConfig = _defaultDetection,
   }) {
+    lastTokenConfig = realtimeInputConfig;
     var call = 0;
     service = LiveTranslationService(
       isOnline: () async => online,
@@ -152,6 +169,7 @@ class Harness {
           model: 'models/gemini-3.5-live-translate-preview',
           // Each lease carries its own metered session id.
           sessionId: 'session-$call',
+          realtimeInputConfig: realtimeInputConfig,
           expireTime: tokenExpiry ??
               DateTime.now().toUtc().add(const Duration(minutes: 5)),
         );
@@ -179,6 +197,9 @@ class Harness {
   /// Accounting seam, so lease handover can be observed.
   final LiveSessionObserver? observer;
 
+  /// What the fake token service locked into the token.
+  Map<String, dynamic>? lastTokenConfig;
+
   final FakeCapture capture = FakeCapture();
   final FakePlayback playback = FakePlayback();
   final List<FakeSocket> sockets = [];
@@ -200,6 +221,31 @@ class Harness {
   /// ~100 ms of 16 kHz PCM16 (3200 bytes) so one chunk flushes the coalescer.
   void mic([int filler = 7]) =>
       capture.onAudio!(Uint8List.fromList(List.filled(3200, filler)));
+
+  /// One chunk of a 220 Hz tone at [amplitude] of full scale, standing in for
+  /// a voice at a given loudness.
+  void micTone(double amplitude) {
+    const samples = 1600;
+    final pcm = Uint8List(samples * 2);
+    final view = ByteData.sublistView(pcm);
+    for (var i = 0; i < samples; i++) {
+      final value = math.sin(2 * math.pi * 220 * i / 16000) * amplitude;
+      view.setInt16(
+          i * 2, (value * 32768).round().clamp(-32768, 32767), Endian.little);
+    }
+    capture.onAudio!(pcm);
+  }
+
+  /// The PCM actually put on the wire, as normalized samples.
+  List<double> decodeAudio(Map<String, dynamic> frame) {
+    final data = ((frame['realtimeInput'] as Map)['audio'] as Map)['data'];
+    final bytes = base64Decode(data as String);
+    final view = ByteData.sublistView(bytes);
+    return [
+      for (var i = 0; i < bytes.lengthInBytes ~/ 2; i++)
+        view.getInt16(i * 2, Endian.little) / 32768.0,
+    ];
+  }
 
   List<Map<String, dynamic>> sentAudio(FakeSocket s) => [
         for (final frame in s.sent)
@@ -1336,4 +1382,123 @@ void main() {
     expect(h.tokenRequests, hasLength(2));
     expect(h.events.whereType<ServiceError>(), isEmpty);
   });
+
+  // ── Far-field capture ─────────────────────────────────────────────────────
+  //
+  // Sayvo is an ambient translator: somebody across the room is the normal
+  // case. Nothing between the microphone and the socket may decide that a
+  // quiet chunk is not worth sending.
+
+  test('very quiet audio is still sent to Gemini, never dropped', () async {
+    final h = Harness();
+    await h.startListening();
+
+    // Roughly −48 dBFS: a person several metres away with no AGC.
+    for (var i = 0; i < 5; i++) {
+      h.micTone(0.004);
+    }
+    await h.pump();
+
+    expect(h.sentAudio(h.socket), hasLength(5),
+        reason: 'no level threshold may sit between the mic and the socket');
+  });
+
+  test('silence is sent too — transport has no VAD of its own', () async {
+    final h = Harness();
+    await h.startListening();
+    for (var i = 0; i < 4; i++) {
+      h.mic(0);
+    }
+    await h.pump();
+    expect(h.sentAudio(h.socket), hasLength(4));
+  });
+
+  test('the billing detector cannot gate what Gemini hears', () async {
+    // The observer insists nothing is speech. Transport must not care.
+    final recorder = RecordingObserver();
+    final h = Harness(observer: recorder);
+    await h.startListening();
+    for (var i = 0; i < 6; i++) {
+      h.micTone(0.004);
+    }
+    await h.pump();
+
+    expect(recorder.isSpeechDetected, isFalse);
+    expect(h.sentAudio(h.socket), hasLength(6),
+        reason: 'billing detection and translation transport are separate');
+  });
+
+  test('quiet audio is lifted on its way out, loud audio is not', () async {
+    final h = Harness();
+    await h.startListening();
+
+    // A quiet talker, long enough for the gain to wind up.
+    for (var i = 0; i < 40; i++) {
+      h.micTone(0.01);
+    }
+    await h.pump();
+    expect(h.service.gain.gain, greaterThan(2.0));
+    final quiet = h.decodeAudio(h.sentAudio(h.socket).last);
+    expect(_rmsOf(quiet), greaterThan(0.01),
+        reason: 'the far-field voice reaches Gemini at a usable level');
+
+    // Someone speaks right next to the phone: no gain, no clipping.
+    for (var i = 0; i < 20; i++) {
+      h.micTone(0.3);
+    }
+    await h.pump();
+    expect(h.service.gain.gain, closeTo(1.0, 0.05));
+    final close = h.decodeAudio(h.sentAudio(h.socket).last);
+    expect(close.every((v) => v.abs() <= 1.0), isTrue);
+    expect(_rmsOf(close), closeTo(0.3 / math.sqrt2, 0.02),
+        reason: 'close speech passes through unchanged');
+  });
+
+  test('the TTS gate still sends nothing at all', () async {
+    final h = Harness(playbackGateTail: const Duration(seconds: 5));
+    await h.startListening();
+    h.playback.active.add(true);
+    await h.pump();
+
+    for (var i = 0; i < 10; i++) {
+      h.micTone(0.3);
+    }
+    await h.pump();
+
+    expect(h.sentAudio(h.socket), isEmpty,
+        reason: 'the device must never re-ingest its own voice');
+  });
+
+  test('the setup frame carries the token speech detection verbatim',
+      () async {
+    final h = Harness();
+    await h.startListening();
+
+    final setup = jsonDecode(h.socket.sent.first) as Map<String, dynamic>;
+    final config = (setup['setup'] as Map)['realtimeInputConfig'];
+    // Whatever the token locked in, byte for byte — the client never composes
+    // detection settings of its own, so the two cannot drift apart.
+    expect(config, h.lastTokenConfig);
+    final detection = (config as Map)['automaticActivityDetection'] as Map;
+    expect(detection['startOfSpeechSensitivity'], 'START_SENSITIVITY_HIGH');
+    expect(detection['endOfSpeechSensitivity'], 'END_SENSITIVITY_LOW');
+    expect(detection['disabled'], false);
+  });
+
+  test('a token without detection settings sends none', () async {
+    // The server kill switch: the app must follow it rather than inventing
+    // settings the token does not permit.
+    final h = Harness(realtimeInputConfig: null);
+    await h.startListening();
+    final setup = jsonDecode(h.socket.sent.first) as Map<String, dynamic>;
+    expect((setup['setup'] as Map).containsKey('realtimeInputConfig'), isFalse);
+  });
+}
+
+double _rmsOf(List<double> samples) {
+  var sum = 0.0;
+  for (final value in samples) {
+    sum += value * value;
+  }
+  return math.sqrt(sum / samples.length);
 }

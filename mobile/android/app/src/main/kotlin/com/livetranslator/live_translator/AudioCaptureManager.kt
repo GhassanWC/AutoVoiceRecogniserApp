@@ -9,16 +9,18 @@ import android.media.MediaRecorder
 import android.media.audiofx.AutomaticGainControl
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import androidx.core.content.ContextCompat
 import io.flutter.plugin.common.EventChannel
 
 /**
  * Microphone capture: 16 kHz mono PCM16 streamed to Dart in ~100 ms chunks.
  *
- * Preprocessing (best effort, device-dependent): platform NoiseSuppressor,
- * AcousticEchoCanceler and AutomaticGainControl are attached when available.
- * VOICE_RECOGNITION is used as the source because it gives an unprocessed
- * signal tuned for speech recognition rather than telephony.
+ * Tuned for a ROOM, not a phone call. VOICE_RECOGNITION is the source because
+ * it is tuned for speech recognition rather than telephony, and only
+ * AutomaticGainControl is attached — NoiseSuppressor and AcousticEchoCanceler
+ * are deliberately left OFF, because they are built for a near-field talker
+ * and remove the distant speech this app exists to hear.
  *
  * Events sent to Dart are either a ByteArray (audio) or a map
  * {"event": "stopped", "reason": ...} when capture ends outside Dart's
@@ -77,6 +79,7 @@ object AudioCaptureManager : EventChannel.StreamHandler {
         }
 
         attachEffects(audioRecord.audioSessionId)
+        logCaptureConfiguration(audioRecord, bufferSize)
 
         audioRecord.startRecording()
         if (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
@@ -141,6 +144,25 @@ object AudioCaptureManager : EventChannel.StreamHandler {
             }
         }
         effects.clear()
+    }
+
+    /**
+     * One line per capture start describing what the hardware is actually
+     * doing, so a far-field report can distinguish "never captured" from
+     * "captured and lost downstream". Configuration only — no audio, no
+     * transcript.
+     */
+    private fun logCaptureConfiguration(record: AudioRecord, bufferSize: Int) {
+        Log.i(
+            "LT-NATIVE",
+            "AUDIO_SESSION source=VOICE_RECOGNITION " +
+                "sampleRate=${record.sampleRate} " +
+                "channels=${record.channelCount} " +
+                "encoding=${record.audioFormat} " +
+                "bufferBytes=$bufferSize " +
+                "agc=${AutomaticGainControl.isAvailable()} " +
+                "noiseSuppressor=off echoCanceler=off",
+        )
     }
 
     /**

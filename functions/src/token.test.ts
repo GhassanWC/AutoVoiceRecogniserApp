@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AUTH_TOKENS_URL,
+  FAR_FIELD_ACTIVITY_DETECTION,
   MAX_TOKEN_LEASE_MINUTES,
   MODEL,
   TokenError,
@@ -57,6 +58,87 @@ describe("the lease a token grants", () => {
   });
 });
 
+describe("room-tuned speech detection", () => {
+  function setupOf(body: Record<string, unknown>) {
+    return body.bidiGenerateContentSetup as Record<string, unknown>;
+  }
+
+  it("asks Gemini to be sensitive about where speech STARTS", () => {
+    const detection = (
+      setupOf(tokenRequestBody("ar", NOW)).realtimeInputConfig as Record<
+        string,
+        unknown
+      >
+    ).automaticActivityDetection as Record<string, unknown>;
+
+    expect(detection.disabled).toBe(false);
+    expect(detection.startOfSpeechSensitivity).toBe("START_SENSITIVITY_HIGH");
+    // Less eager to call an utterance finished, because a distant speaker
+    // dips below the threshold mid-sentence.
+    expect(detection.endOfSpeechSensitivity).toBe("END_SENSITIVITY_LOW");
+    // prefixPaddingMs is the speech REQUIRED before a start commits, so a low
+    // value is the sensitive one — this is the field most easily read
+    // backwards.
+    expect(detection.prefixPaddingMs).toBeLessThanOrEqual(100);
+    // silenceDurationMs is the silence required before an end commits, so a
+    // high value tolerates the gaps in quiet speech.
+    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(500);
+  });
+
+  it("uses only fields the v1beta AutomaticActivityDetection schema defines", () => {
+    // Verified against the live discovery document. An unknown field here is
+    // rejected by auth_tokens with 400 INVALID_ARGUMENT, which would stop the
+    // app minting tokens at all.
+    const detection = FAR_FIELD_ACTIVITY_DETECTION as Record<string, unknown>;
+    expect(Object.keys(detection).sort()).toEqual([
+      "disabled",
+      "endOfSpeechSensitivity",
+      "prefixPaddingMs",
+      "silenceDurationMs",
+      "startOfSpeechSensitivity",
+    ]);
+  });
+
+  it("locks the SAME config into the token that the app is told to send",
+    async () => {
+      // The app echoes this verbatim in its setup frame. If the two could
+      // differ, the constrained session would be rejected.
+      const { fetchFn } = fakeFetch(200, { name: "auth_tokens/abc" });
+      const issued = await issueLiveTranslateToken("ar", {
+        fetchFn,
+        apiKey: "SECRET",
+        now: () => NOW,
+      });
+      expect(issued.realtimeInputConfig).toEqual(
+        setupOf(tokenRequestBody("ar", NOW)).realtimeInputConfig,
+      );
+    });
+
+  it("the kill switch removes it from the token AND from the app", async () => {
+    const body = tokenRequestBody("ar", NOW, false);
+    expect(setupOf(body).realtimeInputConfig).toBeUndefined();
+
+    const { calls, fetchFn } = fakeFetch(200, { name: "auth_tokens/abc" });
+    const issued = await issueLiveTranslateToken("ar", {
+      fetchFn,
+      apiKey: "SECRET",
+      now: () => NOW,
+      farField: false,
+    });
+    expect(issued.realtimeInputConfig).toBeUndefined();
+    const sent = JSON.parse(String(calls[0].init.body));
+    expect(sent.bidiGenerateContentSetup.realtimeInputConfig).toBeUndefined();
+  });
+
+  it("leaves everything else about the token untouched", () => {
+    const withFarField = setupOf(tokenRequestBody("ar", NOW));
+    const without = setupOf(tokenRequestBody("ar", NOW, false));
+    for (const key of ["model", "generationConfig", "inputAudioTranscription"]) {
+      expect(withFarField[key]).toEqual(without[key]);
+    }
+  });
+});
+
 describe("tokenRequestBody", () => {
   // Pins the exact v1beta AuthToken request shape, verified against the
   // live discovery document and a real 200 mint — if Google changes the
@@ -78,6 +160,15 @@ describe("tokenRequestBody", () => {
         },
         inputAudioTranscription: {},
         outputAudioTranscription: {},
+        realtimeInputConfig: {
+          automaticActivityDetection: {
+            disabled: false,
+            startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
+            endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
+            prefixPaddingMs: 20,
+            silenceDurationMs: 800,
+          },
+        },
         sessionResumption: {},
       },
     });
@@ -118,6 +209,16 @@ describe("issueLiveTranslateToken", () => {
       token: "auth_tokens/abc123",
       model: MODEL,
       expireTime: "2026-09-14T10:05:00.000Z",
+      // Handed on to the app so its setup frame matches the token.
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          disabled: false,
+          startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
+          endOfSpeechSensitivity: "END_SENSITIVITY_LOW",
+          prefixPaddingMs: 20,
+          silenceDurationMs: 800,
+        },
+      },
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(AUTH_TOKENS_URL);
