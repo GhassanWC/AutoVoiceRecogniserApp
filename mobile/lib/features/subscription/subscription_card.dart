@@ -20,8 +20,11 @@ class SubscriptionCard extends StatelessWidget {
     final controller = context.watch<EntitlementController>();
     final entitlement = controller.entitlement;
     final paid = entitlement.isPaid;
-    final remaining = entitlement.remainingMs;
-    final used = entitlement.spentMs;
+    // The displayed figures fold in translated speech this device has
+    // committed but not yet reported, so usage moves while somebody is
+    // speaking instead of jumping when the batched report lands.
+    final remaining = controller.displayedRemainingMs;
+    final used = controller.displayedUsedMs;
     final total = entitlement.totalMs;
     final progress = total <= 0 ? 0.0 : (used / total).clamp(0.0, 1.0);
 
@@ -59,8 +62,8 @@ class SubscriptionCard extends StatelessWidget {
                       paid
                           ? '${planMinutes(entitlement.plan)} min translated '
                               'speech / month'
-                          : '${formatSpeechDuration(remaining)} of '
-                              '$kFreeLifetimeMinutes free minutes left',
+                          : 'Free — $kFreeLifetimeMinutes min translated '
+                              'speech, one time',
                       style: theme.textTheme.bodySmall
                           ?.copyWith(color: AppColors.textSecondary),
                     ),
@@ -82,8 +85,15 @@ class SubscriptionCard extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 8),
+          // Exactly what was spent and exactly what is left, to the second —
+          // translated speech only, never microphone time.
           Text(
-            '${formatSpeechDuration(used)} translated · '
+            '${formatSpeechDuration(used)} of ${formatSpeechDuration(total)} used',
+            style: theme.textTheme.bodyMedium
+                ?.copyWith(fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 2),
+          Text(
             '${formatSpeechDuration(remaining)} remaining',
             style: theme.textTheme.bodySmall
                 ?.copyWith(color: AppColors.textSecondary),

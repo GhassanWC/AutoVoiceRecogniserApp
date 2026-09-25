@@ -64,6 +64,7 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
     // The server is the authority on the remainder; it can also cut a session
     // short the moment the allowance runs out.
     _meter.onRemaining = (remainingMs) => onRemainingMs?.call(remainingMs);
+    _meter.onPendingUsage = (pendingMs) => onPendingSpeechMs?.call(pendingMs);
     _meter.onExhausted = () {
       _outOfMinutes = true;
       unawaited(stopListening());
@@ -89,6 +90,11 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
   /// Milliseconds of TRANSLATED SPEECH left — it does not move while a room
   /// is quiet, however long the microphone stays open.
   void Function(int remainingMs)? onRemainingMs;
+
+  /// Translated speech measured on this device but not yet accepted by the
+  /// server, so usage on screen moves as people speak instead of waiting for
+  /// the batched report.
+  void Function(int pendingMs)? onPendingSpeechMs;
 
   // ── Observable state ────────────────────────────────────────────────────────
 

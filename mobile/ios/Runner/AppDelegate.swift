@@ -45,6 +45,20 @@ import UIKit
       name: "app.livetranslator/tts_events", binaryMessenger: messenger)
     ttsEvents.setStreamHandler(speech)
 
+    // TEMPORARY (store-products investigation): lets the billing diagnostic
+    // report the bundle id the app is ACTUALLY running under, rather than the
+    // one we believe is configured. A mismatch is invisible any other way.
+    let appInfo = FlutterMethodChannel(
+      name: "app.livetranslator/app_info", binaryMessenger: messenger)
+    appInfo.setMethodCallHandler { call, result in
+      switch call.method {
+      case "bundleId":
+        result(Bundle.main.bundleIdentifier)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
     let tts = FlutterMethodChannel(
       name: "app.livetranslator/tts", binaryMessenger: messenger)
     tts.setMethodCallHandler { [weak self] call, result in

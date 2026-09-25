@@ -3,7 +3,9 @@ import 'dart:developer' as developer;
 import 'dart:io' show Platform;
 
 import 'package:cloud_functions/cloud_functions.dart';
-import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
+import 'package:flutter/foundation.dart'
+    show debugPrint, kIsWeb, visibleForTesting;
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -17,6 +19,98 @@ enum PurchaseOutcome { success, cancelled, pending, failed, unavailable }
 
 /// The only two payment systems Sayvo uses.
 enum BillingStore { apple, google }
+
+/// Why the paywall has prices, or hasn't.
+enum ProductQueryOutcome {
+  /// The store returned at least one product.
+  loaded,
+
+  /// In-app purchase is not possible here at all (web, desktop preview).
+  unsupportedPlatform,
+
+  /// The store itself said no — commonly purchases restricted on the device
+  /// (Screen Time → Content & Privacy → In-app Purchases).
+  storeUnavailable,
+
+  /// The store answered, and did not recognise our product ids. Almost always
+  /// App Store Connect / Play Console configuration rather than the app.
+  productsNotFound,
+
+  /// The store returned an error for the query.
+  queryFailed,
+}
+
+/// The result of asking the store about our products, kept so the paywall and
+/// the logs can say WHY there are no prices instead of only that there are
+/// none.
+class ProductQueryReport {
+  const ProductQueryReport({
+    required this.supportedPlatform,
+    required this.storeAvailable,
+    required this.requested,
+    required this.products,
+    required this.notFoundIds,
+    required this.error,
+    required this.attempts,
+  });
+
+  factory ProductQueryReport.unsupported(Set<String> requested) =>
+      ProductQueryReport(
+        supportedPlatform: false,
+        storeAvailable: false,
+        requested: requested,
+        products: const [],
+        notFoundIds: const [],
+        error: null,
+        attempts: 0,
+      );
+
+  factory ProductQueryReport.storeUnavailable(Set<String> requested) =>
+      ProductQueryReport(
+        supportedPlatform: true,
+        storeAvailable: false,
+        requested: requested,
+        products: const [],
+        notFoundIds: const [],
+        error: null,
+        attempts: 0,
+      );
+
+  final bool supportedPlatform;
+  final bool storeAvailable;
+  final Set<String> requested;
+  final List<ProductDetails> products;
+  final List<String> notFoundIds;
+  final String? error;
+  final int attempts;
+
+  List<String> get returnedIds => [for (final p in products) p.id]..sort();
+
+  ProductQueryOutcome get outcome {
+    if (!supportedPlatform) return ProductQueryOutcome.unsupportedPlatform;
+    if (!storeAvailable) return ProductQueryOutcome.storeUnavailable;
+    if (products.isNotEmpty) return ProductQueryOutcome.loaded;
+    if (error != null) return ProductQueryOutcome.queryFailed;
+    return ProductQueryOutcome.productsNotFound;
+  }
+
+  /// What to tell the user. Each case is actionable by somebody: the device
+  /// owner, or whoever configures the store.
+  String get message => switch (outcome) {
+        ProductQueryOutcome.loaded => '',
+        ProductQueryOutcome.unsupportedPlatform =>
+          'Subscriptions are not available on this device.',
+        ProductQueryOutcome.storeUnavailable =>
+          'In-app purchases are turned off for this device. Check Screen Time '
+              '→ Content & Privacy Restrictions → In-app Purchases.',
+        ProductQueryOutcome.productsNotFound =>
+          'Sayvo plans are not available from the App Store yet. This usually '
+              'clears within a few hours of them going live.',
+        ProductQueryOutcome.queryFailed =>
+          'The App Store could not be reached. Check your connection and try '
+              'again.',
+      };
+}
 
 class PurchaseResult {
   const PurchaseResult(this.outcome, {this.message});
@@ -44,6 +138,11 @@ class SubscriptionService {
 
   /// Who is signed in, so a purchase can carry the account it was made for.
   final String? Function()? _uidProvider;
+
+  /// How many times a store query that returns nothing is retried, and how
+  /// long the first wait is (it lengthens each attempt).
+  static const int productQueryAttempts = 3;
+  static const Duration productQueryRetryDelay = Duration(milliseconds: 800);
 
   final BillingStore? _injectedStore;
 
@@ -82,8 +181,14 @@ class SubscriptionService {
     return null;
   }
 
+  /// Whether in-app purchase exists here at all.
+  ///
+  /// An injected [store] means a caller is standing in for a platform — only
+  /// tests do that — so it answers for the platform too. Production never
+  /// injects one and falls through to the real check.
   bool get isSupportedPlatform =>
-      !kIsWeb && (Platform.isIOS || Platform.isAndroid);
+      _injectedStore != null ||
+      (!kIsWeb && (Platform.isIOS || Platform.isAndroid));
 
   /// Starts listening for purchase updates. Safe to call more than once.
   void listen() {
@@ -96,20 +201,105 @@ class SubscriptionService {
     );
   }
 
+  /// What the last store query actually returned.
+  ///
+  /// The paywall can only say "no prices" on its own; this says WHY, which is
+  /// the difference between an App Store Connect problem, a device with
+  /// purchases restricted, and a transient query failure.
+  ProductQueryReport? _lastQuery;
+  ProductQueryReport? get lastQuery => _lastQuery;
+
   /// Loads the three subscriptions and their localized prices from the store.
+  ///
+  /// Retries a few times when the store answers with nothing at all: StoreKit
+  /// can come back empty for a moment right after launch, and a single attempt
+  /// at screen-open would leave the paywall showing dashes for the rest of the
+  /// session.
   Future<bool> loadProducts() async {
-    if (!isSupportedPlatform) return false;
-    if (!await _iap.isAvailable()) return false;
-    final response = await _iap.queryProductDetails(kAllProductIds);
-    if (response.error != null) {
-      developer.log('queryProductDetails: ${response.error}', name: 'billing');
+    if (!isSupportedPlatform) {
+      _lastQuery = ProductQueryReport.unsupported(kAllProductIds);
+      _logQuery();
+      return false;
     }
-    _products = response.productDetails;
-    if (response.notFoundIDs.isNotEmpty) {
-      // Normal until the products are live in App Store Connect / Play.
-      developer.log('products not found: ${response.notFoundIDs}', name: 'billing');
+    await _ensureBundleId();
+    final available = await _iap.isAvailable();
+    if (!available) {
+      _lastQuery = ProductQueryReport.storeUnavailable(kAllProductIds);
+      _logQuery();
+      return false;
     }
+
+    ProductQueryReport report = ProductQueryReport.storeUnavailable(kAllProductIds);
+    for (var attempt = 1; attempt <= productQueryAttempts; attempt++) {
+      final response = await _iap.queryProductDetails(kAllProductIds);
+      report = ProductQueryReport(
+        supportedPlatform: true,
+        storeAvailable: true,
+        requested: kAllProductIds,
+        products: response.productDetails,
+        notFoundIds: response.notFoundIDs,
+        error: response.error?.toString(),
+        attempts: attempt,
+      );
+      _products = response.productDetails;
+      if (_products.isNotEmpty) break;
+      if (attempt < productQueryAttempts) {
+        await Future<void>.delayed(productQueryRetryDelay * attempt);
+      }
+    }
+
+    _lastQuery = report;
+    _logQuery();
     return _products.isNotEmpty;
+  }
+
+  /// TEMPORARY far-side diagnostics for the "prices show —" investigation.
+  ///
+  /// Uses [debugPrint], not `dart:developer`: developer.log goes to the VM
+  /// service, which is not attached in a TestFlight build, so those lines
+  /// never reach a real device. Nothing personal or payment-related is
+  /// printed — product metadata, counts and ids only.
+  void _logQuery() {
+    final report = _lastQuery;
+    if (report == null) return;
+    debugPrint(
+      '[BILLING-IOS] storeAvailable=${report.storeAvailable} '
+      'supportedPlatform=${report.supportedPlatform} '
+      'bundleId=${_bundleId ?? 'unknown'} '
+      'requestedProductIds=${report.requested.toList()..sort()} '
+      'returnedProductsCount=${report.products.length} '
+      'returnedProductIds=${report.returnedIds} '
+      'notFoundIds=${report.notFoundIds} '
+      'queryError=${report.error ?? 'none'} '
+      'attempts=${report.attempts}',
+    );
+    for (final product in report.products) {
+      debugPrint(
+        '[BILLING-IOS] product id=${product.id} title=${product.title} '
+        'price=${product.price} currencyCode=${product.currencyCode} '
+        'rawPrice=${product.rawPrice}',
+      );
+    }
+  }
+
+  static const MethodChannel _appInfo =
+      MethodChannel('app.livetranslator/app_info');
+  String? _bundleId;
+
+  /// Reads the bundle id the app is ACTUALLY running under, so a mismatch
+  /// with App Store Connect is visible rather than assumed.
+  ///
+  /// Strictly best effort, and time-boxed: a diagnostic must never be able to
+  /// hold up the paywall, on a platform without the channel or anywhere else.
+  Future<void> _ensureBundleId() async {
+    if (_bundleId != null || kIsWeb) return;
+    try {
+      _bundleId = await _appInfo
+          .invokeMethod<String>('bundleId')
+          .timeout(const Duration(seconds: 1));
+    } catch (_) {
+      _bundleId = null;
+    }
   }
 
   /// Starts the platform's own purchase sheet. Upgrades and downgrades go

@@ -54,9 +54,10 @@ class _PaywallScreenState extends State<PaywallScreen> {
     if (!mounted) return;
     setState(() {
       _loading = false;
-      if (!ok) {
-        _error = 'Subscriptions are not available on this device right now.';
-      }
+      // Say WHY there are no prices. "Not available" covered a restricted
+      // device, an App Store Connect product that is not live yet, and a
+      // failed query with one sentence that helps nobody act.
+      _error = ok ? null : _subscriptions.lastQuery?.message;
     });
   }
 

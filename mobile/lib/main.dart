@@ -62,6 +62,7 @@ Future<void> main() async {
   // The usage report carries the freshest remainder there is, so let it drive
   // the counter between Firestore snapshots.
   liveController.onRemainingMs = entitlements.applyRemainingMs;
+  liveController.onPendingSpeechMs = entitlements.applyPendingSpeechMs;
 
   runApp(
     MultiProvider(

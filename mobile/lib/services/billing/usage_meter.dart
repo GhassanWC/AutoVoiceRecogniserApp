@@ -80,6 +80,16 @@ class UsageMeter implements LiveSessionObserver {
   /// Called with each fresh server remainder so the UI can count down.
   void Function(int remainingMs)? onRemaining;
 
+  /// Translated speech committed locally but not yet accepted by the server.
+  ///
+  /// The server round-trip is batched, so without this the usage on screen
+  /// would sit still for seconds after somebody spoke — and not move at all
+  /// while offline. The UI adds this on top of the authoritative number and
+  /// drops it the moment the server confirms.
+  void Function(int pendingMs)? onPendingUsage;
+
+  int _lastNotifiedPendingMs = 0;
+
   bool get isRunning => _sessionId != null;
 
   /// Translated speech this metered session is responsible for.
@@ -159,6 +169,8 @@ class UsageMeter implements LiveSessionObserver {
   }) {
     _speech.onAudio(rms: rms, duration: duration, gated: gated, at: _now());
     if (sentUpstream) _audioSentMs += duration.inMilliseconds;
+    // A segment can commit here: speech that was already translated ends.
+    _notifyPending();
   }
 
   /// Diagnostics only. Nothing in the audio path may branch on this: the
@@ -169,12 +181,14 @@ class UsageMeter implements LiveSessionObserver {
   @override
   void onTranslatedText() {
     _speech.onTranslatedText(_now());
+    _notifyPending();
     if (unreportedMs > 0) _scheduleFlush();
   }
 
   @override
   void onUtteranceTranslated() {
     _speech.onUtteranceTranslated();
+    _notifyPending();
     // The utterance is done, so its speech is now committed; batch briefly in
     // case several land together.
     _scheduleFlush();
@@ -224,6 +238,15 @@ class UsageMeter implements LiveSessionObserver {
     });
   }
 
+  /// Tells the UI what is owed but unreported, and only when it changes —
+  /// this is called from the audio path, which runs ten times a second.
+  void _notifyPending() {
+    final pending = unreportedMs;
+    if (pending == _lastNotifiedPendingMs) return;
+    _lastNotifiedPendingMs = pending;
+    onPendingUsage?.call(pending < 0 ? 0 : pending);
+  }
+
   void _closeConnectedWindow() {
     final since = _connectedAt;
     if (since == null) return;
@@ -254,6 +277,9 @@ class UsageMeter implements LiveSessionObserver {
       _reportedMs = cumulative;
       final remaining = (data['remainingMs'] as num?)?.toInt();
       if (remaining != null) onRemaining?.call(remaining);
+      // Accepted: the authoritative number now covers it, so the local
+      // estimate must stop being added on top.
+      _notifyPending();
       if (data['allowed'] == false && !close) onExhausted?.call();
     } catch (e) {
       // A dropped report must not stop a paid session: the total is

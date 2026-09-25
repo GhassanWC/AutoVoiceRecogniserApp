@@ -89,6 +89,17 @@ class _FakeSubscriptions extends SubscriptionService {
   }
 
   @override
+  ProductQueryReport? get lastQuery => ProductQueryReport(
+        supportedPlatform: true,
+        storeAvailable: true,
+        requested: kAllProductIds,
+        products: products,
+        notFoundIds: productsAvailable ? const [] : kAllProductIds.toList(),
+        error: null,
+        attempts: 1,
+      );
+
+  @override
   List<ProductDetails> get products =>
       productsAvailable ? _catalog.values.toList() : const [];
 
@@ -604,8 +615,8 @@ void main() {
         (tester) async {
       final (subs, _) = await pumpPaywall(tester, productsAvailable: false);
 
-      expect(
-          find.textContaining('not available on this device'), findsOneWidget);
+      expect(find.textContaining('not available from the App Store yet'),
+          findsOneWidget);
       expect(find.text('—'), findsNWidgets(3));
       await tester.tap(find.text('Subscribe'));
       await tester.pumpAndSettle();
@@ -647,8 +658,10 @@ void main() {
         'allowanceSource': 'free',
       });
       expect(find.text('Free'), findsOneWidget);
-      expect(find.text('3m of 5 free minutes left'), findsOneWidget);
-      expect(find.text('2m translated · 3m remaining'), findsOneWidget);
+      expect(find.text('Free — 5 min translated speech, one time'),
+          findsOneWidget);
+      expect(find.text('2m of 5m used'), findsOneWidget);
+      expect(find.text('3m remaining'), findsOneWidget);
       expect(find.text('Upgrade Sayvo'), findsOneWidget);
       expect(find.text('Manage Subscription'), findsNothing);
     });
@@ -668,7 +681,8 @@ void main() {
       });
       expect(find.text('Sayvo Plus'), findsOneWidget);
       expect(find.text('35 min translated speech / month'), findsOneWidget);
-      expect(find.text('12m 24s translated · 22m 36s remaining'), findsOneWidget);
+      expect(find.text('12m 24s of 35m used'), findsOneWidget);
+      expect(find.text('22m 36s remaining'), findsOneWidget);
       expect(find.textContaining('Renews'), findsOneWidget);
       expect(find.textContaining('November 3, 2026'), findsOneWidget);
       expect(find.text('Upgrade Sayvo'), findsNothing);
@@ -691,7 +705,8 @@ void main() {
       });
       // The plan is gone, so the card shows Free and offers an upgrade.
       expect(find.text('Free'), findsOneWidget);
-      expect(find.text('5m of 5 free minutes left'), findsOneWidget);
+      expect(find.text('0s of 5m used'), findsOneWidget);
+      expect(find.text('5m remaining'), findsOneWidget);
       expect(find.text('Upgrade Sayvo'), findsOneWidget);
     });
   });

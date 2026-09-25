@@ -38,6 +38,33 @@ class EntitlementController extends ChangeNotifier {
 
   bool get canStartSession => _entitlement.hasSpeechLeft;
 
+  /// Translated speech committed on THIS device but not yet accepted by the
+  /// server. Added on top of the authoritative figures so usage on screen
+  /// moves the moment somebody is translated, rather than waiting for the
+  /// batched report to land — and so it still moves while offline.
+  ///
+  /// It is only ever an overlay. Every authoritative update clears it, so the
+  /// server's number always wins in the end.
+  int _pendingSpeechMs = 0;
+  int get pendingSpeechMs => _pendingSpeechMs;
+
+  /// Usage to SHOW: what the server has accepted, plus what this device knows
+  /// it owes. Never more than the allowance.
+  int get displayedUsedMs =>
+      (_entitlement.spentMs + _pendingSpeechMs).clamp(0, _entitlement.totalMs);
+
+  /// Allowance left to SHOW, the mirror image of [displayedUsedMs].
+  int get displayedRemainingMs =>
+      (_entitlement.remainingMs - _pendingSpeechMs).clamp(0, _entitlement.totalMs);
+
+  /// Reports translated speech this device has committed locally.
+  void applyPendingSpeechMs(int pendingMs) {
+    final clamped = pendingMs < 0 ? 0 : pendingMs;
+    if (clamped == _pendingSpeechMs) return;
+    _pendingSpeechMs = clamped;
+    notifyListeners();
+  }
+
   /// Points at a user (or clears on sign-out).
   void bind(String? uid) {
     if (uid == _uid) return;
@@ -46,6 +73,7 @@ class EntitlementController extends ChangeNotifier {
     _subscription = null;
     if (uid == null) {
       _entitlement = Entitlement.free;
+      _pendingSpeechMs = 0;
       _loaded = false;
       notifyListeners();
       return;
@@ -65,6 +93,8 @@ class EntitlementController extends ChangeNotifier {
     _entitlement =
         data == null ? Entitlement.free : Entitlement.fromMap(data);
     _loaded = true;
+    // Reconciled: the stored figure now covers what the overlay stood in for.
+    _pendingSpeechMs = 0;
     notifyListeners();
   }
 
@@ -77,6 +107,7 @@ class EntitlementController extends ChangeNotifier {
           .call<Map<String, dynamic>>();
       _entitlement = Entitlement.fromMap(Map<String, dynamic>.from(result.data));
       _loaded = true;
+      _pendingSpeechMs = 0;
       notifyListeners();
     } catch (e) {
       // Never downgrade on a failed refresh; the stream remains the source.
@@ -91,7 +122,14 @@ class EntitlementController extends ChangeNotifier {
   /// produces no reports, so the number on screen simply stays put.
   void applyRemainingMs(int remainingMs) {
     final clamped = remainingMs < 0 ? 0 : remainingMs;
-    if (clamped == _entitlement.remainingMs) return;
+    // The server has accepted everything up to here, so the local overlay has
+    // done its job and must not be counted twice.
+    final hadPending = _pendingSpeechMs != 0;
+    _pendingSpeechMs = 0;
+    if (clamped == _entitlement.remainingMs) {
+      if (hadPending) notifyListeners();
+      return;
+    }
     final spent = (_entitlement.totalMs - clamped).clamp(0, _entitlement.totalMs);
     _entitlement = Entitlement(
       plan: _entitlement.plan,

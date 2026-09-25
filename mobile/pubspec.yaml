@@ -28,6 +28,10 @@ dependencies:
   url_launcher: ^6.3.2
 
 dev_dependencies:
+  # Used by billing_display_test to stand in for StoreKit/Play underneath the
+  # real SubscriptionService. Transitive via in_app_purchase, declared here
+  # because the test imports it directly.
+  in_app_purchase_platform_interface: ^1.4.1
   flutter_test:
     sdk: flutter
   flutter_lints: ^4.0.0
