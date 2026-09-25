@@ -15,9 +15,12 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  APIException,
   AppStoreServerAPIClient,
   Environment,
   SignedDataVerifier,
+  VerificationException,
+  VerificationStatus,
 } from "@apple/app-store-server-library";
 import { GoogleAuth } from "google-auth-library";
 
@@ -94,6 +97,16 @@ export function mapAppleTransaction(
   };
 }
 
+/// Structured, non-sensitive progress from the Apple verification path.
+///
+/// Signed payloads, decoded transactions, the .p8 key and the issuer id never
+/// appear here — only which environment was tried, what Apple answered, and
+/// which check failed.
+export type AppleDiagnostic = (
+  event: string,
+  data: Record<string, unknown>,
+) => void;
+
 export interface AppleDeps {
   issuerId: string;
   keyId: string;
@@ -101,9 +114,18 @@ export interface AppleDeps {
   privateKey: string;
   bundleId: string;
   environment: Environment;
+  /**
+   * The app's numeric App Store id.
+   *
+   * Apple's library REFUSES to construct a Production verifier without it
+   * ("appAppleId is required when the environment is Production"), so with no
+   * value here only Sandbox can be verified — fine for TestFlight, useless
+   * for the real App Store release.
+   */
   appAppleId?: number;
   /** Apple root certificates (DER), required for signature verification. */
   rootCertificates: Buffer[];
+  onDiagnostic?: AppleDiagnostic;
 }
 
 function requireAppleDeps(deps: Partial<AppleDeps> | null): AppleDeps {
@@ -164,20 +186,39 @@ export async function verifyAppleTransaction(
   rawDeps: Partial<AppleDeps> | null,
 ): Promise<VerifiedSubscription> {
   const deps = requireAppleDeps(rawDeps);
-  const order =
+  const log = deps.onDiagnostic ?? (() => {});
+
+  // Production needs the numeric App Store id; without it the verifier cannot
+  // even be constructed, so there is no point attempting that environment.
+  const canVerifyProduction = deps.appAppleId !== undefined;
+  if (!canVerifyProduction) {
+    log("apple.production_unavailable", {
+      reason: "APPLE_APP_APPLE_ID is not configured",
+      consequence: "sandbox/TestFlight only; App Store purchases cannot verify",
+    });
+  }
+
+  const order = (
     deps.environment === Environment.SANDBOX
       ? [Environment.SANDBOX, Environment.PRODUCTION]
-      : [Environment.PRODUCTION, Environment.SANDBOX];
+      : [Environment.PRODUCTION, Environment.SANDBOX]
+  ).filter(
+    (environment) =>
+      environment !== Environment.PRODUCTION || canVerifyProduction,
+  );
 
   let lastError: unknown;
   for (const environment of order) {
     try {
-      return await lookupAppleTransaction(transactionId, {
+      const verified = await lookupAppleTransaction(transactionId, {
         ...deps,
         environment,
       });
+      log("apple.verified", { environment, productId: verified.productId });
+      return verified;
     } catch (error) {
       lastError = error;
+      log("apple.attempt_failed", { environment, ...describeAppleError(error) });
     }
   }
   throw lastError instanceof BillingVerificationError
@@ -187,6 +228,39 @@ export async function verifyAppleTransaction(
           lastError instanceof Error ? lastError.message : String(lastError)
         }`,
       );
+}
+
+/**
+ * Turns whatever Apple's library threw into something safe to log: the kind
+ * of failure and its code, never the payload that failed.
+ */
+export function describeAppleError(error: unknown): Record<string, unknown> {
+  if (error instanceof VerificationException) {
+    return {
+      kind: "VerificationException",
+      // The name is the useful part: INVALID_ENVIRONMENT means we tried the
+      // wrong store, INVALID_CERTIFICATE means the root certificates are
+      // wrong or missing, INVALID_APP_IDENTIFIER means the bundle id differs.
+      status: VerificationStatus[error.status] ?? String(error.status),
+    };
+  }
+  if (error instanceof APIException) {
+    return {
+      kind: "APIException",
+      httpStatusCode: error.httpStatusCode,
+      // 4040010 is TransactionIdNotFound — the usual answer when a sandbox
+      // transaction is looked up in production, or vice versa.
+      apiError: error.apiError,
+      apiErrorMessage: error.errorMessage,
+    };
+  }
+  if (error instanceof BillingVerificationError) {
+    return { kind: "BillingVerificationError", message: error.message };
+  }
+  return {
+    kind: error instanceof Error ? error.name : typeof error,
+    message: error instanceof Error ? error.message : String(error),
+  };
 }
 
 async function lookupAppleTransaction(
@@ -208,23 +282,55 @@ async function lookupAppleTransaction(
     deps.appAppleId,
   );
 
+  const log = deps.onDiagnostic ?? (() => {});
   const statuses = await client.getAllSubscriptionStatuses(transactionId);
-  for (const group of statuses.data ?? []) {
+  const groups = statuses.data ?? [];
+  log("apple.statuses", {
+    environment: deps.environment,
+    groups: groups.length,
+    transactions: groups.reduce(
+      (total, group) => total + (group.lastTransactions?.length ?? 0),
+      0,
+    ),
+  });
+
+  // Apple resolved the subscription FROM the id we sent, so every transaction
+  // it returned belongs to it. An exact id match is preferred, but its
+  // absence is not a rejection: after a renewal the latest transaction
+  // legitimately carries a different id from the one the app purchased with.
+  let fallback: VerifiedSubscription | null = null;
+  for (const group of groups) {
     for (const item of group.lastTransactions ?? []) {
       if (!item.signedTransactionInfo) continue;
+      // Signature, certificate chain, bundle id and environment are all
+      // checked in here by Apple's own verifier. Nothing below relaxes that.
       const decoded = await verifier.verifyAndDecodeTransaction(
         item.signedTransactionInfo,
       );
-      if (decoded.transactionId !== transactionId &&
-          decoded.originalTransactionId !== transactionId) {
-        continue;
-      }
-      return mapAppleTransaction(
+      const verified = mapAppleTransaction(
         decoded as AppleTransactionPayload,
         item.status ?? 2,
       );
+      const exact =
+        decoded.transactionId === transactionId ||
+        decoded.originalTransactionId === transactionId;
+      if (exact) {
+        log("apple.match", { environment: deps.environment, match: "exact" });
+        return verified;
+      }
+      fallback ??= verified;
     }
   }
+
+  if (fallback !== null) {
+    log("apple.match", {
+      environment: deps.environment,
+      match: "subscription",
+      note: "no exact transaction id; using the subscription Apple resolved",
+    });
+    return fallback;
+  }
+
   throw new BillingVerificationError(
     "Apple returned no subscription for that transaction",
   );

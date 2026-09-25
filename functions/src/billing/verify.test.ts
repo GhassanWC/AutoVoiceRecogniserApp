@@ -2,12 +2,18 @@ import { describe, expect, it } from "vitest";
 
 import { accessFor, applyVerifiedSubscription, freshEntitlement } from "./entitlement.js";
 import { PLAN_ALLOWANCE_MS, PRODUCT_IDS } from "./plans.js";
-import { Environment } from "@apple/app-store-server-library";
+import {
+  APIException,
+  Environment,
+  VerificationException,
+  VerificationStatus,
+} from "@apple/app-store-server-library";
 
 import {
   BillingConfigError,
   BillingVerificationError,
   appleRootCertificates,
+  describeAppleError,
   mapAppleTransaction,
   mapGoogleSubscription,
   verifyAppleTransaction,
@@ -103,6 +109,131 @@ describe("Apple mapping", () => {
     () => {
       expect(appleRootCertificates("./definitely-not-a-directory")).toEqual([]);
     });
+});
+
+describe("which App Store environment is verified", () => {
+  const configured = {
+    issuerId: "issuer",
+    keyId: "key",
+    privateKey: "-----BEGIN PRIVATE KEY-----",
+    bundleId: "com.ghassanalhattali.livetranslator",
+    environment: Environment.PRODUCTION,
+    rootCertificates: [Buffer.from("not-a-real-certificate")],
+  };
+
+  /** Collects the diagnostic events a verification attempt emits. */
+  function recorder() {
+    const events: { event: string; data: Record<string, unknown> }[] = [];
+    return {
+      events,
+      onDiagnostic: (event: string, data: Record<string, unknown>) =>
+        events.push({ event, data }),
+    };
+  }
+
+  it("says so, loudly, when Production cannot be verified at all", async () => {
+    // Apple's library refuses to construct a Production verifier without the
+    // numeric App Store id, so without it ONLY sandbox can ever succeed —
+    // which is survivable in TestFlight and fatal at launch.
+    const log = recorder();
+    await expect(
+      verifyAppleTransaction("2000000999", {
+        ...configured,
+        onDiagnostic: log.onDiagnostic,
+      }),
+    ).rejects.toBeInstanceOf(BillingVerificationError);
+
+    const warning = log.events.find(
+      (e) => e.event === "apple.production_unavailable",
+    );
+    expect(warning).toBeDefined();
+    expect(String(warning!.data.reason)).toContain("APPLE_APP_APPLE_ID");
+    // Production was skipped rather than attempted and silently failing.
+    const attempted = log.events
+      .filter((e) => e.event === "apple.attempt_failed")
+      .map((e) => e.data.environment);
+    expect(attempted).not.toContain(Environment.PRODUCTION);
+    expect(attempted).toContain(Environment.SANDBOX);
+  });
+
+  it("tries Production first, then Sandbox, once the App Store id is set",
+    async () => {
+      const log = recorder();
+      await expect(
+        verifyAppleTransaction("2000000999", {
+          ...configured,
+          appAppleId: 1234567890,
+          onDiagnostic: log.onDiagnostic,
+        }),
+      ).rejects.toBeInstanceOf(BillingVerificationError);
+
+      const attempted = log.events
+        .filter((e) => e.event === "apple.attempt_failed")
+        .map((e) => e.data.environment);
+      // Both environments, production first: a real App Store purchase and a
+      // TestFlight one both have somewhere to be verified.
+      expect(attempted).toEqual([Environment.PRODUCTION, Environment.SANDBOX]);
+    });
+
+  it("every attempt is reported with a classified reason", async () => {
+    const log = recorder();
+    await expect(
+      verifyAppleTransaction("2000000999", {
+        ...configured,
+        appAppleId: 1234567890,
+        onDiagnostic: log.onDiagnostic,
+      }),
+    ).rejects.toBeInstanceOf(BillingVerificationError);
+
+    for (const failure of log.events.filter(
+      (e) => e.event === "apple.attempt_failed",
+    )) {
+      expect(failure.data.kind).toBeDefined();
+    }
+  });
+
+  it("never puts a key, a payload or a transaction into a diagnostic",
+    async () => {
+      const log = recorder();
+      await verifyAppleTransaction("2000000999", {
+        ...configured,
+        appAppleId: 1234567890,
+        onDiagnostic: log.onDiagnostic,
+      }).catch(() => undefined);
+
+      const printed = JSON.stringify(log.events);
+      expect(printed).not.toContain("BEGIN PRIVATE KEY");
+      expect(printed).not.toContain("issuer");
+      expect(printed).not.toContain("2000000999");
+    });
+});
+
+describe("classifying an Apple failure for the logs", () => {
+  it("names the verification status rather than a bare number", () => {
+    const described = describeAppleError(
+      new VerificationException(VerificationStatus.INVALID_ENVIRONMENT),
+    );
+    expect(described.kind).toBe("VerificationException");
+    // The name is what tells a reader we asked the wrong store.
+    expect(described.status).toBe("INVALID_ENVIRONMENT");
+  });
+
+  it("carries Apple's HTTP status and error code through", () => {
+    const described = describeAppleError(
+      new APIException(404, 4040010, "Transaction id not found."),
+    );
+    expect(described.kind).toBe("APIException");
+    expect(described.httpStatusCode).toBe(404);
+    expect(described.apiError).toBe(4040010);
+  });
+
+  it("passes our own rejections through intact", () => {
+    const described = describeAppleError(
+      new BillingVerificationError("Apple returned no subscription"),
+    );
+    expect(described.kind).toBe("BillingVerificationError");
+    expect(described.message).toContain("no subscription");
+  });
 });
 
 describe("Google Play mapping", () => {

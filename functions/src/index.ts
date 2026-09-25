@@ -21,6 +21,7 @@ import {
   BillingConfigError,
   BillingVerificationError,
   appleRootCertificates,
+  describeAppleError,
   verifyAppleTransaction,
   verifyGoogleSubscription,
 } from "./billing/verify.js";
@@ -40,6 +41,13 @@ const appleBundleId = defineString("APPLE_BUNDLE_ID", {
 const playPackageName = defineString("PLAY_PACKAGE_NAME", {
   default: "com.livetranslator.live_translator",
 });
+
+/**
+ * The app's numeric App Store id (App Store Connect → App Information →
+ * Apple ID). Apple's library cannot build a PRODUCTION verifier without it,
+ * so until this is set only Sandbox/TestFlight purchases can be verified.
+ */
+const appleAppAppleId = defineString("APPLE_APP_APPLE_ID", { default: "" });
 
 /**
  * Room-tuned Gemini speech detection. On by default; set to "off" to mint
@@ -140,6 +148,31 @@ export const createLiveTranslateToken = onCall(
     }
   },
 );
+
+/**
+ * Everything Apple verification needs, in one place so the purchase path and
+ * the lapsed-period re-check cannot drift apart.
+ *
+ * [label] tags the diagnostic lines so a log reader can tell which call site
+ * produced them. Nothing sensitive is logged: no key, no signed payload, no
+ * transaction contents.
+ */
+function appleVerificationDeps(label: string, uid: string) {
+  const appStoreId = Number(appleAppAppleId.value());
+  return {
+    issuerId: appleIssuerId.value(),
+    keyId: appleKeyId.value(),
+    privateKey: applePrivateKey.value(),
+    bundleId: appleBundleId.value(),
+    // Production first, then sandbox for TestFlight. Never taken from the
+    // client, which would otherwise pick the easier environment.
+    environment: Environment.PRODUCTION,
+    appAppleId: Number.isFinite(appStoreId) && appStoreId > 0 ? appStoreId : undefined,
+    rootCertificates: appleRootCertificates(),
+    onDiagnostic: (event: string, data: Record<string, unknown>) =>
+      logger.info("apple verify", { uid, label, event, ...data }),
+  };
+}
 
 /**
  * Accepts a CUMULATIVE translated-speech report for a session and says what is
@@ -248,16 +281,10 @@ export const verifySubscriptionPurchase = onCall(
         if (typeof transactionId !== "string" || transactionId.length === 0) {
           throw new HttpsError("invalid-argument", "transactionId is required.");
         }
-        const verified = await verifyAppleTransaction(transactionId, {
-          issuerId: appleIssuerId.value(),
-          keyId: appleKeyId.value(),
-          privateKey: applePrivateKey.value(),
-          bundleId: appleBundleId.value(),
-          // Production first, then sandbox for TestFlight. Never taken from
-          // the client, which would otherwise pick the easier environment.
-          environment: Environment.PRODUCTION,
-          rootCertificates: appleRootCertificates(),
-        });
+        const verified = await verifyAppleTransaction(
+          transactionId,
+          appleVerificationDeps("purchase", uid),
+        );
         warnOnAccountTokenMismatch(uid, verified.accountToken, "apple");
         const entitlement = await applyVerified(uid, verified, now);
         logger.info("apple purchase verified", { uid, plan: entitlement.plan });
@@ -304,9 +331,12 @@ export const verifySubscriptionPurchase = onCall(
         );
       }
       if (error instanceof BillingVerificationError) {
+        // "rejected" on its own says nothing actionable; carry the store and
+        // the classified reason so a log reader knows which check failed.
         logger.warn("purchase verification rejected", {
           uid,
-          message: error.message,
+          store,
+          ...describeAppleError(error),
         });
         throw new HttpsError("permission-denied", "Purchase could not be verified.");
       }
@@ -364,14 +394,10 @@ async function refreshLapsedFromStore(
   try {
     const verified =
       entitlement.store === "apple"
-        ? await verifyAppleTransaction(handle, {
-            issuerId: appleIssuerId.value(),
-            keyId: appleKeyId.value(),
-            privateKey: applePrivateKey.value(),
-            bundleId: appleBundleId.value(),
-            environment: Environment.PRODUCTION,
-            rootCertificates: appleRootCertificates(),
-          })
+        ? await verifyAppleTransaction(
+            handle,
+            appleVerificationDeps("lapsed-recheck", uid),
+          )
         : await verifyGoogleSubscription(handle, {
             packageName: playPackageName.value(),
           });
