@@ -110,8 +110,14 @@ class _FakeSubscriptions extends SubscriptionService {
   @override
   Future<void> buy(ProductDetails product) async => bought.add(product.id);
 
+  /// What a restore will report back; defaults to finding nothing.
+  RestoreReport restoreReport = const RestoreReport(delivered: 0, verified: 0);
+
   @override
-  Future<void> restorePurchases() async => restoreCalls++;
+  Future<RestoreReport> restorePurchases() async {
+    restoreCalls++;
+    return restoreReport;
+  }
 
   @override
   Future<bool> openManageSubscription({String? productId}) async {

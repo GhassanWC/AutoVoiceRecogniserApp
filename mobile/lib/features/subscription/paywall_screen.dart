@@ -110,7 +110,10 @@ class _PaywallScreenState extends State<PaywallScreen> {
       _busy = true;
       _error = null;
     });
-    await _subscriptions.restorePurchases();
+    // Waits for the store to deliver AND the server to settle, so the message
+    // below describes what happened rather than what had happened by the time
+    // the store's own call returned.
+    final report = await _subscriptions.restorePurchases();
     if (!mounted) return;
     await context.read<EntitlementController>().refresh();
     if (!mounted) return;
@@ -118,9 +121,16 @@ class _PaywallScreenState extends State<PaywallScreen> {
     final entitlement = context.read<EntitlementController>().entitlement;
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-      content: Text(entitlement.isPaid
-          ? '${planDisplayName(entitlement.plan)} restored.'
-          : 'No previous subscription found.'),
+      content: Text(switch (report) {
+        _ when entitlement.isPaid =>
+          '${planDisplayName(entitlement.plan)} restored.',
+        // The store had nothing for this Apple ID — a different account, or
+        // a subscription that has since lapsed.
+        _ when report.foundNothing => 'No previous subscription found.',
+        // It found something and the server would not accept it; the reason
+        // has already been surfaced through the purchase stream.
+        _ => 'That subscription could not be confirmed.',
+      }),
     ));
   }
 

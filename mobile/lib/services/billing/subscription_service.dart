@@ -112,10 +112,29 @@ class ProductQueryReport {
       };
 }
 
+/// Sends one purchase to the backend for verification. Injectable so the
+/// purchase and restore flows can be tested without a Firebase app, exactly
+/// as the usage meter's sender is.
+typedef VerifySender = Future<void> Function(Map<String, dynamic> payload);
+
 class PurchaseResult {
   const PurchaseResult(this.outcome, {this.message});
   final PurchaseOutcome outcome;
   final String? message;
+}
+
+/// What a Restore Purchases actually did, so the UI can tell "nothing to
+/// restore" apart from "restored and verified".
+class RestoreReport {
+  const RestoreReport({required this.delivered, required this.verified});
+
+  /// Transactions the store handed back.
+  final int delivered;
+
+  /// Of those, how many the server accepted.
+  final int verified;
+
+  bool get foundNothing => delivered == 0;
 }
 
 /// Wraps the platform billing clients: StoreKit on iOS, Google Play Billing
@@ -131,10 +150,14 @@ class SubscriptionService {
     FirebaseFunctions? functions,
     BillingStore? store,
     String? Function()? uidProvider,
+    VerifySender? verifySender,
   })  : _injectedIap = iap,
         _functions = functions,
         _injectedStore = store,
-        _uidProvider = uidProvider;
+        _uidProvider = uidProvider,
+        _verifySender = verifySender;
+
+  final VerifySender? _verifySender;
 
   /// Who is signed in, so a purchase can carry the account it was made for.
   final String? Function()? _uidProvider;
@@ -191,14 +214,23 @@ class SubscriptionService {
       (!kIsWeb && (Platform.isIOS || Platform.isAndroid));
 
   /// Starts listening for purchase updates. Safe to call more than once.
+  ///
+  /// Nothing can be verified without this: restored and completed purchases
+  /// both arrive on the store's stream, never as a return value.
   void listen() {
-    _subscription ??= _iap.purchaseStream.listen(
+    if (_subscription != null) {
+      debugPrint('[BILLING-IOS] listen: already attached');
+      return;
+    }
+    _subscription = _iap.purchaseStream.listen(
       _onPurchases,
       onError: (Object error) {
-        developer.log('purchase stream error: $error', name: 'billing');
+        debugPrint('[BILLING-IOS] purchase stream error: $error');
         _results.add(PurchaseResult(PurchaseOutcome.failed, message: '$error'));
       },
+      onDone: () => debugPrint('[BILLING-IOS] purchase stream closed'),
     );
+    debugPrint('[BILLING-IOS] listen: attached to the purchase stream');
   }
 
   /// What the last store query actually returned.
@@ -321,7 +353,50 @@ class SubscriptionService {
 
   /// Asks the store to replay past purchases; entitlement is then re-verified
   /// server-side exactly like a fresh purchase.
-  Future<void> restorePurchases() => _iap.restorePurchases();
+  ///
+  /// The store's own call returns as soon as IT is done — the transactions
+  /// arrive afterwards, on the purchase stream, and the backend call happens
+  /// later still. Reporting a result before that has been through says "no
+  /// subscription found" for a restore that is about to succeed, so this
+  /// waits for the stream, bounded, and reports what actually arrived.
+  Future<RestoreReport> restorePurchases() async {
+    _restoreDelivered = 0;
+    _restoreVerified = 0;
+    final settled = _restoreSettled = Completer<void>();
+    debugPrint('[BILLING-IOS] restore requested');
+    try {
+      await _iap.restorePurchases();
+    } catch (e) {
+      debugPrint('[BILLING-IOS] restore call failed: $e');
+    }
+    if (!settled.isCompleted) {
+      // Nothing to restore looks exactly like a slow store, so give up after
+      // a bounded wait rather than hanging the button.
+      await settled.future
+          .timeout(restoreSettleWindow, onTimeout: () {})
+          .catchError((_) {});
+    }
+    _restoreSettled = null;
+    final report =
+        RestoreReport(delivered: _restoreDelivered, verified: _restoreVerified);
+    debugPrint('[BILLING-IOS] restore finished delivered=${report.delivered} '
+        'verified=${report.verified}');
+    return report;
+  }
+
+  Future<void> _callVerify(Map<String, dynamic> payload) async {
+    await (_functions ?? FirebaseFunctions.instance)
+        .httpsCallable('verifySubscriptionPurchase')
+        .call<Map<String, dynamic>>(payload);
+  }
+
+  /// How long a restore waits for the store to deliver before concluding
+  /// there was nothing to restore.
+  static const Duration restoreSettleWindow = Duration(seconds: 10);
+
+  Completer<void>? _restoreSettled;
+  int _restoreDelivered = 0;
+  int _restoreVerified = 0;
 
   /// Opens the PLATFORM's own subscription management — Apple's subscriptions
   /// screen on iOS, Play's on Android. Sayvo never sends anyone to a web
@@ -344,7 +419,18 @@ class SubscriptionService {
   }
 
   Future<void> _onPurchases(List<PurchaseDetails> purchases) async {
+    debugPrint('[BILLING-IOS] purchases received: ${purchases.length}');
     for (final purchase in purchases) {
+      _restoreDelivered++;
+      // Product id and status are our own metadata. The verification data is
+      // the receipt and is never printed.
+      debugPrint(
+        '[BILLING-IOS] purchase productId=${purchase.productID} '
+        'status=${purchase.status.name} '
+        'hasPurchaseId=${purchase.purchaseID != null} '
+        'pendingComplete=${purchase.pendingCompletePurchase} '
+        'error=${purchase.error?.code ?? 'none'}',
+      );
       var settled = true;
       switch (purchase.status) {
         case PurchaseStatus.pending:
@@ -368,8 +454,13 @@ class SubscriptionService {
       // discarding a purchase somebody paid for.
       if (settled && purchase.pendingCompletePurchase) {
         await _iap.completePurchase(purchase);
+        debugPrint('[BILLING-IOS] transaction finished with the store');
+      } else if (!settled) {
+        debugPrint('[BILLING-IOS] transaction LEFT PENDING for redelivery');
       }
     }
+    // A restore only knows it is done once the stream has been through.
+    if (_restoreSettled?.isCompleted == false) _restoreSettled!.complete();
   }
 
   /// The payload sent for verification: an opaque store handle and nothing
@@ -390,20 +481,38 @@ class SubscriptionService {
   /// refused. A transient failure returns false so the transaction stays in
   /// the store's queue and is delivered again.
   Future<bool> _verify(PurchaseDetails purchase) async {
+    final payload = verificationPayload(purchase);
+    // The handle itself is a credential, so only its shape is printed.
+    final handleField = payload.containsKey('transactionId')
+        ? 'transactionId'
+        : 'purchaseToken';
+    final handle = payload[handleField];
+    debugPrint(
+      '[BILLING-IOS] verifying with the backend: store=${payload['store']} '
+      '$handleField=${handle is String ? '${handle.length} chars' : 'MISSING'}',
+    );
+    if (handle is! String || handle.isEmpty) {
+      // Nothing to verify with: sending this would be rejected anyway, and
+      // finishing it would throw away a purchase somebody paid for.
+      debugPrint('[BILLING-IOS] verification SKIPPED: no store handle');
+      _results.add(const PurchaseResult(PurchaseOutcome.failed,
+          message: 'That purchase is missing its store reference.'));
+      return false;
+    }
     try {
-      final callable = (_functions ?? FirebaseFunctions.instance)
-          .httpsCallable('verifySubscriptionPurchase');
-      await callable.call<Map<String, dynamic>>(verificationPayload(purchase));
+      await (_verifySender ?? _callVerify)(payload);
+      _restoreVerified++;
+      debugPrint('[BILLING-IOS] verification OK — entitlement granted');
       _results.add(const PurchaseResult(PurchaseOutcome.success));
       return true;
     } on FirebaseFunctionsException catch (e) {
-      developer.log('verification rejected: ${e.code} ${e.message}',
-          name: 'billing');
+      debugPrint('[BILLING-IOS] verification REJECTED code=${e.code} '
+          'message=${e.message}');
       _results.add(PurchaseResult(PurchaseOutcome.failed, message: e.message));
       // The server had an answer, and the answer was no.
       return e.code == 'permission-denied' || e.code == 'invalid-argument';
     } catch (e) {
-      developer.log('verification failed: $e', name: 'billing');
+      debugPrint('[BILLING-IOS] verification FAILED to reach the backend: $e');
       _results.add(PurchaseResult(PurchaseOutcome.failed, message: '$e'));
       return false;
     }

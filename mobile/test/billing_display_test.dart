@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:fake_cloud_firestore/fake_cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -38,6 +40,21 @@ class _FakeStore extends InAppPurchasePlatform {
   int queries = 0;
   Set<String>? lastRequested;
 
+  /// Transactions handed back to the app, as StoreKit does: on the stream,
+  /// after the restore call has already returned.
+  final StreamController<List<PurchaseDetails>> purchases =
+      StreamController<List<PurchaseDetails>>.broadcast();
+  void Function()? onRestore;
+  final List<String> completed = [];
+
+  @override
+  Future<void> restorePurchases({String? applicationUserName}) async =>
+      onRestore?.call();
+
+  @override
+  Future<void> completePurchase(PurchaseDetails purchase) async =>
+      completed.add(purchase.productID);
+
   @override
   Future<bool> isAvailable() async => available;
 
@@ -54,14 +71,21 @@ class _FakeStore extends InAppPurchasePlatform {
   }
 
   @override
-  Stream<List<PurchaseDetails>> get purchaseStream =>
-      const Stream<List<PurchaseDetails>>.empty();
+  Stream<List<PurchaseDetails>> get purchaseStream => purchases.stream;
 }
 
-SubscriptionService _serviceWith(_FakeStore store) {
+SubscriptionService _serviceWith(
+  _FakeStore store, {
+  void Function(Map<String, dynamic> payload)? onVerify,
+}) {
   InAppPurchasePlatform.instance = store;
   return SubscriptionService(
-      iap: InAppPurchase.instance, store: BillingStore.apple);
+    iap: InAppPurchase.instance,
+    store: BillingStore.apple,
+    verifySender: onVerify == null
+        ? null
+        : (payload) async => onVerify(payload),
+  );
 }
 
 /// Captures debugPrint so a test can assert what a TestFlight log would show.
@@ -241,6 +265,117 @@ void main() {
       final service = _serviceWith(store);
       await service.loadProducts();
       expect(store.queries, 1);
+    });
+  });
+
+  group('restore reaches the backend before it reports', () {
+    /// A store that hands back one restored transaction, the way StoreKit
+    /// does: asynchronously, after restorePurchases() has already returned.
+    _FakeStore restoringStore({Duration delay = const Duration(milliseconds: 20)}) {
+      final store = _FakeStore(products: const []);
+      store.onRestore = () {
+        Future<void>.delayed(delay, () {
+          store.purchases.add([
+            PurchaseDetails(
+              productID: kPlusProductId,
+              purchaseID: '2000000999',
+              verificationData: PurchaseVerificationData(
+                localVerificationData: 'local',
+                serverVerificationData: 'jws',
+                source: 'app_store',
+              ),
+              transactionDate: null,
+              status: PurchaseStatus.restored,
+            ),
+          ]);
+        });
+      };
+      return store;
+    }
+
+    test('waits for the delivered transaction instead of reporting first',
+        () async {
+      final store = restoringStore();
+      final verified = <Map<String, dynamic>>[];
+      final service = _serviceWith(store, onVerify: verified.add);
+      service.listen();
+
+      final report = await service.restorePurchases();
+
+      // The backend was called before the restore reported anything — the
+      // old code answered the user while this was still in flight.
+      expect(verified, hasLength(1));
+      expect(verified.single['store'], 'apple');
+      expect(verified.single['transactionId'], '2000000999');
+      expect(report.delivered, 1);
+      expect(report.verified, 1);
+      expect(report.foundNothing, isFalse);
+      await service.dispose();
+    });
+
+    test('an empty restore is reported as finding nothing', () async {
+      final store = _FakeStore(products: const []);
+      final service = _serviceWith(store);
+      service.listen();
+
+      final report = await service.restorePurchases();
+
+      expect(report.delivered, 0);
+      expect(report.foundNothing, isTrue);
+      await service.dispose();
+    });
+
+    test('a purchase with no store handle is never sent or finished',
+        () async {
+      // Verifying nothing would be refused, and finishing it would throw a
+      // paid subscription away.
+      final store = _FakeStore(products: const []);
+      store.onRestore = () {
+        store.purchases.add([
+          PurchaseDetails(
+            productID: kPlusProductId,
+            purchaseID: null,
+            verificationData: PurchaseVerificationData(
+              localVerificationData: '',
+              serverVerificationData: '',
+              source: 'app_store',
+            ),
+            transactionDate: null,
+            status: PurchaseStatus.restored,
+          ),
+        ]);
+      };
+      final verified = <Map<String, dynamic>>[];
+      final service = _serviceWith(store, onVerify: verified.add);
+      service.listen();
+
+      final report = await service.restorePurchases();
+
+      expect(verified, isEmpty);
+      expect(store.completed, isEmpty);
+      expect(report.verified, 0);
+      await service.dispose();
+    });
+
+    test('the log names what arrived, without any receipt data', () async {
+      final store = restoringStore();
+      final service = _serviceWith(store, onVerify: (_) {});
+      service.listen();
+
+      final lines = await _captureLogs(() async {
+        await service.restorePurchases();
+      });
+      final joined = lines.join('\n');
+
+      expect(joined, contains('restore requested'));
+      expect(joined, contains('purchase productId=$kPlusProductId'));
+      expect(joined, contains('status=restored'));
+      expect(joined, contains('verifying with the backend'));
+      expect(joined, contains('restore finished delivered=1'));
+      // The receipt itself must never be printed.
+      expect(joined, isNot(contains('jws')));
+      expect(joined, isNot(contains('local')));
+      await service.dispose();
     });
   });
 

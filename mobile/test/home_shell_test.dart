@@ -178,7 +178,8 @@ class _NoopSubscriptions extends SubscriptionService {
   @override
   Future<bool> loadProducts() async => false;
   @override
-  Future<void> restorePurchases() async {}
+  Future<RestoreReport> restorePurchases() async =>
+      const RestoreReport(delivered: 0, verified: 0);
 }
 
 class _ShellHarness {
