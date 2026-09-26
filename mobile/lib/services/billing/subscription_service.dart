@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:developer' as developer;
 import 'dart:io' show Platform;
 
 import 'package:cloud_functions/cloud_functions.dart';
@@ -118,6 +117,9 @@ class ProductQueryReport {
 /// as the usage meter's sender is.
 typedef VerifySender = Future<void> Function(Map<String, dynamic> payload);
 
+/// Opens a store's own web page. Injectable for the same reason.
+typedef UrlOpener = Future<bool> Function(Uri uri);
+
 class PurchaseResult {
   const PurchaseResult(this.outcome, {this.message});
   final PurchaseOutcome outcome;
@@ -152,13 +154,19 @@ class SubscriptionService {
     BillingStore? store,
     String? Function()? uidProvider,
     VerifySender? verifySender,
+    UrlOpener? openUrl,
   })  : _injectedIap = iap,
         _functions = functions,
         _injectedStore = store,
         _uidProvider = uidProvider,
-        _verifySender = verifySender;
+        _verifySender = verifySender,
+        _openUrl = openUrl;
 
   final VerifySender? _verifySender;
+
+  /// How a store's own web page is opened, injectable so the fallback path is
+  /// testable without a platform plugin.
+  final UrlOpener? _openUrl;
 
   /// Who is signed in, so a purchase can carry the account it was made for.
   final String? Function()? _uidProvider;
@@ -440,11 +448,32 @@ class SubscriptionService {
   int _restoreDelivered = 0;
   int _restoreVerified = 0;
 
-  /// Opens the PLATFORM's own subscription management — Apple's subscriptions
-  /// screen on iOS, Play's on Android. Sayvo never sends anyone to a web
-  /// checkout or a third-party billing portal.
+  /// StoreKit's own management sheet, on a channel of its own — the app_info
+  /// channel above is temporary, this is not.
+  static const MethodChannel _billing =
+      MethodChannel('app.livetranslator/billing');
+
+  /// Opens the PLATFORM's own subscription management — StoreKit's native sheet
+  /// on iOS, Play's subscriptions page on Android. Sayvo never sends anyone to
+  /// a web checkout or a third-party billing portal.
+  ///
+  /// iOS goes through StoreKit rather than apps.apple.com because that URL only
+  /// ever shows the PRODUCTION App Store account. A TestFlight or Sandbox
+  /// subscription is simply absent from it, so a tester who taps Manage
+  /// Subscription is shown a list their Sayvo plan is not in.
+  /// `AppStore.showManageSubscriptions(in:)` shows whichever environment the
+  /// app is actually running in — Sandbox under TestFlight, Production from the
+  /// App Store — which is the same one the purchase was made in.
+  ///
+  /// The URL survives only as a fallback for when the native call cannot run.
   Future<bool> openManageSubscription({String? productId}) async {
     if (kIsWeb) return false;
+    // Only a FAILED native call falls through to the URL. A sheet that was
+    // shown and dismissed is a success, not something to follow with a
+    // browser.
+    if (store == BillingStore.apple && await _showNativeManageSheet()) {
+      return true;
+    }
     final uri = store == BillingStore.apple
         ? Uri.parse('https://apps.apple.com/account/subscriptions')
         : Uri.parse(
@@ -453,9 +482,31 @@ class SubscriptionService {
             '${productId == null ? '' : '&sku=$productId'}',
           );
     try {
-      return await launchUrl(uri, mode: LaunchMode.externalApplication);
+      return await (_openUrl ?? _launchExternal)(uri);
     } catch (e) {
-      developer.log('could not open subscription management: $e', name: 'billing');
+      debugPrint('[BILLING-IOS] could not open subscription management: $e');
+      return false;
+    }
+  }
+
+  static Future<bool> _launchExternal(Uri uri) =>
+      launchUrl(uri, mode: LaunchMode.externalApplication);
+
+  /// Asks StoreKit to present its management sheet. Returns false rather than
+  /// throwing when it cannot — a build without the native handler, no
+  /// foreground window scene, or a StoreKit error — so the caller can fall
+  /// back instead of leaving the user with a dead button.
+  ///
+  /// This suspends until the sheet is dismissed, which is why the button treats
+  /// it as fire-and-forget.
+  Future<bool> _showNativeManageSheet() async {
+    try {
+      final shown = await _billing.invokeMethod<bool>('showManageSubscriptions');
+      debugPrint('[BILLING-IOS] native manage sheet shown=$shown');
+      return shown ?? false;
+    } catch (e) {
+      debugPrint('[BILLING-IOS] native manage sheet unavailable: $e — '
+          'falling back to the App Store URL');
       return false;
     }
   }

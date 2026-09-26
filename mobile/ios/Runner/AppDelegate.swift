@@ -1,5 +1,6 @@
 import AVFoundation
 import Flutter
+import StoreKit
 import UIKit
 
 /// Native audio for Sayvo: environmental microphone capture
@@ -54,6 +55,25 @@ import UIKit
       switch call.method {
       case "bundleId":
         result(Bundle.main.bundleIdentifier)
+      default:
+        result(FlutterMethodNotImplemented)
+      }
+    }
+
+    // Subscription management. Deliberately NOT the apps.apple.com URL: that
+    // page only ever lists the PRODUCTION App Store account, so a TestFlight or
+    // Sandbox subscription cannot appear on it. StoreKit's own sheet shows
+    // whichever environment the app is running in, which is the one the
+    // purchase was actually made in.
+    //
+    // Purchase and verification stay entirely in the Dart/`in_app_purchase`
+    // path — this presents a sheet and nothing else.
+    let billing = FlutterMethodChannel(
+      name: "app.livetranslator/billing", binaryMessenger: messenger)
+    billing.setMethodCallHandler { call, result in
+      switch call.method {
+      case "showManageSubscriptions":
+        AppDelegate.showManageSubscriptions(result: result)
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -137,6 +157,47 @@ import UIKit
         result(FlutterMethodNotImplemented)
       }
     }
+  }
+
+  /// Presents StoreKit's subscription management sheet for the environment the
+  /// app is running in (Sandbox under TestFlight, Production from the App
+  /// Store), reporting `true` once it has been shown and dismissed.
+  ///
+  /// Every failure comes back as a FlutterError so Dart can fall back to the
+  /// App Store URL rather than leave the button doing nothing. The result is
+  /// delivered exactly once, on the main thread.
+  private static func showManageSubscriptions(result: @escaping FlutterResult) {
+    Task { @MainActor in
+      guard let scene = AppDelegate.activeWindowScene() else {
+        print("[LT-NATIVE] MANAGE_SUBSCRIPTIONS no window scene")
+        result(
+          FlutterError(
+            code: "no_window_scene",
+            message: "No active UIWindowScene to present the sheet in", details: nil))
+        return
+      }
+      do {
+        try await AppStore.showManageSubscriptions(in: scene)
+        print("[LT-NATIVE] MANAGE_SUBSCRIPTIONS sheet shown")
+        result(true)
+      } catch {
+        // Typically the simulator without a StoreKit configuration, or a
+        // StoreKit error. Nothing here identifies the customer or the purchase.
+        print("[LT-NATIVE] MANAGE_SUBSCRIPTIONS failed: \(error.localizedDescription)")
+        result(
+          FlutterError(
+            code: "storekit_unavailable", message: error.localizedDescription, details: nil))
+      }
+    }
+  }
+
+  /// The scene to present in. Prefers the foreground one; a single-window app
+  /// has exactly one, but ordering is not promised, so it is chosen rather than
+  /// assumed.
+  @MainActor
+  private static func activeWindowScene() -> UIWindowScene? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
   }
 
   /// AVAudioSession.recordPermission mirrors AVAudioApplication on iOS 17+;

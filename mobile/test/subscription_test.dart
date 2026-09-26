@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:fake_cloud_firestore/fake_cloud_firestore.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:live_translator/features/subscription/paywall_screen.dart';
@@ -466,6 +467,110 @@ void main() {
           BillingStore.apple);
       expect(SubscriptionService(store: BillingStore.google).store,
           BillingStore.google);
+    });
+  });
+
+  // ── Managing an existing subscription ─────────────────────────────────────
+
+  group('manage subscription', () {
+    // Named, not referenced: a mock handler is keyed by channel NAME, so this
+    // asserts the channel the service actually talks on.
+    const channel = MethodChannel('app.livetranslator/billing');
+    late List<MethodCall> nativeCalls;
+    late List<Uri> opened;
+
+    setUp(() {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      nativeCalls = <MethodCall>[];
+      opened = <Uri>[];
+    });
+
+    /// Stands in for the native side. [answer] is what
+    /// `showManageSubscriptions` returns, or a throw for a native failure.
+    void mockNative(Object? Function() answer) {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        nativeCalls.add(call);
+        return answer();
+      });
+      addTearDown(() => TestDefaultBinaryMessengerBinding
+          .instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null));
+    }
+
+    SubscriptionService serviceFor(BillingStore store) => SubscriptionService(
+          store: store,
+          openUrl: (uri) async {
+            opened.add(uri);
+            return true;
+          },
+        );
+
+    test('iOS asks StoreKit for its own sheet, not a URL', () async {
+      mockNative(() => true);
+
+      final shown =
+          await serviceFor(BillingStore.apple).openManageSubscription();
+
+      expect(shown, isTrue);
+      expect(nativeCalls.single.method, 'showManageSubscriptions');
+      // The apps.apple.com page shows the PRODUCTION account only, which is
+      // why a TestFlight tester could not find their plan there.
+      expect(opened, isEmpty);
+    });
+
+    test('a StoreKit failure falls back to the App Store URL', () async {
+      mockNative(() => throw PlatformException(code: 'storekit_unavailable'));
+
+      final shown =
+          await serviceFor(BillingStore.apple).openManageSubscription();
+
+      expect(nativeCalls, hasLength(1));
+      expect(shown, isTrue, reason: 'the fallback still opened something');
+      expect(opened.single.host, 'apps.apple.com');
+    });
+
+    test('no window scene to present in falls back too', () async {
+      mockNative(() => false);
+
+      await serviceFor(BillingStore.apple).openManageSubscription();
+
+      expect(opened.single.host, 'apps.apple.com');
+    });
+
+    test('a build without the native handler falls back', () async {
+      // No mock at all: the channel answers as unimplemented, exactly as an
+      // older binary would.
+      final shown =
+          await serviceFor(BillingStore.apple).openManageSubscription();
+
+      expect(shown, isTrue);
+      expect(opened.single.host, 'apps.apple.com');
+    });
+
+    test('both fallbacks failing reports failure rather than throwing',
+        () async {
+      mockNative(() => false);
+      final service = SubscriptionService(
+        store: BillingStore.apple,
+        openUrl: (_) async => throw Exception('no browser'),
+      );
+
+      expect(await service.openManageSubscription(), isFalse);
+    });
+
+    test('Android never touches the StoreKit channel', () async {
+      mockNative(() => true);
+
+      final shown = await serviceFor(BillingStore.google)
+          .openManageSubscription(productId: kPlusProductId);
+
+      expect(shown, isTrue);
+      expect(nativeCalls, isEmpty, reason: 'there is no StoreKit on Android');
+      expect(opened.single.host, 'play.google.com');
+      expect(opened.single.queryParameters['sku'], kPlusProductId);
+      expect(opened.single.queryParameters['package'],
+          'com.livetranslator.live_translator');
     });
   });
 
