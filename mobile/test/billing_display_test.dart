@@ -53,6 +53,18 @@ class _FakeStore extends InAppPurchasePlatform {
   Future<void> restorePurchases({String? applicationUserName}) async =>
       onRestore?.call();
 
+  /// The store accepts the request; whether it ever delivers anything back is
+  /// up to the test, which is the distinction this file exists to make.
+  bool buyThrows = false;
+  final List<String> bought = [];
+
+  @override
+  Future<bool> buyNonConsumable({required PurchaseParam purchaseParam}) async {
+    if (buyThrows) throw Exception('store refused');
+    bought.add(purchaseParam.productDetails.id);
+    return true;
+  }
+
   @override
   Future<void> completePurchase(PurchaseDetails purchase) async {
     onComplete?.call();
@@ -523,6 +535,152 @@ void main() {
       // A missing deployment must not be dressed up as a refused purchase.
       expect(messages.single, isNot(contains('could not be verified')));
       expect(messages.single, contains('not-found'));
+      await service.dispose();
+    });
+  });
+
+  group('the diagnostics screen sees each step', () {
+    PurchaseDetails tx(PurchaseStatus status, {String? id = '2000000999'}) =>
+        PurchaseDetails(
+          productID: kPlusProductId,
+          purchaseID: id,
+          verificationData: PurchaseVerificationData(
+            localVerificationData: 'local',
+            serverVerificationData: 'jws',
+            source: 'app_store',
+          ),
+          transactionDate: null,
+          status: status,
+        )..pendingCompletePurchase = true;
+
+    Future<void> deliver(_FakeStore store, PurchaseDetails purchase) async {
+      store.purchases.add([purchase]);
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    }
+
+    test('nothing attempted yet reads as nothing attempted', () {
+      final service = _serviceWith(_FakeStore());
+      expect(service.diagnostics.value.listenerAttached, isFalse);
+      expect(service.diagnostics.value.stoppedAt,
+          contains('never listened for purchases'));
+    });
+
+    test('attaching the listener is recorded', () async {
+      final service = _serviceWith(_FakeStore())..listen();
+      expect(service.diagnostics.value.listenerAttached, isTrue);
+      await service.dispose();
+    });
+
+    test('a delivered purchase records status, product and id', () async {
+      final store = _FakeStore();
+      final service = _serviceWith(store, onVerify: (_) {})..listen();
+
+      await deliver(store, tx(PurchaseStatus.purchased));
+
+      final d = service.diagnostics.value;
+      expect(d.purchaseReceived, isTrue);
+      expect(d.purchaseStatus, 'purchased');
+      expect(d.productId, kPlusProductId);
+      expect(d.purchaseIdExists, isTrue);
+      expect(d.callableCalled, isTrue);
+      expect(d.callableResult, 'success');
+      expect(d.stoppedAt, contains('granted'));
+      await service.dispose();
+    });
+
+    test('a callable failure records code, message and details', () async {
+      final store = _FakeStore();
+      final service = _serviceWith(store,
+          onVerify: (_) => throw FirebaseFunctionsException(
+                code: 'not-found',
+                message: 'NOT_FOUND',
+                details: const {'hint': 'function missing'},
+              ))
+        ..listen();
+
+      await deliver(store, tx(PurchaseStatus.purchased));
+
+      final d = service.diagnostics.value;
+      expect(d.callableCalled, isTrue);
+      expect(d.callableResult, 'failure');
+      expect(d.errorCode, 'not-found');
+      expect(d.errorMessage, 'NOT_FOUND');
+      expect(d.errorDetails, contains('function missing'));
+      expect(d.stoppedAt, contains('answered with an error'));
+      await service.dispose();
+    });
+
+    test('a missing purchase id says so instead of blaming the backend',
+        () async {
+      final store = _FakeStore();
+      final sent = <Map<String, dynamic>>[];
+      final service = _serviceWith(store, onVerify: sent.add)..listen();
+
+      await deliver(store, tx(PurchaseStatus.purchased, id: null));
+
+      final d = service.diagnostics.value;
+      expect(sent, isEmpty);
+      expect(d.callableCalled, isFalse);
+      expect(d.purchaseIdExists, isFalse);
+      expect(d.clientReason, contains('missing_purchase_id'));
+      expect(d.stoppedAt, contains('without a transaction id'));
+      await service.dispose();
+    });
+
+    test('a status that skips verification explains itself', () async {
+      final store = _FakeStore();
+      final sent = <Map<String, dynamic>>[];
+      final service = _serviceWith(store, onVerify: sent.add)..listen();
+
+      await deliver(store, tx(PurchaseStatus.canceled));
+
+      final d = service.diagnostics.value;
+      expect(sent, isEmpty);
+      expect(d.callableCalled, isFalse);
+      // The screen must not imply the backend refused something it never saw.
+      expect(d.clientReason, contains('CANCELLED'));
+      expect(d.stoppedAt, isNot(contains('backend')));
+      await service.dispose();
+    });
+
+    test('a purchase requested but never delivered is visible as such',
+        () async {
+      final store = _FakeStore(
+          products: [_product(kPlusProductId, '£17.99', 17.99)]);
+      final service = _serviceWith(store)..listen();
+      await service.loadProducts();
+
+      await service.buy(service.productFor(SayvoPlan.plus)!);
+
+      final d = service.diagnostics.value;
+      expect(d.buyRequested, isTrue);
+      expect(d.buyProductId, kPlusProductId);
+      expect(d.purchaseReceived, isFalse);
+      // This is the case that looked identical to every other failure.
+      expect(d.stoppedAt, contains('never delivered'));
+      await service.dispose();
+    });
+
+    test('a new attempt starts a clean trace', () async {
+      final store = _FakeStore(
+          products: [_product(kPlusProductId, '£17.99', 17.99)]);
+      final service = _serviceWith(store,
+          onVerify: (_) => throw FirebaseFunctionsException(
+              code: 'unavailable', message: 'down'))
+        ..listen();
+      await service.loadProducts();
+
+      await deliver(store, tx(PurchaseStatus.purchased));
+      expect(service.diagnostics.value.errorCode, 'unavailable');
+
+      await service.buy(service.productFor(SayvoPlan.plus)!);
+
+      // Stale values from the previous attempt would be worse than none.
+      final d = service.diagnostics.value;
+      expect(d.errorCode, isNull);
+      expect(d.callableResult, isNull);
+      expect(d.purchaseReceived, isFalse);
+      expect(d.listenerAttached, isTrue, reason: 'still listening');
       await service.dispose();
     });
   });

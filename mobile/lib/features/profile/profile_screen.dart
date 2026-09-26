@@ -12,6 +12,7 @@ import '../../widgets/components/glass_card.dart';
 import '../../widgets/components/language_selector_sheet.dart';
 import '../../widgets/components/profile_menu_tile.dart';
 import '../settings/privacy_policy_screen.dart';
+import '../subscription/billing_diagnostics_screen.dart';
 import '../subscription/subscription_card.dart';
 
 /// Profile: identity, translation preferences, privacy & data, appearance,
@@ -68,6 +69,19 @@ class ProfileScreen extends StatelessWidget {
         // ── Plan ────────────────────────────────────────────────────────────
         const _SectionLabel('Plan'),
         const SubscriptionCard(),
+        const SizedBox(height: 8),
+        // TEMPORARY, while billing is being brought up: a TestFlight build
+        // has no console, so this is the only way to see where a purchase
+        // stops. Remove it once purchases verify reliably.
+        AppGlassCard(
+          padding: EdgeInsets.zero,
+          child: ProfileMenuTile(
+            icon: Icons.receipt_long_rounded,
+            title: 'Billing Diagnostics',
+            subtitle: 'Temporary — shows where a purchase stopped',
+            onTap: () => BillingDiagnosticsScreen.show(context),
+          ),
+        ),
         const SizedBox(height: 16),
 
         // ── Translation ─────────────────────────────────────────────────────
