@@ -16,7 +16,7 @@ import {
 } from "./store.js";
 import { FREE_LIFETIME_MS, MS_PER_MINUTE, PRODUCT_IDS } from "./plans.js";
 import { REPORT_SLACK_MS, SESSION_STALE_SECONDS } from "./usage.js";
-import { VerifiedSubscription } from "./entitlement.js";
+import { VerifiedSubscription, accessFor } from "./entitlement.js";
 
 /**
  * A minimal in-memory stand-in for the Admin SDK surface this module uses.
@@ -445,6 +445,20 @@ describe("who owns a purchase", () => {
     expect(entitlementDoc("u2")).toBeUndefined();
   });
 
+  it("the refusal names both accounts, so a log can explain itself", async () => {
+    // Easy to hit in testing: a sandbox Apple ID reused after a reinstall
+    // keeps its original transaction id, so a new Firebase account looks like
+    // a second claimant on the same purchase.
+    await applyVerified("owner-uid", verified(), NOW);
+    await expect(
+      applyVerified("caller-uid", verified({ eventId: "txn-2" }), NOW + MINUTE),
+    ).rejects.toMatchObject({
+      name: "PurchaseOwnershipError",
+      ownerUid: "owner-uid",
+      callerUid: "caller-uid",
+    });
+  });
+
   it("a second account cannot claim the same Play purchase token", async () => {
     const play = verified({ store: "google", handle: "play-token-xyz" });
     await applyVerified("u1", play, NOW);
@@ -581,5 +595,30 @@ describe("reading an entitlement", () => {
     expect(entitlement.freeUsedMs).toBe(0);
     // Reading must not create the document — only a real session does.
     expect(fake.data.size).toBe(0);
+  });
+
+  // A read must never be refused. getEntitlement is how the app learns it is
+  // on the free tier, so a throw here would lock somebody out of the very
+  // answer that unblocks them.
+  it("never throws for an account with no document", async () => {
+    await expect(readEntitlement("nobody", NOW)).resolves.toBeDefined();
+  });
+
+  it("never throws for a lapsed subscription", async () => {
+    await applyVerified("u1", verified(), NOW);
+    const lapsed = NOW + 60 * 24 * 60 * MINUTE;
+    const entitlement = await readEntitlement("u1", lapsed);
+    expect(entitlement.plan).toBe("plus");
+    // The plan is remembered, but it grants nothing any more.
+    expect(accessFor(entitlement, lapsed).source).toBe("free");
+  });
+
+  it("never throws for a purchase owned by somebody else", async () => {
+    // Reading is not claiming: another account owning the purchase has no
+    // bearing on what THIS account is allowed to read about itself.
+    await applyVerified("u1", verified(), NOW);
+    await expect(readEntitlement("u2", NOW)).resolves.toMatchObject({
+      plan: "free",
+    });
   });
 });

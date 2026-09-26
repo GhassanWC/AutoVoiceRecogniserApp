@@ -319,7 +319,15 @@ export const verifySubscriptionPurchase = onCall(
       if (error instanceof PurchaseOwnershipError) {
         // One subscription, one Sayvo account. Whoever claimed it first keeps
         // it; everybody else is told plainly rather than silently granted.
-        logger.warn("purchase claimed by another account", { uid, store });
+        logger.warn("verifySubscriptionPurchase denied", {
+          reason: "purchase-already-owned-by-another-account",
+          store,
+          callerUid: error.callerUid,
+          ownerUid: error.ownerUid,
+          hint: "the same store purchase was already claimed by a different "
+            + "Sayvo account; clearing subscriptionOwners for it releases the "
+            + "claim if that was a test account",
+        });
         throw new HttpsError("permission-denied", error.message);
       }
       if (error instanceof BillingConfigError) {
@@ -333,7 +341,8 @@ export const verifySubscriptionPurchase = onCall(
       if (error instanceof BillingVerificationError) {
         // "rejected" on its own says nothing actionable; carry the store and
         // the classified reason so a log reader knows which check failed.
-        logger.warn("purchase verification rejected", {
+        logger.warn("verifySubscriptionPurchase denied", {
+          reason: "store-verification-failed",
           uid,
           store,
           ...describeAppleError(error),
@@ -363,8 +372,22 @@ export const getEntitlement = onCall(
     }
     const now = Date.now();
     const uid = request.auth.uid;
+    // This handler NEVER denies a read. A missing document, a lapsed
+    // subscription, a failed store re-check and an account that never bought
+    // anything all resolve to the free tier — the only thing that stops it is
+    // not being signed in, which is handled above. The outcome is logged so
+    // that is provable from the logs rather than asserted here.
     const stored = await readEntitlement(uid, now);
-    return summarize(await refreshLapsedFromStore(uid, stored, now), now);
+    const entitlement = await refreshLapsedFromStore(uid, stored, now);
+    const summary = summarize(entitlement, now);
+    logger.info("getEntitlement served", {
+      uid,
+      plan: summary.plan,
+      allowanceSource: summary.allowanceSource,
+      allowed: summary.allowed,
+      hadStoredDocument: stored.storeHandle !== null,
+    });
+    return summary;
   },
 );
 

@@ -35,9 +35,21 @@ export const ENTITLEMENTS = "entitlements";
 export const USAGE_SESSIONS = "usageSessions";
 export const SUBSCRIPTION_OWNERS = "subscriptionOwners";
 
-/** Raised when a purchase already belongs to a different account. */
+/**
+ * Raised when a purchase already belongs to a different account.
+ *
+ * Carries both accounts so the refusal can be logged as what it is — one
+ * subscription, two accounts — rather than as a generic denial. It is easy to
+ * hit while testing: a sandbox Apple ID reused after a reinstall keeps its
+ * original transaction id, so if the Firebase account changed in between, the
+ * second account is refused a purchase that looks like its own.
+ */
 export class PurchaseOwnershipError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly ownerUid: string,
+    readonly callerUid: string,
+  ) {
     super(message);
     this.name = "PurchaseOwnershipError";
   }
@@ -138,7 +150,10 @@ export async function applyVerified(
     const owner = ownerSnapshot.data();
     if (owner && owner.uid !== uid) {
       throw new PurchaseOwnershipError(
-        "That subscription is already attached to another Sayvo account.",
+        "That subscription is already attached to another Sayvo account. "
+          + "Sign in with the account that bought it, or contact support.",
+        String(owner.uid),
+        uid,
       );
     }
 
