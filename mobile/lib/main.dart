@@ -51,7 +51,12 @@ Future<void> main() async {
   authController.addListener(() => entitlements.bind(authController.uid));
 
   final subscriptions =
-      SubscriptionService(uidProvider: () => authController.uid)..listen();
+      SubscriptionService(uidProvider: () => authController.uid);
+  // A verified purchase re-reads the authoritative entitlement BEFORE the
+  // store transaction is finished, so the plan is in hand first.
+  subscriptions.onVerified = entitlements.refresh;
+  subscriptions.logStartupDiagnostics();
+  subscriptions.listen();
 
   final liveController = LiveTranslationController(
     settings: settings,

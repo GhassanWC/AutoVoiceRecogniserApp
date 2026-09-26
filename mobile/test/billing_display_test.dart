@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:fake_cloud_firestore/fake_cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -45,6 +46,7 @@ class _FakeStore extends InAppPurchasePlatform {
   final StreamController<List<PurchaseDetails>> purchases =
       StreamController<List<PurchaseDetails>>.broadcast();
   void Function()? onRestore;
+  void Function()? onComplete;
   final List<String> completed = [];
 
   @override
@@ -52,8 +54,10 @@ class _FakeStore extends InAppPurchasePlatform {
       onRestore?.call();
 
   @override
-  Future<void> completePurchase(PurchaseDetails purchase) async =>
-      completed.add(purchase.productID);
+  Future<void> completePurchase(PurchaseDetails purchase) async {
+    onComplete?.call();
+    completed.add(purchase.productID);
+  }
 
   @override
   Future<bool> isAvailable() async => available;
@@ -370,11 +374,155 @@ void main() {
       expect(joined, contains('restore requested'));
       expect(joined, contains('purchase productId=$kPlusProductId'));
       expect(joined, contains('status=restored'));
-      expect(joined, contains('verifying with the backend'));
+      expect(joined, contains('calling verifySubscriptionPurchase'));
       expect(joined, contains('restore finished delivered=1'));
       // The receipt itself must never be printed.
       expect(joined, isNot(contains('jws')));
       expect(joined, isNot(contains('local')));
+      await service.dispose();
+    });
+  });
+
+  group('a transaction is only finished once the backend grants it', () {
+    PurchaseDetails delivered(
+      PurchaseStatus status, {
+      String? purchaseId = '2000000999',
+    }) =>
+        PurchaseDetails(
+          productID: kPlusProductId,
+          purchaseID: purchaseId,
+          verificationData: PurchaseVerificationData(
+            localVerificationData: 'local',
+            serverVerificationData: 'jws',
+            source: 'app_store',
+          ),
+          transactionDate: null,
+          status: status,
+        )..pendingCompletePurchase = true;
+
+    /// Pushes one transaction at the service and waits for it to be handled.
+    Future<void> deliver(_FakeStore store, PurchaseDetails purchase) async {
+      store.purchases.add([purchase]);
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    }
+
+    test('a purchased transaction calls the callable', () async {
+      final store = _FakeStore();
+      final sent = <Map<String, dynamic>>[];
+      final service = _serviceWith(store, onVerify: sent.add)..listen();
+
+      await deliver(store, delivered(PurchaseStatus.purchased));
+
+      expect(sent, hasLength(1));
+      expect(sent.single['store'], 'apple');
+      expect(sent.single['transactionId'], '2000000999');
+      await service.dispose();
+    });
+
+    test('a restored transaction calls the callable', () async {
+      final store = _FakeStore();
+      final sent = <Map<String, dynamic>>[];
+      final service = _serviceWith(store, onVerify: sent.add)..listen();
+
+      await deliver(store, delivered(PurchaseStatus.restored));
+
+      expect(sent, hasLength(1));
+      expect(sent.single['transactionId'], '2000000999');
+      await service.dispose();
+    });
+
+    test('a null purchase id is never sent and never finished', () async {
+      final store = _FakeStore();
+      final sent = <Map<String, dynamic>>[];
+      final service = _serviceWith(store, onVerify: sent.add)..listen();
+
+      await deliver(store, delivered(PurchaseStatus.purchased, purchaseId: null));
+
+      expect(sent, isEmpty);
+      expect(store.completed, isEmpty,
+          reason: 'finishing it would destroy a paid purchase');
+      await service.dispose();
+    });
+
+    test('a network failure leaves the transaction unfinished', () async {
+      final store = _FakeStore();
+      final service = _serviceWith(store,
+          onVerify: (_) => throw Exception('SocketException: no route'))
+        ..listen();
+
+      await deliver(store, delivered(PurchaseStatus.purchased));
+
+      expect(store.completed, isEmpty);
+      await service.dispose();
+    });
+
+    for (final code in ['unauthenticated', 'not-found', 'unavailable']) {
+      test('a $code callable failure leaves the transaction unfinished',
+          () async {
+        // App Check, auth and a missing deployment are all OUR problem, not
+        // the user's — the purchase must survive them.
+        final store = _FakeStore();
+        final service = _serviceWith(store,
+            onVerify: (_) =>
+                throw FirebaseFunctionsException(code: code, message: code))
+          ..listen();
+
+        await deliver(store, delivered(PurchaseStatus.purchased));
+
+        expect(store.completed, isEmpty);
+        await service.dispose();
+      });
+    }
+
+    test('even an outright backend rejection leaves it unfinished', () async {
+      // This is what consumed a real purchase: "permission-denied" was read as
+      // a final answer and the transaction was finished, so the store never
+      // offered it again and the money was gone.
+      final store = _FakeStore();
+      final service = _serviceWith(store,
+          onVerify: (_) => throw FirebaseFunctionsException(
+              code: 'permission-denied',
+              message: 'Purchase could not be verified.'))
+        ..listen();
+
+      await deliver(store, delivered(PurchaseStatus.purchased));
+
+      expect(store.completed, isEmpty);
+      await service.dispose();
+    });
+
+    test('a granted purchase refreshes the entitlement, THEN finishes',
+        () async {
+      final store = _FakeStore();
+      final order = <String>[];
+      final service = _serviceWith(store, onVerify: (_) => order.add('verify'))
+        ..onVerified = (() async => order.add('refresh'))
+        ..listen();
+      store.onComplete = () => order.add('complete');
+
+      await deliver(store, delivered(PurchaseStatus.purchased));
+
+      // The plan must be in hand before the store lets go of the transaction.
+      expect(order, ['verify', 'refresh', 'complete']);
+      expect(store.completed, [kPlusProductId]);
+      await service.dispose();
+    });
+
+    test('only a real rejection says the purchase could not be verified',
+        () async {
+      final store = _FakeStore();
+      final messages = <String?>[];
+      final service = _serviceWith(store,
+          onVerify: (_) => throw FirebaseFunctionsException(
+              code: 'not-found', message: 'NOT_FOUND'))
+        ..listen();
+      service.results.listen((r) => messages.add(r.message));
+
+      await deliver(store, delivered(PurchaseStatus.purchased));
+
+      // A missing deployment must not be dressed up as a refused purchase.
+      expect(messages.single, isNot(contains('could not be verified')));
+      expect(messages.single, contains('not-found'));
       await service.dispose();
     });
   });

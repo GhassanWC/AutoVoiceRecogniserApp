@@ -3,6 +3,7 @@ import 'dart:developer' as developer;
 import 'dart:io' show Platform;
 
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart'
     show debugPrint, kIsWeb, visibleForTesting;
 import 'package:flutter/services.dart' show MethodChannel;
@@ -230,7 +231,7 @@ class SubscriptionService {
       },
       onDone: () => debugPrint('[BILLING-IOS] purchase stream closed'),
     );
-    debugPrint('[BILLING-IOS] listen: attached to the purchase stream');
+    debugPrint('[BILLING-IOS] purchase listener attached');
   }
 
   /// What the last store query actually returned.
@@ -384,10 +385,42 @@ class SubscriptionService {
     return report;
   }
 
+  /// The region the billing callables are deployed to. Stated explicitly
+  /// rather than relying on the default, so the app and the deployment cannot
+  /// silently disagree about where the function lives.
+  static const String functionsRegion = 'us-central1';
+
+  /// The Firebase project this build actually talks to. Best effort: without
+  /// an initialized app (tests) it reports unknown rather than throwing.
+  static String firebaseProjectId() {
+    try {
+      return Firebase.app().options.projectId;
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
   Future<void> _callVerify(Map<String, dynamic> payload) async {
-    await (_functions ?? FirebaseFunctions.instance)
+    final functions = _functions ??
+        FirebaseFunctions.instanceFor(
+          app: Firebase.app(),
+          region: functionsRegion,
+        );
+    await functions
         .httpsCallable('verifySubscriptionPurchase')
         .call<Map<String, dynamic>>(payload);
+  }
+
+  /// Re-reads the authoritative entitlement after the backend accepts a
+  /// purchase, before the transaction is finished with the store. Wired to
+  /// EntitlementController.refresh in main.dart.
+  Future<void> Function()? onVerified;
+
+  /// One line at startup naming the project and region this build will call,
+  /// so a mismatch is visible in a TestFlight log instead of inferred.
+  void logStartupDiagnostics() {
+    debugPrint('[BILLING-IOS] firebaseProject=${firebaseProjectId()}');
+    debugPrint('[BILLING-IOS] functionsRegion=$functionsRegion');
   }
 
   /// How long a restore waits for the store to deliver before concluding
@@ -480,43 +513,94 @@ class SubscriptionService {
   /// Returns whether the purchase is SETTLED: verified, or definitively
   /// refused. A transient failure returns false so the transaction stays in
   /// the store's queue and is delivered again.
+  /// Returns true ONLY when the backend positively granted the entitlement.
+  ///
+  /// Every other outcome — a missing transaction id, a network failure, App
+  /// Check, auth, or a rejection — returns false, which leaves the StoreKit
+  /// transaction unfinished so the store delivers it again. Finishing a
+  /// transaction the backend never accepted destroys a purchase somebody paid
+  /// for, and there is no way to get it back.
   Future<bool> _verify(PurchaseDetails purchase) async {
     final payload = verificationPayload(purchase);
-    // The handle itself is a credential, so only its shape is printed.
-    final handleField = payload.containsKey('transactionId')
-        ? 'transactionId'
-        : 'purchaseToken';
-    final handle = payload[handleField];
     debugPrint(
-      '[BILLING-IOS] verifying with the backend: store=${payload['store']} '
-      '$handleField=${handle is String ? '${handle.length} chars' : 'MISSING'}',
+      '[BILLING-IOS] verify start project=${firebaseProjectId()} '
+      'region=$functionsRegion status=${purchase.status.name} '
+      'productId=${purchase.productID} '
+      'hasPurchaseId=${purchase.purchaseID != null}',
     );
+
+    final handleField =
+        payload.containsKey('transactionId') ? 'transactionId' : 'purchaseToken';
+    final handle = payload[handleField];
     if (handle is! String || handle.isEmpty) {
-      // Nothing to verify with: sending this would be rejected anyway, and
-      // finishing it would throw away a purchase somebody paid for.
-      debugPrint('[BILLING-IOS] verification SKIPPED: no store handle');
-      _results.add(const PurchaseResult(PurchaseOutcome.failed,
-          message: 'That purchase is missing its store reference.'));
+      // Nothing to verify with. Reported visibly and left UNFINISHED.
+      debugPrint('[BILLING-IOS] missing_purchase_id — transaction left pending');
+      _results.add(const PurchaseResult(
+        PurchaseOutcome.failed,
+        message: 'missing_purchase_id: the store gave no transaction id.',
+      ));
       return false;
     }
+    // The handle is a credential; only its shape is printed.
+    debugPrint('[BILLING-IOS] calling verifySubscriptionPurchase '
+        'store=${payload['store']} $handleField=${handle.length} chars');
+
     try {
       await (_verifySender ?? _callVerify)(payload);
       _restoreVerified++;
-      debugPrint('[BILLING-IOS] verification OK — entitlement granted');
+      debugPrint('[BILLING-IOS] callable OK — backend granted the entitlement');
+      // The authoritative entitlement is re-read BEFORE the transaction is
+      // finished, so the plan is in hand by the time the store lets go of it.
+      try {
+        await onVerified?.call();
+        debugPrint('[BILLING-IOS] entitlement refreshed after verification');
+      } catch (e) {
+        debugPrint('[BILLING-IOS] entitlement refresh failed (non-fatal): $e');
+      }
       _results.add(const PurchaseResult(PurchaseOutcome.success));
       return true;
     } on FirebaseFunctionsException catch (e) {
-      debugPrint('[BILLING-IOS] verification REJECTED code=${e.code} '
-          'message=${e.message}');
-      _results.add(PurchaseResult(PurchaseOutcome.failed, message: e.message));
-      // The server had an answer, and the answer was no.
-      return e.code == 'permission-denied' || e.code == 'invalid-argument';
+      // The exact failure, not a blanket message — code, message and details
+      // are what separate a rejected purchase from a callable we never
+      // reached.
+      debugPrint(
+        '[BILLING-IOS] callable FAILED code=${e.code} message=${e.message} '
+        'details=${e.details}',
+      );
+      _results.add(PurchaseResult(
+        PurchaseOutcome.failed,
+        message: _describeCallableFailure(e),
+      ));
+      return false;
     } catch (e) {
-      debugPrint('[BILLING-IOS] verification FAILED to reach the backend: $e');
-      _results.add(PurchaseResult(PurchaseOutcome.failed, message: '$e'));
+      debugPrint('[BILLING-IOS] callable THREW ${e.runtimeType}: $e');
+      _results.add(PurchaseResult(
+        PurchaseOutcome.failed,
+        message: 'Could not reach Sayvo to confirm the purchase '
+            '(${e.runtimeType}). It stays pending and will retry.',
+      ));
       return false;
     }
   }
+
+  /// "Purchase could not be verified" belongs to ONE case: the backend looked
+  /// at the purchase and refused it. Everything else is the app failing to
+  /// reach the backend, and saying otherwise hides the real fault.
+  String _describeCallableFailure(FirebaseFunctionsException e) =>
+      switch (e.code) {
+        'permission-denied' =>
+          e.message ?? 'The store could not confirm that purchase.',
+        'unauthenticated' =>
+          'Sign-in or device attestation failed [${e.code}]. The purchase '
+              'stays pending.',
+        'not-found' =>
+          'Sayvo could not find the verification service [${e.code}]. The '
+              'purchase stays pending and will retry.',
+        'failed-precondition' =>
+          e.message ?? 'Purchases are not ready on the server yet.',
+        _ => 'Verification could not complete [${e.code}]: '
+            '${e.message ?? 'no message'}. The purchase stays pending.',
+      };
 
   Future<void> dispose() async {
     await _subscription?.cancel();
