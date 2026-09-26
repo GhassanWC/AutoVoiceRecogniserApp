@@ -71,8 +71,40 @@ workflows:
 
       - name: Configure Xcode signing
         script: |
-          xcode-project use-profiles \
-            --custom-export-options='{"testFlightInternalTestingOnly": true}'
+          # Export options are derived from the IOS_APP_STORE profile fetched
+          # above, so the archive exports for App Store distribution.
+          #
+          # NOTHING here may set testFlightInternalTestingOnly: that flag marks
+          # the upload as internal testing only, and App Store Connect then
+          # refuses to attach the build to a version for review.
+          xcode-project use-profiles
+
+      - name: Verify the export is App Store eligible (build gate)
+        script: |
+          #!/bin/bash
+          set -e
+
+          PLIST=/Users/builder/export_options.plist
+          echo "[EXPORT GATE] generated export options:"
+          plutil -p "$PLIST"
+
+          if plutil -extract testFlightInternalTestingOnly raw "$PLIST" \
+              >/dev/null 2>&1; then
+            echo "[EXPORT GATE] FAILED — testFlightInternalTestingOnly is set."
+            echo "              This build could not be submitted for review."
+            exit 1
+          fi
+
+          METHOD=$(plutil -extract method raw "$PLIST")
+          case "$METHOD" in
+            app-store|app-store-connect)
+              echo "[EXPORT GATE] PASSED — method=$METHOD, no internal-testing restriction."
+              ;;
+            *)
+              echo "[EXPORT GATE] FAILED — export method is '$METHOD', not App Store."
+              exit 1
+              ;;
+          esac
 
       - name: Flutter analyze
         script: |
