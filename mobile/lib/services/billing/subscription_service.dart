@@ -5,12 +5,11 @@ import 'dart:io' show Platform;
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart'
-    show ValueNotifier, debugPrint, kIsWeb, visibleForTesting;
+    show debugPrint, kIsWeb, visibleForTesting;
 import 'package:flutter/services.dart' show MethodChannel;
 import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-import 'billing_diagnostics.dart';
 import '../../utils/account_token.dart';
 import '../../utils/plans.dart';
 
@@ -161,15 +160,6 @@ class SubscriptionService {
 
   final VerifySender? _verifySender;
 
-  /// TEMPORARY: how far the last purchase got, for the in-app diagnostics
-  /// screen. A TestFlight build has no console, so this is the only way to
-  /// see where the path stops.
-  final ValueNotifier<BillingDiagnostics> diagnostics =
-      ValueNotifier(const BillingDiagnostics());
-
-  void _note(BillingDiagnostics Function(BillingDiagnostics) update) =>
-      diagnostics.value = update(diagnostics.value);
-
   /// Who is signed in, so a purchase can carry the account it was made for.
   final String? Function()? _uidProvider;
 
@@ -241,7 +231,6 @@ class SubscriptionService {
       },
       onDone: () => debugPrint('[BILLING-IOS] purchase stream closed'),
     );
-    _note((d) => d.copyWith(listenerAttached: true));
     debugPrint('[BILLING-IOS] purchase listener attached');
   }
 
@@ -355,14 +344,6 @@ class SubscriptionService {
   /// a subscription carries the account it was bought for and a mismatch is
   /// visible server-side.
   Future<void> buy(ProductDetails product) async {
-    // A fresh trace per attempt, keeping only whether we are listening —
-    // stale values from a previous try would be worse than none.
-    _note((d) => BillingDiagnostics(
-          listenerAttached: d.listenerAttached,
-          buyRequested: true,
-          buyProductId: product.id,
-          updatedAt: DateTime.now(),
-        ));
     debugPrint('[BILLING-IOS] buy requested productId=${product.id}');
     final uid = _uidProvider?.call();
     final param = PurchaseParam(
@@ -376,7 +357,6 @@ class SubscriptionService {
       // The store refused to even start it; without this the screen would
       // show "requested yes, received no" with no explanation.
       debugPrint('[BILLING-IOS] buy REJECTED by the store: $e');
-      _note((d) => d.copyWith(buyError: '${e.runtimeType}: $e'));
       rethrow;
     }
   }
@@ -493,39 +473,16 @@ class SubscriptionService {
         'pendingComplete=${purchase.pendingCompletePurchase} '
         'error=${purchase.error?.code ?? 'none'}',
       );
-      _note((d) => d.copyWith(
-            purchaseReceived: true,
-            purchaseStatus: purchase.status.name,
-            productId: purchase.productID,
-            purchaseIdExists:
-                purchase.purchaseID != null && purchase.purchaseID!.isNotEmpty,
-            clearError: true,
-          ));
       var settled = true;
       switch (purchase.status) {
         case PurchaseStatus.pending:
           // Deferred payment (e.g. Ask to Buy). Nothing is granted yet, and
           // the store will deliver it again when it resolves.
-          _note((d) => d.copyWith(
-                clientReason: 'The store reported this purchase as PENDING '
-                    '(deferred / Ask to Buy), so there is nothing to verify '
-                    'yet. It will be delivered again when it resolves.',
-              ));
           _results.add(const PurchaseResult(PurchaseOutcome.pending));
           continue;
         case PurchaseStatus.canceled:
-          _note((d) => d.copyWith(
-                clientReason: 'The purchase was CANCELLED, so it was never '
-                    'sent for verification.',
-              ));
           _results.add(const PurchaseResult(PurchaseOutcome.cancelled));
         case PurchaseStatus.error:
-          _note((d) => d.copyWith(
-                clientReason: 'The store delivered this transaction with '
-                    'status ERROR, so it was never sent for verification. '
-                    'Store code: ${purchase.error?.code ?? 'none'}. '
-                    'Store message: ${purchase.error?.message ?? 'none'}.',
-              ));
           _results.add(PurchaseResult(PurchaseOutcome.failed,
               message: purchase.error?.message));
         case PurchaseStatus.purchased:
@@ -587,18 +544,12 @@ class SubscriptionService {
     if (handle is! String || handle.isEmpty) {
       // Nothing to verify with. Reported visibly and left UNFINISHED.
       debugPrint('[BILLING-IOS] missing_purchase_id — transaction left pending');
-      _note((d) => d.copyWith(
-            clientReason: 'missing_purchase_id: the store delivered the '
-                'transaction without an id, so there was nothing to send. '
-                'The transaction was left unfinished.',
-          ));
       _results.add(const PurchaseResult(
         PurchaseOutcome.failed,
         message: 'missing_purchase_id: the store gave no transaction id.',
       ));
       return false;
     }
-    _note((d) => d.copyWith(callableCalled: true, clearError: true));
     // The handle is a credential; only its shape is printed.
     debugPrint('[BILLING-IOS] calling verifySubscriptionPurchase '
         'store=${payload['store']} $handleField=${handle.length} chars');
@@ -606,7 +557,6 @@ class SubscriptionService {
     try {
       await (_verifySender ?? _callVerify)(payload);
       _restoreVerified++;
-      _note((d) => d.copyWith(callableResult: 'success'));
       debugPrint('[BILLING-IOS] callable OK — backend granted the entitlement');
       // The authoritative entitlement is re-read BEFORE the transaction is
       // finished, so the plan is in hand by the time the store lets go of it.
@@ -626,12 +576,6 @@ class SubscriptionService {
         '[BILLING-IOS] callable FAILED code=${e.code} message=${e.message} '
         'details=${e.details}',
       );
-      _note((d) => d.copyWith(
-            callableResult: 'failure',
-            errorCode: e.code,
-            errorMessage: e.message ?? 'none',
-            errorDetails: '${e.details ?? 'none'}',
-          ));
       _results.add(PurchaseResult(
         PurchaseOutcome.failed,
         message: _describeCallableFailure(e),
@@ -639,12 +583,6 @@ class SubscriptionService {
       return false;
     } catch (e) {
       debugPrint('[BILLING-IOS] callable THREW ${e.runtimeType}: $e');
-      _note((d) => d.copyWith(
-            callableResult: 'failure',
-            errorCode: '${e.runtimeType}',
-            errorMessage: '$e',
-            errorDetails: 'none',
-          ));
       _results.add(PurchaseResult(
         PurchaseOutcome.failed,
         message: 'Could not reach Sayvo to confirm the purchase '
