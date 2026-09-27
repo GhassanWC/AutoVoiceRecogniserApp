@@ -49,7 +49,9 @@ class _FakeSocket implements GeminiSocket {
 
   @override
   void send(String data) {
-    if (data.contains('realtimeInput')) audioFrames++;
+    // Audio only: audioStreamEnd is a realtimeInput too, and counting the
+    // flush marker as a chunk of the room would hide a gated microphone.
+    if (data.contains('"audio"')) audioFrames++;
   }
   @override
   Future<void> close() async {

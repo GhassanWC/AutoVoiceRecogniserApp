@@ -6,6 +6,7 @@ import 'dart:typed_data';
 class GainReport {
   const GainReport({
     required this.rawRms,
+    required this.rawPeak,
     required this.processedRms,
     required this.appliedGain,
     required this.peakAfterGain,
@@ -14,6 +15,11 @@ class GainReport {
   });
 
   final double rawRms;
+
+  /// Loudest input sample in the chunk, 0..1. RMS alone hides a distant voice
+  /// whose peaks are the only thing standing above the room.
+  final double rawPeak;
+
   final double processedRms;
   final double appliedGain;
   final double peakAfterGain;
@@ -22,6 +28,7 @@ class GainReport {
 
   static const GainReport idle = GainReport(
     rawRms: 0,
+    rawPeak: 0,
     processedRms: 0,
     appliedGain: 1,
     peakAfterGain: 0,
@@ -61,12 +68,30 @@ class AdaptiveGain {
   AdaptiveGain({
     this.targetRms = 0.06,
     this.maxGain = 6.0,
-    this.noiseCeiling = 0.02,
-    this.gainUpRate = 0.08,
+    this.noiseCeiling = 0.035,
+    this.gainUpRate = 0.35,
     this.gainDownRate = 0.35,
     this.limitThreshold = 0.89,
+    this.contentRatio = 1.25,
+    this.absoluteFloor = 0.0006,
     this.enabled = true,
   });
+
+  /// How far above the tracked noise floor a chunk must sit before it is worth
+  /// lifting at all.
+  ///
+  /// This was 2.0, and that is where the quietest speech was lost: a person
+  /// three metres away in a room with any air conditioning arrives at barely
+  /// more than the floor, failed this test, and was handed a gain of exactly
+  /// 1.0 — the one signal in the building that needed help got none. 1.25 is
+  /// low enough to catch them. It is safe to be this low because it does not
+  /// decide what gets SENT (everything does) and because [noiseCeiling]
+  /// separately caps how loud the room itself can ever be made.
+  final double contentRatio;
+
+  /// A floor under the floor: below this, a chunk is silence however the
+  /// ratio works out.
+  final double absoluteFloor;
 
   /// Where speech should land, roughly −24 dBFS: loud enough to detect, with
   /// plenty of headroom left for a sudden nearby voice.
@@ -78,10 +103,24 @@ class AdaptiveGain {
   final double maxGain;
 
   /// The loudest the amplified NOISE FLOOR is ever allowed to become. This is
-  /// what stops a quiet room being walked up to full scale.
+  /// what stops a quiet room being walked up to full scale, and it is the
+  /// clause — not [contentRatio] — that keeps a fan or an air conditioner out
+  /// of the model's ear.
+  ///
+  /// It is also a hard cap on how much help a distant voice can get: in a
+  /// room with a floor of 0.01 the old 0.02 allowed 2× and no more, whatever
+  /// [maxGain] said. 0.035 buys a distant speaker ~3.5× in that same room
+  /// while still holding amplified noise around −29 dBFS.
   final double noiseCeiling;
 
-  /// Gain rises slowly (no pumping) and falls quickly (no clipping).
+  /// Gain falls quickly (no clipping) and rises quickly enough to be useful
+  /// within an utterance.
+  ///
+  /// This was 0.08 per 100 ms chunk — a ~2 second climb to a useful gain, so
+  /// the opening words of every quiet sentence went upstream under-amplified
+  /// and the model saw exactly the fragment it was least able to detect.
+  /// 0.35 gets most of the way inside ~300 ms. The soft limiter and the
+  /// [noiseCeiling] cap are what make a fast attack safe.
   final double gainUpRate;
   final double gainDownRate;
 
@@ -97,6 +136,10 @@ class AdaptiveGain {
   /// waveform are looking at — and it round-trips every sample exactly.
   static const double _int16Scale = 32768.0;
 
+  /// The room is ASSUMED quiet until measured otherwise, and deliberately so:
+  /// a session that starts while somebody is already talking must treat that
+  /// voice as speech, not adopt its level as the floor. The floor drops fast
+  /// toward a genuinely quieter room and only creeps up on non-speech.
   double _noiseFloor = 0.003;
   double get noiseFloor => _noiseFloor;
 
@@ -121,12 +164,13 @@ class AdaptiveGain {
     final rawRms = math.sqrt(sumSquares / samples);
 
     // Worked out BEFORE the floor moves, so the two stay consistent.
-    final isContent = rawRms > math.max(_noiseFloor * 2.0, 0.0008);
+    final isContent = rawRms > math.max(_noiseFloor * contentRatio, absoluteFloor);
     _trackNoiseFloor(rawRms, isContent: isContent);
     if (!enabled) {
       out.setRange(0, samples * 2, pcm);
       return GainReport(
         rawRms: rawRms,
+        rawPeak: rawPeak,
         processedRms: rawRms,
         appliedGain: 1,
         peakAfterGain: rawPeak,
@@ -143,6 +187,7 @@ class AdaptiveGain {
       out.setRange(0, samples * 2, pcm);
       return GainReport(
         rawRms: rawRms,
+        rawPeak: rawPeak,
         processedRms: rawRms,
         appliedGain: 1,
         peakAfterGain: rawPeak,
@@ -173,6 +218,7 @@ class AdaptiveGain {
 
     return GainReport(
       rawRms: rawRms,
+      rawPeak: rawPeak,
       processedRms: math.sqrt(outSumSquares / samples),
       appliedGain: _gain,
       peakAfterGain: outPeak,

@@ -38,19 +38,24 @@ const NEW_SESSION_TTL_SECONDS = 60;
  * its default sensitivity a quiet or distant voice frequently is not detected
  * — the audio arrives, and nothing happens.
  *
- * Field meanings are from the v1beta discovery document, and two of them read
- * the opposite way round to what the names suggest:
- *  - `prefixPaddingMs` is the duration of speech REQUIRED before a start is
- *    committed, so a LOW value is the sensitive one. 20 ms barely asks for
- *    anything, which is what keeps the first quiet word.
- *  - `silenceDurationMs` is the silence required before an end is committed,
- *    so a HIGH value tolerates longer gaps. A distant speaker dips below the
- *    threshold mid-sentence; 800 ms stops that being read as "finished".
- *  - START_SENSITIVITY_HIGH detects speech starts more often.
- *  - END_SENSITIVITY_LOW is less eager to declare speech over.
+ * Field meanings are quoted from the v1beta discovery document (the
+ * machine-readable API contract), because the prose guide describes
+ * `prefixPaddingMs` the other way round — as OpenAI's identically-named
+ * look-back field. The contract is what this API implements:
  *
- * These are a calibrated STARTING POINT, to be trimmed against real device
- * logs — see the far-field acceptance matrix in the report.
+ *  - `prefixPaddingMs`: "The required duration of detected speech before
+ *    start-of-speech is committed. The LOWER this value, the more sensitive
+ *    the start-of-speech detection is and shorter speech can be recognized."
+ *    20 ms asks for almost nothing, which is what keeps the first quiet word.
+ *    Raising it would make quiet speech HARDER to detect, not easier.
+ *  - `silenceDurationMs`: "The required duration of detected non-speech
+ *    before end-of-speech is committed." A distant speaker dips below the
+ *    threshold mid-sentence; 800 ms stops that being read as "finished".
+ *  - START_SENSITIVITY_HIGH: "detect the start of speech more often".
+ *  - END_SENSITIVITY_LOW: "ends speech less often".
+ *
+ * All four are already at their most sensitive setting, which is why the
+ * far-field work continues in the two fields below rather than here.
  */
 export const FAR_FIELD_ACTIVITY_DETECTION = {
   disabled: false,
@@ -59,6 +64,28 @@ export const FAR_FIELD_ACTIVITY_DETECTION = {
   prefixPaddingMs: 20,
   silenceDurationMs: 800,
 } as const;
+
+/**
+ * What the model is given, and what a new speaker does to a translation in
+ * flight. Both default the wrong way for an ambient translator.
+ *
+ * `turnCoverage` (discovery document): the default for current models is
+ * TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO, where "audio activity means
+ * speech and EXCLUDES silence" — so the turn contains only what the VAD
+ * carved out, and a quiet onset the VAD commits late is simply not in it.
+ * TURN_INCLUDES_ALL_INPUT "includes all realtime input since the last turn,
+ * including inactivity", which hands the model the continuous stream Sayvo
+ * is already sending and lets IT decide where the speech starts. That is the
+ * architectural point: the phone should not pre-decide what is speech.
+ *
+ * `activityHandling`: the default START_OF_ACTIVITY_INTERRUPTS is barge-in —
+ * "the model's current response will be cut-off in the moment of the
+ * interruption". In a room, the second speaker starting is the NORMAL case,
+ * and cutting the first speaker's translation off mid-sentence loses text the
+ * user needed. NO_INTERRUPTION lets each translation finish.
+ */
+export const FAR_FIELD_TURN_COVERAGE = "TURN_INCLUDES_ALL_INPUT";
+export const FAR_FIELD_ACTIVITY_HANDLING = "NO_INTERRUPTION";
 
 /**
  * The realtimeInputConfig the token locks in — and the SAME object the app is
@@ -70,7 +97,11 @@ export function farFieldRealtimeInputConfig(
   enabled: boolean,
 ): Record<string, unknown> | undefined {
   return enabled
-    ? { automaticActivityDetection: { ...FAR_FIELD_ACTIVITY_DETECTION } }
+    ? {
+        automaticActivityDetection: { ...FAR_FIELD_ACTIVITY_DETECTION },
+        turnCoverage: FAR_FIELD_TURN_COVERAGE,
+        activityHandling: FAR_FIELD_ACTIVITY_HANDLING,
+      }
     : undefined;
 }
 

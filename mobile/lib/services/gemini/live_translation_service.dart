@@ -10,6 +10,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import '../../utils/languages.dart' show normalizeDetectedLanguage;
 import '../../utils/mic_level.dart';
 import '../audio/adaptive_gain.dart';
+import '../diagnostics/audio_diagnostics.dart';
 import '../audio/audio_capture_service.dart';
 import '../audio/audio_playback_service.dart';
 import '../diagnostics/live_diagnostics.dart';
@@ -346,6 +347,23 @@ class LiveTranslationService {
   int _chunksDropped = 0;
   DateTime? _lastChunkAt;
   bool? _lastGateState;
+
+  /// True once an audioStreamEnd has been sent for the CURRENT pause, so one
+  /// pause produces one flush rather than one per gated chunk.
+  bool _audioStreamEnded = false;
+
+  /// When room audio last rose above the noise floor with no utterance open —
+  /// the start of the clock that measures how long Gemini takes to call it
+  /// speech. Null while an utterance is already in progress.
+  DateTime? _riseAt;
+
+  final StreamController<AudioDiagnostics> _diagnostics =
+      StreamController<AudioDiagnostics>.broadcast();
+
+  /// Numbers for the development diagnostics panel. Emitted ~5x/second while
+  /// listening; nobody has to listen to it.
+  Stream<AudioDiagnostics> get diagnostics => _diagnostics.stream;
+  AudioDiagnostics _lastDiagnostics = AudioDiagnostics.idle;
   String? _lastServerKeys;
 
   bool get _uplinkGated {
@@ -392,6 +410,7 @@ class LiveTranslationService {
     _discardedAudioBytes = 0;
     _lastChunkAt = null;
     _lastGateState = null;
+    _audioStreamEnded = false;
     _lastServerKeys = null;
     _clearTail();
     gain.reset();
@@ -490,6 +509,7 @@ class LiveTranslationService {
     await _stateChanges.close();
     await _micLevel.close();
     await _speaking.close();
+    await _diagnostics.close();
     await playback.dispose();
   }
 
@@ -846,6 +866,7 @@ class LiveTranslationService {
         // A language change opens a NEW utterance before this text is stored,
         // so the incoming words can never land in the previous speaker's
         // bubble (see _openOrContinueUtterance).
+        _recordDetectionLatency();
         _openOrContinueUtterance(raw is String && raw.isNotEmpty ? raw : null);
         _sourceBuffer.write(text);
         // Content is user speech — log shape only, never the words.
@@ -1086,7 +1107,12 @@ class LiveTranslationService {
       gated: gated || !live,
       sentUpstream: live && !gated,
     );
-    if (!live) return;
+    if (!live) {
+      _emitDiagnostics(
+          sending: false,
+          reason: _setupDone ? 'not listening' : 'connecting to Gemini');
+      return;
+    }
     if (gated != _lastGateState) {
       _lastGateState = gated;
       liveTrace(
@@ -1098,14 +1124,29 @@ class LiveTranslationService {
     if (gated) {
       // The device is speaking a translation: DROP room audio so the speaker
       // output can't be re-ingested and re-translated in a feedback loop.
+      //
+      // Whatever was already buffered came from BEFORE the speaker started,
+      // so it is real room audio and goes upstream rather than into the bin —
+      // it is usually the tail of the sentence that prompted the playback.
+      _flushPendingAudio();
+      _endAudioStream();
       _chunksDropped++;
       liveTraceThrottled('MIC_CHUNK_DROPPED',
           () => 'total=$_chunksDropped (device is speaking)');
-      _pendingAudio.clear();
+      _emitDiagnostics(
+          sending: false, reason: 'the device is speaking a translation');
       return;
     }
     _pendingAudio.add(pcm);
     if (_pendingAudio.length < _sendChunkBytes) return;
+    _flushPendingAudio();
+  }
+
+  /// Sends whatever is buffered, gain-corrected. Never decides WHETHER to
+  /// send on level: quiet chunks go upstream exactly like loud ones, and the
+  /// model makes the speech/non-speech call.
+  void _flushPendingAudio() {
+    if (_pendingAudio.isEmpty) return;
     final chunk = _pendingAudio.takeBytes();
     final socket = _socket;
     if (socket == null) {
@@ -1129,7 +1170,81 @@ class LiveTranslationService {
       },
     }));
     _chunksSent++;
+    _audioStreamEnded = false;
+    // The clock for "how long until the model called this speech" starts the
+    // moment the room rises above its own floor, not when it gets loud.
+    if (_riseAt == null &&
+        _utteranceId == null &&
+        _lastGain.rawRms > math.max(_lastGain.noiseFloor * 1.25, 0.0006)) {
+      _riseAt = _now();
+    }
     _traceAudioLevels();
+    _emitDiagnostics(sending: true, reason: '');
+  }
+
+  /// Tells the server the audio stream has paused, so anything it is still
+  /// holding is flushed instead of waiting for audio that is not coming.
+  ///
+  /// The only pause Sayvo ever takes is the half-duplex gate; the API's
+  /// guidance is to send this whenever the stream stops for more than about a
+  /// second. Sent once per pause, not once per gated chunk.
+  void _endAudioStream() {
+    if (_audioStreamEnded) return;
+    final socket = _socket;
+    if (socket == null) return;
+    _audioStreamEnded = true;
+    socket.send(jsonEncode({
+      'realtimeInput': {'audioStreamEnd': true},
+    }));
+    liveTrace('AUDIO_STREAM_END', 'uplink paused — flushing server-side audio');
+  }
+
+  /// Publishes the numbers behind the audio path. Throttled — the panel is a
+  /// human reading a screen, not a recorder — and skipped entirely when the
+  /// development panel is not built in, so production pays nothing.
+  void _emitDiagnostics({required bool sending, required String reason}) {
+    if (!_diagnostics.hasListener) return;
+    final now = _now();
+    if (_lastDiagnosticsAt != null &&
+        now.difference(_lastDiagnosticsAt!) <
+            const Duration(milliseconds: 200)) {
+      return;
+    }
+    _lastDiagnosticsAt = now;
+    _lastDiagnostics = _lastDiagnostics.copyWith(
+      inputRms: _lastGain.rawRms,
+      inputPeak: _lastGain.rawPeak,
+      processedRms: _lastGain.processedRms,
+      noiseFloor: _lastGain.noiseFloor,
+      gain: _lastGain.appliedGain,
+      clippedSamples: _lastGain.clippedSamples,
+      sending: sending,
+      notSendingReason: reason,
+      chunksSent: _chunksSent,
+      chunksDropped: _chunksDropped,
+      speechDetected: observer?.isSpeechDetected ?? false,
+    );
+    _diagnostics.add(_lastDiagnostics);
+  }
+
+  DateTime? _lastDiagnosticsAt;
+
+  /// Called when the model's first transcript for an utterance arrives, so
+  /// room-rises → recognized can be reported. This is the number that
+  /// separates "detected late" from "never detected".
+  void _recordDetectionLatency() {
+    final rise = _riseAt;
+    _riseAt = null;
+    if (rise == null) return;
+    final latency = _now().difference(rise);
+    liveTrace('SPEECH_DETECTED',
+        'room rose to first transcript in ${latency.inMilliseconds}ms');
+    if (!_diagnostics.hasListener) return;
+    _lastDiagnostics = _lastDiagnostics.copyWith(
+      lastDetectionLatency: latency,
+      lastUtteranceAt: _now(),
+    );
+    _diagnostics.add(_lastDiagnostics);
   }
 
   /// The far-field diagnostic line: one per second while listening, carrying
@@ -1143,6 +1258,9 @@ class LiveTranslationService {
           ? '-inf'
           : (20 * (math.log(value) / math.ln10)).toStringAsFixed(1);
       return 'inputRms=${report.rawRms.toStringAsFixed(5)}(${db(report.rawRms)}dB) '
+          'inputPeak=${report.rawPeak.toStringAsFixed(5)}'
+          '(${db(report.rawPeak)}dB) '
+          'sending=${_uplinkGated ? 'NO(device is speaking)' : 'YES'} '
           'processedRms=${report.processedRms.toStringAsFixed(5)}'
           '(${db(report.processedRms)}dB) '
           'gain=${report.appliedGain.toStringAsFixed(2)}x '

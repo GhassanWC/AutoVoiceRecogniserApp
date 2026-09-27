@@ -63,6 +63,26 @@ describe("room-tuned speech detection", () => {
     return body.bidiGenerateContentSetup as Record<string, unknown>;
   }
 
+  it("gives the model the whole stream, not only what its VAD carved out", () => {
+    // The default (TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO) means, per the
+    // discovery document, that "audio activity means speech and excludes
+    // silence" — so a quiet onset the VAD commits late is not in the turn at
+    // all. This is the setting that lets the MODEL decide where speech began
+    // rather than the activity detector deciding for it.
+    const config = setupOf(tokenRequestBody("ar", NOW))
+      .realtimeInputConfig as Record<string, unknown>;
+    expect(config.turnCoverage).toBe("TURN_INCLUDES_ALL_INPUT");
+  });
+
+  it("lets a translation finish when the next person starts talking", () => {
+    // The default is barge-in: a new speaker cuts the previous speaker's
+    // translation off mid-sentence. In a room that is the normal case, and
+    // the text the user loses is text they needed.
+    const config = setupOf(tokenRequestBody("ar", NOW))
+      .realtimeInputConfig as Record<string, unknown>;
+    expect(config.activityHandling).toBe("NO_INTERRUPTION");
+  });
+
   it("asks Gemini to be sensitive about where speech STARTS", () => {
     const detection = (
       setupOf(tokenRequestBody("ar", NOW)).realtimeInputConfig as Record<
@@ -97,6 +117,30 @@ describe("room-tuned speech detection", () => {
       "silenceDurationMs",
       "startOfSpeechSensitivity",
     ]);
+  });
+
+  it("uses only fields the v1beta RealtimeInputConfig schema defines", () => {
+    // Same hazard one level up: turnCoverage and activityHandling are real
+    // RealtimeInputConfig fields, and anything else here would break minting.
+    const config = setupOf(tokenRequestBody("ar", NOW))
+      .realtimeInputConfig as Record<string, unknown>;
+    expect(Object.keys(config).sort()).toEqual([
+      "activityHandling",
+      "automaticActivityDetection",
+      "turnCoverage",
+    ]);
+    // And the values must be enum members the schema lists.
+    expect([
+      "TURN_COVERAGE_UNSPECIFIED",
+      "TURN_INCLUDES_ONLY_ACTIVITY",
+      "TURN_INCLUDES_ALL_INPUT",
+      "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO",
+    ]).toContain(config.turnCoverage);
+    expect([
+      "ACTIVITY_HANDLING_UNSPECIFIED",
+      "START_OF_ACTIVITY_INTERRUPTS",
+      "NO_INTERRUPTION",
+    ]).toContain(config.activityHandling);
   });
 
   it("locks the SAME config into the token that the app is told to send",
@@ -161,6 +205,8 @@ describe("tokenRequestBody", () => {
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         realtimeInputConfig: {
+          turnCoverage: "TURN_INCLUDES_ALL_INPUT",
+          activityHandling: "NO_INTERRUPTION",
           automaticActivityDetection: {
             disabled: false,
             startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",
@@ -211,6 +257,8 @@ describe("issueLiveTranslateToken", () => {
       expireTime: "2026-09-14T10:05:00.000Z",
       // Handed on to the app so its setup frame matches the token.
       realtimeInputConfig: {
+        turnCoverage: "TURN_INCLUDES_ALL_INPUT",
+        activityHandling: "NO_INTERRUPTION",
         automaticActivityDetection: {
           disabled: false,
           startOfSpeechSensitivity: "START_SENSITIVITY_HIGH",

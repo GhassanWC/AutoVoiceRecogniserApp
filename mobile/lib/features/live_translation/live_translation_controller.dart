@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../models/translation_message.dart';
+import '../../services/diagnostics/audio_diagnostics.dart';
 import '../../services/firestore/session_repository.dart';
 import '../../services/gemini/live_translation_service.dart';
 import '../../services/permissions/mic_permission_service.dart';
@@ -141,6 +142,10 @@ class LiveTranslationController extends ChangeNotifier with WidgetsBindingObserv
 
   /// One-off user notices (snackbars).
   Stream<String> get notices => _notices.stream;
+
+  /// Development-only audio diagnostics from the live session. Nothing
+  /// listens to this unless the diagnostics panel is built in.
+  Stream<AudioDiagnostics> get audioDiagnostics => _service.diagnostics;
 
   bool get isListening => state == ListeningState.listening;
 

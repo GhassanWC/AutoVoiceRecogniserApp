@@ -13,7 +13,9 @@ import '../../widgets/components/app_bottom_nav.dart' show bottomNavClearance;
 import '../../widgets/components/app_error_banner.dart';
 import '../../widgets/components/audio_waveform.dart';
 import '../../widgets/components/glass_card.dart';
+import '../../services/diagnostics/audio_diagnostics.dart';
 import '../../widgets/components/language_selector_sheet.dart';
+import 'widgets/audio_diagnostics_panel.dart';
 import '../../widgets/components/listening_orb.dart';
 import 'live_translation_controller.dart';
 import 'widgets/message_bubble.dart';
@@ -256,6 +258,9 @@ class _LiveTranslationScreenState extends State<LiveTranslationScreen> {
                 targetLanguage: settings.targetLanguage,
                 onTap: () => showLanguageSelectorSheet(context),
               ),
+              // Compiled out of production builds — see kAudioDiagnosticsUi.
+              if (kAudioDiagnosticsUi)
+                AudioDiagnosticsPanel(stream: controller.audioDiagnostics),
             ],
           ),
         ),

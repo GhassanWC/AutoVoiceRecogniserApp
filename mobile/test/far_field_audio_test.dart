@@ -182,6 +182,111 @@ void main() {
       expect(report.rawRms, closeTo(pcm16Rms(pcm), 1e-9));
     });
   });
+  // ── P0: the quietest speech, which is where this was going wrong ──────────
+
+  group('speech barely above the room', () {
+    test('a voice just over the noise floor is still lifted', () {
+      // THE regression. The old contentRatio of 2.0 meant a distant speaker
+      // sitting at ~1.5x the floor was classified as room noise and handed a
+      // gain of exactly 1.0 — the one signal that needed help got none.
+      final gain = AdaptiveGain();
+      // Let the floor settle on a realistic room first.
+      settle(gain, roomNoise(amplitude: 0.004), chunks: 60);
+      final floor = gain.noiseFloor;
+
+      // Just over the floor: under the old 2.0 ratio this exact signal was
+      // classified as room noise and left at gain 1.0.
+      expect(pcm16Rms(tone(0.006)), greaterThan(floor * 1.25));
+      expect(pcm16Rms(tone(0.006)), lessThan(floor * 2.0));
+      final report = settle(gain, tone(0.006), chunks: 20);
+
+      expect(report.appliedGain, greaterThan(1.5),
+          reason: 'quiet speech must be amplified, not written off as noise');
+      expect(report.processedRms, greaterThan(report.rawRms));
+    });
+
+    test('the lift arrives inside the first words, not two seconds later', () {
+      // Chunks are 100 ms. The old attack rate of 0.08 needed ~2 seconds to
+      // reach a useful gain, so every quiet sentence went upstream with its
+      // opening under-amplified — exactly the part the model needs most.
+      final gain = AdaptiveGain();
+      final out = Uint8List(3200);
+      final quiet = tone(0.014);
+
+      late GainReport report;
+      for (var i = 0; i < 3; i++) {
+        report = gain.apply(quiet, out);
+      }
+
+      // The old 0.08 rate reached about 2.1x by here; 0.35 reaches ~4.6x.
+      expect(report.appliedGain, greaterThan(3.5),
+          reason: '300 ms in, the gain must already be most of the way there');
+    });
+
+    test('a whisper at 1 metre reaches a level the model can work with', () {
+      final gain = AdaptiveGain();
+      final report = settle(gain, tone(0.006));
+      // Lands in the region of the configured target rather than staying at
+      // the microphone's own quiet reading.
+      expect(report.processedRms, greaterThan(0.02));
+    });
+  });
+
+  group('the safety clauses still hold after the retune', () {
+    test('a steadily noisy room is still not walked up to full scale', () {
+      final gain = AdaptiveGain();
+      final report = settle(gain, roomNoise(amplitude: 0.01), chunks: 120);
+      // noiseCeiling is what bounds this, and it must keep amplified noise
+      // well below speech level however long the room hums.
+      expect(report.processedRms, lessThan(0.05));
+      expect(report.appliedGain, lessThanOrEqualTo(6.0));
+    });
+
+    test('a fast attack cannot clip a sudden close voice', () {
+      final gain = AdaptiveGain();
+      settle(gain, tone(0.004), chunks: 20);
+      final out = Uint8List(3200);
+      final report = gain.apply(tone(0.7), out);
+      expect(report.peakAfterGain, lessThanOrEqualTo(1.0));
+      final view = ByteData.sublistView(out);
+      for (var i = 0; i < 1600; i++) {
+        final sample = view.getInt16(i * 2, Endian.little);
+        expect(sample, inInclusiveRange(-32768, 32767));
+      }
+    });
+
+    test('digital silence is still passed through as silence', () {
+      final gain = AdaptiveGain();
+      final silence = Uint8List(3200);
+      final out = Uint8List(3200);
+      final report = gain.apply(silence, out);
+      expect(report.processedRms, 0);
+      expect(out.every((b) => b == 0), isTrue);
+    });
+  });
+
+  group('every chunk reaches the wire', () {
+    test('no level, however low, makes apply() return less audio', () {
+      final gain = AdaptiveGain();
+      for (final amplitude in [0.0, 0.00001, 0.0005, 0.003, 0.05, 0.9]) {
+        final pcm = tone(amplitude);
+        final out = Uint8List(pcm.length);
+        gain.apply(pcm, out);
+        expect(out.lengthInBytes, pcm.lengthInBytes,
+            reason: 'amplitude $amplitude changed the chunk size');
+      }
+    });
+
+    test('the input peak is reported alongside the average', () {
+      // RMS alone hides a distant voice whose peaks are the only thing
+      // standing above the room; the diagnostics need both.
+      final gain = AdaptiveGain();
+      final out = Uint8List(3200);
+      final report = gain.apply(tone(0.2), out);
+      expect(report.rawPeak, greaterThan(report.rawRms));
+      expect(report.rawPeak, closeTo(0.2, 0.01));
+    });
+  });
 }
 
 int _zeroCrossings(List<double> values) {

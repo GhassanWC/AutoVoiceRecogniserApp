@@ -248,10 +248,21 @@ class Harness {
     ];
   }
 
+  /// Frames carrying actual microphone PCM. Deliberately NOT every
+  /// realtimeInput frame: audioStreamEnd is a realtimeInput too, and counting
+  /// it as audio would let a flush marker pass for a chunk of the room.
   List<Map<String, dynamic>> sentAudio(FakeSocket s) => [
         for (final frame in s.sent)
           if (jsonDecode(frame) case final Map<String, dynamic> m
-              when m.containsKey('realtimeInput'))
+              when (m['realtimeInput'] as Map?)?.containsKey('audio') ?? false)
+            m,
+      ];
+
+  /// The "the uplink has paused, flush what you are holding" markers.
+  List<Map<String, dynamic>> sentStreamEnds(FakeSocket s) => [
+        for (final frame in s.sent)
+          if (jsonDecode(frame) case final Map<String, dynamic> m
+              when (m['realtimeInput'] as Map?)?['audioStreamEnd'] == true)
             m,
       ];
 
@@ -1667,6 +1678,162 @@ void main() {
       expect(finalized.sourceText, 'Wannan gwaji ne');
       expect(finalized.translatedText, 'هذا اختبار');
       expect(detectedLanguageLabel(finalized.sourceLanguageCode, 1.0), isNull);
+    });
+  });
+  // ── P0: the phone must not decide what counts as speech ───────────────────
+
+  group('the uplink never withholds audio for being quiet', () {
+    test('near-silent chunks reach Gemini exactly like loud ones', () async {
+      final h = Harness();
+      await h.startListening();
+
+      // −60 dBFS and below: quieter than a distant voice, and still sent.
+      // If any level-based gate is ever added, this is the test it breaks.
+      for (final amplitude in [0.0, 0.0002, 0.001, 0.004]) {
+        h.micTone(amplitude);
+      }
+
+      expect(h.sentAudio(h.socket), hasLength(4),
+          reason: 'every chunk goes upstream, whatever its level');
+    });
+
+    test('digital silence is streamed, not skipped', () async {
+      final h = Harness();
+      await h.startListening();
+
+      h.mic(0);
+
+      expect(h.sentAudio(h.socket), hasLength(1));
+      final samples = h.decodeAudio(h.sentAudio(h.socket).single);
+      expect(samples.every((s) => s == 0), isTrue,
+          reason: 'silence goes upstream as silence — the model decides');
+    });
+
+    test('a quiet chunk and a loud chunk are treated identically by the gate',
+        () async {
+      final h = Harness();
+      await h.startListening();
+
+      h.micTone(0.0005);
+      final quiet = h.sentAudio(h.socket).length;
+      h.micTone(0.5);
+      final loud = h.sentAudio(h.socket).length - quiet;
+
+      expect(quiet, 1);
+      expect(loud, 1);
+    });
+  });
+
+  group('the one place audio IS held back', () {
+    test('room audio buffered before playback is flushed, not binned',
+        () async {
+      // The half-duplex gate exists to stop the speaker being re-translated.
+      // What was already buffered came from BEFORE the speaker started, so it
+      // is real room audio — usually the tail of the sentence that prompted
+      // the playback — and it goes upstream.
+      final h = Harness();
+      await h.startListening();
+
+      // Half a frame: buffered, not yet sent.
+      h.capture.onAudio!(Uint8List.fromList(List.filled(1600, 9)));
+      expect(h.sentAudio(h.socket), isEmpty);
+
+      h.service.gateUplinkForSpeech(const Duration(seconds: 2));
+      h.mic(); // arrives while gated
+
+      expect(h.sentAudio(h.socket), hasLength(1),
+          reason: 'the pre-playback buffer must not be discarded');
+    });
+
+    test('a pause tells the server to flush what it is holding', () async {
+      final h = Harness();
+      await h.startListening();
+      h.mic();
+
+      h.service.gateUplinkForSpeech(const Duration(seconds: 2));
+      h.mic();
+      h.mic();
+
+      expect(h.sentStreamEnds(h.socket), hasLength(1),
+          reason: 'one audioStreamEnd per pause, not one per gated chunk');
+    });
+
+    test('the uplink resumes cleanly and the flush marker can fire again',
+        () async {
+      var clock = DateTime.utc(2026, 9, 27, 12);
+      final h = Harness(now: () => clock);
+      await h.startListening();
+
+      h.service.gateUplinkForSpeech(const Duration(seconds: 1));
+      h.mic();
+      expect(h.sentStreamEnds(h.socket), hasLength(1));
+
+      clock = clock.add(const Duration(seconds: 2));
+      h.mic();
+      expect(h.sentAudio(h.socket), isNotEmpty);
+
+      h.service.gateUplinkForSpeech(const Duration(seconds: 1));
+      h.mic();
+      expect(h.sentStreamEnds(h.socket), hasLength(2),
+          reason: 'the second pause needs its own flush');
+    });
+  });
+
+  group('changing the audio path did not change segmentation', () {
+    test('one turn is still one utterance, however many chunks it took',
+        () async {
+      final h = Harness();
+      await h.startListening();
+
+      for (var i = 0; i < 6; i++) {
+        h.micTone(0.001); // quiet throughout
+        h.socket.serverSends({
+          'serverContent': {
+            'inputTranscription': {'text': 'word$i ', 'languageCode': 'en'}
+          }
+        });
+      }
+      h.socket.serverSends({
+        'serverContent': {
+          'outputTranscription': {'text': 'ترجمة'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {'turnComplete': true}
+      });
+      await h.pump();
+
+      final finalized = h.events.whereType<UtteranceFinalized>().toList();
+      expect(finalized, hasLength(1),
+          reason: 'no duplicate bubbles from the audio changes');
+      expect(finalized.single.sourceText.trim(),
+          'word0 word1 word2 word3 word4 word5');
+    });
+
+    test('speech start and end still bound exactly one utterance', () async {
+      final h = Harness();
+      await h.startListening();
+
+      h.socket.serverSends({
+        'serverContent': {
+          'inputTranscription': {'text': 'Hello', 'languageCode': 'en'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {
+          'outputTranscription': {'text': 'مرحبا'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {'turnComplete': true}
+      });
+      // A second turnComplete must not manufacture an empty second bubble.
+      h.socket.serverSends({
+        'serverContent': {'turnComplete': true}
+      });
+      await h.pump();
+
+      expect(h.events.whereType<UtteranceFinalized>(), hasLength(1));
     });
   });
 }
