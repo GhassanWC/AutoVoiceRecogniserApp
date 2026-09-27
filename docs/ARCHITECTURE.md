@@ -91,10 +91,24 @@ instant startup.
 
 ## Language catalog
 
-`mobile/lib/utils/languages.dart` (`kTargetLanguages`, `geminiCodeFor`) and
-`functions/src/languages.ts` (`ALLOWED_TARGET_LANGUAGES`) are kept in lockstep
-— parity is pinned by `mobile/test/languages_test.dart` and
-`functions/src/languages.test.ts`. Update both together.
+The SOURCE language is never configured anywhere. Gemini Live Translate
+detects it per utterance, and a change of detected language is what closes one
+bubble and opens the next — so nothing in this repo can limit what Sayvo
+HEARS. The catalog governs what it can translate INTO, and how a detected
+language is named in the UI.
+
+`mobile/lib/utils/languages.dart` is the single source of truth: one row per
+language carrying its stored code, English and native name, flag, RTL flag,
+Gemini `targetLanguageCode` and device TTS locale. It covers all 78 languages
+`gemini-3.5-live-translate-preview` documents support for.
+
+`functions/src/languages.ts` (`ALLOWED_TARGET_LANGUAGES`) mirrors the Gemini
+codes and stays a closed set: the value is written into a server-minted
+token's `bidiGenerateContentSetup`, so it is validated before it gets there.
+Widen it by adding languages, never by removing the check.
+
+Parity is pinned in both directions by `mobile/test/languages_test.dart` and
+`functions/src/languages.test.ts`. Update both files together.
 
 ## CI
 

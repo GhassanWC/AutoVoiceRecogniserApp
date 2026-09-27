@@ -32,16 +32,7 @@ class _LanguageSheetState extends State<_LanguageSheet> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final selected = context.watch<SettingsController>().settings.targetLanguage;
-    final query = _query.trim().toLowerCase();
-    final languages = query.isEmpty
-        ? kTargetLanguages
-        : [
-            for (final language in kTargetLanguages)
-              if (language.name.toLowerCase().contains(query) ||
-                  language.nativeName.toLowerCase().contains(query) ||
-                  language.code == query)
-                language,
-          ];
+    final languages = searchLanguages(_query);
 
     // Keyboard insets shrink the sheet so the list stays fully scrollable
     // above the keyboard while searching.

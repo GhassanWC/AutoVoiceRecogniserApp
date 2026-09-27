@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:live_translator/services/audio/audio_capture_service.dart';
 import 'package:live_translator/services/audio/audio_playback_service.dart';
 import 'package:live_translator/services/gemini/live_translation_service.dart';
+import 'package:live_translator/utils/languages.dart';
 
 // ── Fakes ─────────────────────────────────────────────────────────────────────
 
@@ -1492,6 +1493,181 @@ void main() {
     await h.startListening();
     final setup = jsonDecode(h.socket.sent.first) as Map<String, dynamic>;
     expect((setup['setup'] as Map).containsKey('realtimeInputConfig'), isFalse);
+  });
+  // ── Language coverage: real sentences through the real message path ───────
+  //
+  // Gemini detects the source language itself, per utterance. These drive the
+  // service with the frames the model actually sends, in the scripts it
+  // actually sends them in, so a language that reaches the app wrong fails
+  // here rather than in somebody's living room.
+
+  group('language coverage', () {
+    test('a Bengali speaker is transcribed, translated and attributed to Bengali',
+        () async {
+      final h = Harness();
+      await h.startListening();
+
+      // "I am speaking in Bengali. How are you?" — delivered in the partial
+      // chunks Live Translate streams, tagged with a regional BCP-47 code.
+      h.socket.serverSends({
+        'serverContent': {
+          'inputTranscription': {
+            'text': 'আমি বাংলায় ',
+            'languageCode': 'bn-BD',
+          }
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {
+          'inputTranscription': {'text': 'কথা বলছি। আপনি কেমন আছেন?'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {
+          'outputTranscription': {'text': 'أنا أتحدث البنغالية. كيف حالك؟'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {'turnComplete': true}
+      });
+      await h.pump();
+
+      final finalized = h.events.whereType<UtteranceFinalized>().single;
+      // The Bengali text survives byte for byte — no transliteration, no
+      // dropped conjuncts.
+      expect(finalized.sourceText, 'আমি বাংলায় কথা বলছি। আপনি কেমন আছেন?');
+      expect(finalized.translatedText, 'أنا أتحدث البنغالية. كيف حالك؟');
+      // bn-BD and bn-IN are one language to the app.
+      expect(finalized.sourceLanguageCode, 'bn');
+      expect(detectedLanguageLabel(finalized.sourceLanguageCode, 1.0), 'Bengali');
+      expect(detectedLanguageFlag(finalized.sourceLanguageCode, 1.0), '🇧🇩');
+    });
+
+    test('Bengali can be the TARGET language of a session', () async {
+      final h = Harness();
+      await h.service.start(targetLanguageCode: geminiCodeFor('bn'));
+      h.socket.serverSends({'setupComplete': {}});
+      await h.pump();
+
+      // What the token was minted for, and what the setup frame asks for.
+      expect(h.tokenRequests, ['bn']);
+      final setup = jsonDecode(h.socket.sent.first) as Map<String, dynamic>;
+      final translation = ((setup['setup'] as Map)['generationConfig']
+          as Map)['translationConfig'] as Map;
+      expect(translation['targetLanguageCode'], 'bn');
+
+      h.socket.serverSends({
+        'serverContent': {
+          'inputTranscription': {'text': 'Where is the station?', 'languageCode': 'en'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {
+          'outputTranscription': {'text': 'স্টেশন কোথায়?'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {'turnComplete': true}
+      });
+      await h.pump();
+
+      final finalized = h.events.whereType<UtteranceFinalized>().single;
+      expect(finalized.translatedText, 'স্টেশন কোথায়?');
+      expect(finalized.sourceLanguageCode, 'en');
+    });
+
+    test('nothing in the session tells Gemini what language to listen FOR',
+        () async {
+      // This is what makes detection per-utterance: the setup carries a
+      // target and nothing else about language. A source language here would
+      // pin the whole session to one language.
+      final h = Harness();
+      await h.startListening();
+      final setup = jsonDecode(h.socket.sent.first) as Map<String, dynamic>;
+      final text = jsonEncode(setup);
+
+      expect(text, isNot(contains('sourceLanguage')));
+      expect(text, isNot(contains('inputLanguage')));
+      expect(text, isNot(contains('languageCode')));
+      // The transcription configs are present and EMPTY — asking for a
+      // transcript, not for a language.
+      expect((setup['setup'] as Map)['inputAudioTranscription'], isEmpty);
+    });
+
+    test('four languages in one session are four utterances, each self-detected',
+        () async {
+      final h = Harness();
+      await h.startListening();
+
+      // Real sentences in scripts the app had no display name for before:
+      // Bengali, Punjabi, Swahili, Marathi.
+      const speakers = [
+        ('bn', 'আমার নাম রহিম।', 'Bengali'),
+        ('pa-IN', 'ਮੈਂ ਪੰਜਾਬੀ ਬੋਲਦਾ ਹਾਂ।', 'Punjabi'),
+        ('sw', 'Habari yako rafiki?', 'Swahili'),
+        ('mr', 'मी मराठी बोलतो.', 'Marathi'),
+      ];
+
+      for (final (code, sentence, _) in speakers) {
+        h.socket.serverSends({
+          'serverContent': {
+            'inputTranscription': {'text': sentence, 'languageCode': code}
+          }
+        });
+        h.socket.serverSends({
+          'serverContent': {
+            'outputTranscription': {'text': 'ترجمة'}
+          }
+        });
+        await h.pump();
+      }
+      h.socket.serverSends({
+        'serverContent': {'turnComplete': true}
+      });
+      await h.pump();
+
+      final finalized = h.events.whereType<UtteranceFinalized>().toList();
+      expect(finalized, hasLength(4),
+          reason: 'a language change is a bubble boundary');
+      for (var i = 0; i < speakers.length; i++) {
+        final (_, sentence, name) = speakers[i];
+        expect(finalized[i].sourceText, sentence);
+        // Every one of these used to render as a nameless "Speaker".
+        expect(detectedLanguageLabel(finalized[i].sourceLanguageCode, 1.0), name);
+        expect(detectedLanguageFlag(finalized[i].sourceLanguageCode, 1.0),
+            isNotEmpty);
+      }
+      // Each bubble is distinct — no Bengali words leaking into the Punjabi
+      // bubble.
+      expect(finalized.map((f) => f.utteranceId).toSet(), hasLength(4));
+    });
+
+    test('a language the catalog does not know still translates', () async {
+      // Coverage is a display question, never a gate: an unlisted code must
+      // still produce a bubble with its text, just without a name.
+      final h = Harness();
+      await h.startListening();
+
+      h.socket.serverSends({
+        'serverContent': {
+          'inputTranscription': {'text': 'Wannan gwaji ne', 'languageCode': 'xx-YY'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {
+          'outputTranscription': {'text': 'هذا اختبار'}
+        }
+      });
+      h.socket.serverSends({
+        'serverContent': {'turnComplete': true}
+      });
+      await h.pump();
+
+      final finalized = h.events.whereType<UtteranceFinalized>().single;
+      expect(finalized.sourceText, 'Wannan gwaji ne');
+      expect(finalized.translatedText, 'هذا اختبار');
+      expect(detectedLanguageLabel(finalized.sourceLanguageCode, 1.0), isNull);
+    });
   });
 }
 

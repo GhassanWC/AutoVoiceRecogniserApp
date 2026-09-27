@@ -39,15 +39,23 @@ class _OnboardingFlowState extends State<OnboardingFlow> {
   }
 }
 
-class _LanguageStep extends StatelessWidget {
+class _LanguageStep extends StatefulWidget {
   const _LanguageStep({required this.onSelected});
 
   final VoidCallback onSelected;
 
   @override
+  State<_LanguageStep> createState() => _LanguageStepState();
+}
+
+class _LanguageStepState extends State<_LanguageStep> {
+  String _query = '';
+
+  @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final selected = context.watch<SettingsController>().settings.targetLanguage;
+    final languages = searchLanguages(_query);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -69,12 +77,30 @@ class _LanguageStep extends StatelessWidget {
             ],
           ),
         ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 4, 20, 4),
+          child: TextField(
+            onChanged: (value) => setState(() => _query = value),
+            decoration: const InputDecoration(
+              hintText: 'Search languages',
+              prefixIcon: Icon(Icons.search_rounded),
+            ),
+          ),
+        ),
         Expanded(
-          child: ListView.builder(
+          child: languages.isEmpty
+              ? Center(
+                  child: Text(
+                    'No languages match "$_query"',
+                    style: theme.textTheme.bodyMedium
+                        ?.copyWith(color: AppColors.textSecondary),
+                  ),
+                )
+              : ListView.builder(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            itemCount: kTargetLanguages.length,
+            itemCount: languages.length,
             itemBuilder: (context, index) {
-              final language = kTargetLanguages[index];
+              final language = languages[index];
               return LanguageRow(
                 language: language,
                 selected: language.code == selected,
@@ -82,7 +108,7 @@ class _LanguageStep extends StatelessWidget {
                   await context
                       .read<SettingsController>()
                       .setTargetLanguage(language.code);
-                  onSelected();
+                  widget.onSelected();
                 },
               );
             },
